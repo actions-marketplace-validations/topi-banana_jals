@@ -52,7 +52,7 @@ Four subcommands are wired through `jals-cli`:
 | Command            | Backed by                                                                    | What it does                                                                                                                                                    | Flags                                                                                                       |
 | ------------------ | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `jals build`       | `execute_build_script` + `jals-project` + `Invocation::build`                | Run the root pre-build script, preprocess the transitive dependency graph, discover `.java` sources, build the `javac` command, and run it.                     | `--manifest-path <PATH>`, `--dry-run`, `-v`/`--verbose`, `--out-dir <DIR>`, `--bin <NAME>`                  |
-| `jals run`         | `execute_build_script` + `jals-project` + `RunTarget::resolve` + invocations | Run the root and dependency pre-build phases, compile the complete source graph, then run the resolved entry point with `java`. Compilation must succeed first. | `--manifest-path <PATH>`, `--dry-run`, `-v`/`--verbose`, `--main-class <FQCN>`, `--bin <NAME>`, `-- <args>` |
+| `jals run`         | `execute_build_script` + `jals-project` + `RunTarget::resolve` + invocations | Run the root and dependency pre-build phases, compile the complete source graph, then run the resolved entry point with `java`. Compilation must succeed first. | `--manifest-path <PATH>`, `--dry-run`, `-v`/`--verbose`, `--main-class <FQCN>`, `--bin <NAME>`, `--invoke <NAME>`, `-- <args>` |
 | `jals clean`       | `CleanTargets::keys`                                                         | Remove `classes-dir` and `target/jals/build`, including stale outputs after a script is removed. A never-built project succeeds quietly.                        | `--manifest-path <PATH>`, `--dry-run`                                                                       |
 | `jals init [PATH]` | `InitOptions::scaffold`                                                      | Scaffold a new project: `jals.toml`, a starter `Main.java`, and a `.gitignore`. Refuses to overwrite an existing `jals.toml`.                                   | `--name <NAME>`                                                                                             |
 
@@ -110,13 +110,14 @@ release = 21                       # javac --release N
 # target = 17                      # javac --target N  (only when release is unset)
 classpath = ["libs/guava.jar"]    # -classpath entries (jars or dirs)
 javac-flags = ["-Xlint:all"]      # appended verbatim, before the source files
+# native-packages = ["jals.io"]    # Java packages implemented in Rust (jals-wasm backend only)
 
 # [build.resources]                # a sub-table, so it goes *after* every bare [build] key above
 # template = ["fabric.mod.json"]   # globs naming which resources are rendered as templates
 
 # [toolchain]                       # which javac/java to use (defaults to the system tools)
 # compiler = { distribution = { name = "temurin", version = 21 } }  # discover an installed JDK
-# runtime  = "system"               # "system" | "builtin" | { path = "…" } | { distribution = { … } }
+# runtime  = "system"               # …same, plus "wasm" (runs a jals-wasm module)
 
 [run]
 main-class = "com.example.Main"   # entry point for `jals run` (used only when no [[bin]] exists)
@@ -221,7 +222,56 @@ nothing still leaves every dependency script cached.
 | `target`        | integer          | —                        | `--target N` — only when `release` is unset                                                                                                                     |
 | `classpath`     | array of strings | `[]`                     | `-classpath` (joined with the platform separator); omitted entirely when empty                                                                                  |
 | `javac-flags`   | array of strings | `[]`                     | appended **verbatim** after the generated flags, before the source files — an escape hatch for anything the manifest does not model yet                         |
+| `native-packages` | array of strings | `[]`                   | the **native packages** to link — Java packages whose `native` methods are implemented in Rust. `jals-wasm` backend only (see below)                            |
 | `resources`     | sub-table        | `{ template = [] }`      | how resources become jar members; `template` is the globs rendered rather than copied (see below). A sub-table, so it goes after every bare `[build]` key       |
+
+### Native packages
+
+A **native package** is a Java package whose `native` methods are implemented in Rust. Selecting one
+does two things: its Java is compiled into the same artifact the project is, and each `native`
+method it declares becomes a WebAssembly **import** the runner links against the package's Rust half.
+
+```toml
+[build]
+backend = { type = "jals-wasm" }
+native-packages = ["jals.io"]
+```
+
+```java
+import jals.io.Out;
+
+public class Hello {
+    public static void greet() {
+        Out.println(new char[] {'h', 'i'});
+    }
+}
+```
+
+Four things about this are worth stating, because each one is a rule rather than a detail.
+
+**Only the `jals-wasm` backend can take one in.** A package's implementation is a host function
+supplied to a module, and a class file has nowhere to put one — so `native-packages` beside a
+class-file backend is a manifest error, the same shape `[toolchain] runtime = "wasm"` beside one is.
+
+**Which packages exist is a property of the binary, not of the manifest.** `jals` ships `jals.io`;
+the browser playground ships its own; a program embedding this toolchain registers whatever it
+likes. A name this build does not offer is reported with the names it does. `jals build` refuses it;
+`jals lint` and the language server warn and carry on, exactly as they do for any other analysis
+input they cannot resolve.
+
+**A package's methods are not module exports.** Every `static` method of the *project* is exported
+under its bare name; a package's are not. Otherwise a library's internals would fill the list
+`jals run --invoke <name>` offers on a miss, and — since the first export of a name wins and the
+second is dropped without a word — a package method could take a project method's export away
+from it.
+
+**The two halves cannot disagree about a signature.** An import is named by the declaring class's
+internal name and the method's name-with-descriptor (`jals/io/Out`, `writeChars([CII)V`), which are
+the two strings the Rust half registers under. One that spelled it differently produces an import
+nothing satisfies, refused when the module is instantiated with both spellings listed.
+
+See [`jals-native`](../jals-native/README.md) for how to write one, and
+[`examples/hello_world_native`](../examples/hello_world_native) for one end to end.
 
 ### Resource templates
 
@@ -243,16 +293,20 @@ segment, `?` matches exactly one, and `**` is a whole segment matching **zero or
 nothing fails the build rather than shipping the file unrendered: unlike `resource-dirs`, whose
 default lands on every project, a pattern here was written on purpose.
 
-Two namespaces are readable, and nothing else. Environment variables are deliberately absent — a
-value read from the ambient environment is part of no cache identity here.
+The engine is the workspace's own [`jinja`](../crates/jinja/README.md) crate — a general-purpose
+Jinja2 subset with no `jals` in it — and what this section describes is the *configuration* a build
+tool gives it. Two namespaces are readable, and nothing else. Environment variables are deliberately
+absent — a value read from the ambient environment is part of no cache identity here.
 
 | Expression | Reads |
 | --- | --- |
 | `{{ package.name }}` / `{{ package.version }}` | `[package]` metadata |
 | `{% if features.server %}` | whether a build feature is active under this `--features` selection |
 | `{{ features["1.20.1"] }}` | the same, for a feature name no `a.b` path can spell |
-| `{% for f in features %}` | the active feature set, in sorted order; `loop.index`, `index0`, `first`, `last`, `length` |
+| `{% for f in features %}` | the active feature set, in sorted order; `loop.index`, `index0`, `revindex`, `revindex0`, `first`, `last`, `length` |
 | `{{ package.version \| default("0.0.0") }}` | a fallback for a `[package]` key that is not set |
+| `{{ package.name \| upper }}` | one of the engine's filters — `default`, `upper`, `lower`, `trim`, `string`, `length`/`count`, `join`, `replace`, `first`, `last`, `reverse` |
+| `{% if package.version == "1.0" %}` | a comparison; `not`, `and`, `or` and parentheses go with it |
 | `{# … #}` | a comment, which renders to nothing |
 
 The bracket spelling is not sugar: a Minecraft-style project declares features called `1.20.1` and
@@ -365,6 +419,14 @@ asynchronously after Rhai evaluation and capability preflight succeed:
 | `add_classpath(jar)`                                                             | Add a task-produced JAR to the root classpath.                                |
 | `add_nested_classpath(jar)`                                                      | Expand every nested `.jar` member onto the root classpath (library bundlers). |
 | `publish_tree(owner, tree, destination, "replace-root", intent)`                 | Atomically replace an exclusive physical source subtree.                      |
+
+`remap_jar` and `merge_jars` both drop a signed jar's signature block
+(`META-INF/*.{SF,DSA,RSA,EC}`) and the per-entry digests in its manifest. Renaming every class leaves
+both describing bytes that no longer exist, and a union carries members the signer never saw; a JVM
+refuses either archive with `SecurityException: signer information does not match` — so a jar that
+kept them would compile against but never run. A Minecraft client jar carries about 3.7 MB of them.
+The two agree because a release that ships deobfuscated reaches `merge_jars` without passing through
+a remap at all.
 
 For example:
 
@@ -604,7 +666,7 @@ selection activates.
 
 | Key          | Type   | Default | Maps to                                                                                                                                                                                                                                            |
 | ------------ | ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `main-class` | string | —       | the fully-qualified entry point passed to `java`, used **only when no `[[bin]]` is declared**. `jals run` errors if it is unset, no `[[bin]]` exists, and `--main-class` is not given. The run classpath is `classes-dir` followed by `classpath`. |
+| `main-class` | string | —       | the fully-qualified entry point passed to `java`, used **only when no `[[bin]]` is declared**. `jals run` errors if it is unset, no `[[bin]]` exists, and `--main-class` is not given. The run classpath is `classes-dir` followed by `classpath`. Not read at all under `[build] backend = { type = "jals-wasm" }`, which has no main class — see below. |
 
 ### `[toolchain]`
 
@@ -616,7 +678,7 @@ is unaffected.
 | Key        | Type            | Default    | Meaning                                    |
 | ---------- | --------------- | ---------- | ------------------------------------------ |
 | `compiler` | string or table | `"system"` | which `javac` to use (see the forms below) |
-| `runtime`  | string or table | `"system"` | which `java` to use (same forms)           |
+| `runtime`  | string or table | `"system"` | which `java` to use, or `"wasm"` for no `java` at all |
 
 Each value is one of four forms — a keyword string, or a tagged table naming the form (the enum's
 plain serde representation; nothing is classified from a free-form string):
@@ -627,6 +689,7 @@ plain serde representation; nothing is classified from a free-form string):
 | `"builtin"`                | `"builtin"`                                                | the **in-process backend** instead of a JDK tool — today a _dummy_ (compile copies each source into the `classes-dir` unchanged, nothing is compiled; run is a successful no-op, nothing is executed), the placeholder a future embedded compiler replaces behind the same selector |
 | `{ path = "…" }`           | `{ path = "/opt/jdk-21" }`, `{ path = "./jdk/bin/javac" }` | an explicit JDK home directory (the tool is `<path>/bin/<tool>`) or the tool binary itself; a relative path resolves against the manifest dir. Used verbatim — a non-existent path errors rather than silently reverting to `PATH`.                                                 |
 | `{ distribution = { … } }` | `{ distribution = { name = "temurin", version = 21 } }`    | a JDK to **discover** among the installed ones by distribution and/or version; both keys are optional (a bare `version` matches any distribution, a bare `name` any version)                                                                                                        |
+| `"wasm"` (`runtime` only)  | `"wasm"`                                                   | the **WebAssembly engine compiled into this binary**, running the module `[build] backend = { type = "jals-wasm" }` emitted. Resolves no program — the engine is already linked in — and is the one `runtime` value constrained by `[build] backend` |
 
 A JDK tool is resolved in this order: the `$JAVAC`/`$JAVA` environment override (wins
 unconditionally, for CI/back-compat) → the `[toolchain]` selection above → `$JAVA_HOME/bin/<tool>` →
@@ -637,6 +700,22 @@ future work, and an un-discovered distribution falls back to the system tools. A
 selector skips program resolution entirely — no process is spawned for that step; the two selectors
 are independent (each is its own enum, matched by its own `select` factory), so e.g.
 `compiler = "builtin"` with the runtime unset dummy-"compiles" but still runs with the real `java`.
+
+**`runtime = "wasm"` is the one exception to that independence.** Every other value answers *which
+`java`* and pairs with any backend; that one answers *not a `java` at all* — it runs a WebAssembly
+module, and only `[build] backend = { type = "jals-wasm" }` produces one. `Manifest::validate`
+refuses `runtime = "wasm"` beside a class-file backend, so `jals build`, `jals run`, `jals test` and
+the analysis hosts all reach that half: a selection that could never be honoured is a manifest error
+wherever the manifest is read, not one command's.
+
+The other half is **not** symmetric, and deliberately so. `backend = { type = "jals-wasm" }` under
+a JVM `runtime` validates cleanly, because it is only a contradiction for a command that runs
+something: `jals test` refuses it by name (it has a module and a runtime that cannot load one),
+while `jals run` needs no `java` for a module and so *ignores* the `[toolchain] runtime` selection
+rather than refusing it — which is why [`examples/hello_world_wasm`](../examples/hello_world_wasm)
+declares no `[toolchain]` at all. Adding a `#[test]` to such a project therefore also means adding
+`runtime = "wasm"`. See [§5](#5-testing) for what it does to a test run, and
+[`examples/unit_tests_wasm`](../examples/unit_tests_wasm) for a worked project.
 
 ### `[[bin]]`
 
@@ -653,7 +732,8 @@ compilation unit (unlike Rust). It only selects which `main-class` `java` runs �
 what is compiled. `jals build --bin <name>` therefore only validates that the name exists; the
 compile command is unchanged.
 
-The run target for `jals run` is resolved in this order (`RunTarget::resolve`):
+The run target for `jals run` is resolved in this order (`RunTarget::resolve`) — for a backend
+that produces class files, which is every backend but `jals-wasm`:
 
 1. `--main-class <FQCN>` — runs that class directly, bypassing the manifest.
 2. `--bin <name>` — the `[[bin]]` with that name (error if none matches).
@@ -663,6 +743,17 @@ The run target for `jals run` is resolved in this order (`RunTarget::resolve`):
 
 Once any `[[bin]]` exists, `[run] main-class` is ignored for selection. Duplicate bin names and a
 `default-run` that names no bin are rejected at manifest load (`Manifest::validate`).
+
+`[build] backend = { type = "jals-wasm" }` has no entry in that list, because wasm has no
+entry-point convention and Java's `main` cannot be lowered — its `String[]` needs a `java.base` the
+module has no room for. `RunTarget::resolve` is not called for such a project: its entry point is an
+**exported name**, given as `jals run --invoke <name> -- <args>`, and naming none is still a run
+(instantiating executes the module's start function, which is where a class's `static` initialisers
+went — a project with no static state has none). `--main-class`/`--bin` against that backend, and
+`--invoke` against a class-file one, are refused rather than ignored; a `[run] main-class` left in
+the manifest is warned about.
+[`examples/hello_world_wasm`](../examples/hello_world_wasm) is a worked example: it builds and runs
+with no JDK on `PATH`, and its greeting is a `char[]` because the module has no `String`.
 
 ### `[dependencies]`
 
@@ -784,6 +875,7 @@ jals run                    # compile, then run the resolved entry point
 jals run --bin server       # run the [[bin]] named "server"
 jals run -- arg1 arg2       # ...passing args to the program
 jals run --main-class com.example.Other
+jals run --invoke f -- 7    # for a `jals-wasm` project: call an exported static method
 jals clean                  # remove target/classes and target/jals/build
 ```
 
@@ -934,8 +1026,8 @@ Making a `features` release preset also imply a default `javac --release` is sti
 
 | Section                               | Cargo analogue        | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[dev-dependencies]`                  | `[dev-dependencies]`  | **done** — see [§5](#5-testing). Same entry shapes as `[dependencies]`, resolved by `jals test` and by the analysis hosts and by nothing that produces output, and **not transitive**.                                                                                                                                                                                                                                                                                                    |
 | `[dependencies]`                      | `[dependencies]`      | **partly done**: explicit JARs are wired for analysis/compile (plus optional navigation sources), and `{ git = "url", branch/tag/rev, dir }` / `{ path = "...", dir }` form a transitive JALS source-project graph with exact manifest probing, dependency scripts, LSP navigation, and `build`/`run` compilation. Maven coordinates, POM/version resolution, transitive Maven download, and a lockfile remain §3.                                                                            |
-| `[dev-dependencies]`                  | `[dev-dependencies]`  | Dependencies only a test run puts on the classpath. Not needed for testing itself — `jals test` needs no framework (§5) — but a test that reaches for a helper library still has nowhere to declare it.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `[toolchain]`                         | `rust-toolchain.toml` | **partly done**: `compiler`/`runtime` select `javac`/`java` independently — `"system"`, `"builtin"`, an explicit `{ path = "…" }`, or a `{ distribution = { name, version } }` discovered among the installed JDKs (SDKMAN / `~/.jdks` / `~/.jdk` / `/usr/lib/jvm` / macOS). Still to come: **automatic download** of a missing JDK (rust-toolchain style, e.g. via the foojay disco API) into a per-user cache, and letting a `[package] features` release preset default `[build] release`. |
 | `[repositories]`                      | (registries)          | Maven repository URLs; default Maven Central                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `[profile.dev]` / `[profile.release]` | `[profile.*]`         | debug vs. optimized/stripped builds (`-g` vs. `-g:none`, lint levels)                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -1029,11 +1121,94 @@ The flags follow `cargo nextest run`: positional substring filters plus `--exact
 `--no-run`, `--hide-progress-bar`, `--color` and `--no-tests`.
 [`examples/unit_tests`](../examples/unit_tests) is a worked example.
 
+#### Running the tests on the embedded WebAssembly engine
+
+`[toolchain] runtime = "wasm"`, beside `[build] backend = { type = "jals-wasm" }`, runs the suite on
+the interpreter compiled into `jals` instead of on a JVM — **no JDK at any step**, since the
+compiler and the engine are both in-process.
+[`examples/unit_tests_wasm`](../examples/unit_tests_wasm) is a worked example. Four things differ,
+and each is forced by the target rather than chosen:
+
+- **The harness is one exported function per test**, not a generated `main`. wasm has no
+  entry-point convention and Java's cannot be lowered — `main` takes a `String[]`, and a module has
+  no `java.base` to supply `String`. An export name carries no owner, so the generated name carries
+  the class (`JalsTest$com$example$MathTest$adds`); two tests that would still collide are a
+  compile-time error rather than a module that silently holds one of them.
+- **`assert` is armed by the compile, not by the launcher.** A JVM decides at start-up whether
+  assertions run and `jals test` passes `-ea` for exactly that; a wasm host has no such moment, so
+  `jals test` compiles the checks in and `jals build` does not. Two consequences worth knowing: the
+  two commands produce genuinely different modules (and different cache entries), and an `assert`
+  whose condition names something with no wasm representation compiles under `jals build` and is
+  reported under `jals test`. A failed assertion is a **trap** — `AssertionError` is a library type
+  no module declares, and nothing catches a trap, which is the property an assertion failure needs.
+- **`#[should_fail]` is inverted by the runner.** The JVM shim wraps the call in
+  `catch (Throwable)`; here a `catch` type has to be a class the project declares, so the runner
+  reads the call's outcome instead. A trap and an uncaught `throw` are one verdict, as they are on
+  a JVM where both are `Throwable`s. What a module cannot report is *what* was thrown: the object
+  belongs to the engine's collector and the store is gone by the time a caller sees the failure, so
+  a failing test's account is one line and never a stack trace.
+- **Three flags are refused rather than ignored**, because dropping a product the command line asked
+  for is worse than saying the two do not go together. `--timeout`, since a wasm call cannot be
+  interrupted by this runner, which calls each export straight through with no execution budget, so
+  a test that never returns holds its worker until the process is killed. `--no-capture`, since a
+  module has no standard output to hand to the terminal. `--retries`, since a run has no clock,
+  no network, no threads, no filesystem and a fresh store per test, so the second attempt
+  recomputes the identical answer.
+
+Everything else is shared with the JVM runner and means exactly what it does there: the filters,
+`--exact`, `--skip`, `--run-ignored`, `--partition`, `-j`, `--fail-fast`/`--max-fail`, `--list`,
+`--no-run`, `--message-format`, `--no-tests`. Sharing the planning half is not a convenience — a
+selection that differed between the two would make `--partition count:2/3` mean two things.
+`--list` keeps that meaning too, and pays a compile it could technically skip: the ids come from the
+sources — the same catalog the wrappers are generated from, so no export name is ever un-mangled to
+recover one — but a test that does not compile is not a test the flag should name, and on a JVM the
+compile is a precondition rather than a choice.
+
+Each test runs in a fresh instance, which is the same isolation one JVM per test buys at a far
+lower price; it also re-runs every `static` initialiser, so one that traps fails the whole run up
+front rather than each test — a trap seen later has to mean the body. A test body is bounded by
+what the wasm backend compiles: primitives, project classes, arrays, generics, interfaces and
+project-declared exceptions, but no `String`, no boxing and no I/O. A construct with no lowering is
+reported at compile time and today **without the file it is in** — `CompileWasm` takes the whole
+project at once and names the construct rather than the position.
+
 **Still open:** a filter *expression* language (nextest's `-E`), JUnit XML output, reusing a
 compiled test build across runs (`--archive-file`), interoperating with an existing JUnit suite,
 and `jals bench` (JMH) once dependencies (§3) exist. Two known limits: `-j` can only narrow the
 worker pool the executor already sized to the machine, and interrupting a run leaves the test JVMs
 it had already started to finish on their own.
+
+### Test-only dependencies
+
+`[dev-dependencies]` takes the same three entry shapes as `[dependencies]` — `jar`, `git`, `path`
+— and differs only in **when** an entry is resolved:
+
+```toml
+[dev-dependencies]
+mc-client-test = { path = "../minecraft_client_test" }
+```
+
+- **Who resolves it.** `jals test` and the analysis hosts (`jals lint`, the language server); not
+  `jals build`, not `jals run`, and not the packaging step behind them. Which of the two tables a
+  resolution reads is a `jals_config::DependencyScope` a host **states** — `Build` or `Test` —
+  never something inferred from the command or from `ProjectInputOptions`, which is the orthogonal
+  question of what an assembly takes *out* of a plan.
+- **Why the table has to exist.** A `git`/`path` entry is a *source* dependency: its
+  `[build] source-dirs` tree is lowered under its own frontend and handed to the consumer's
+  `javac`. A test-support library declared in `[dependencies]` would therefore be compiled into
+  the consumer's output and packaged. Declared here it reaches the test lowering and nothing else.
+- **`Test` is additive.** It is `[dependencies]` *plus* `[dev-dependencies]`, for the same reason
+  `[test] source-dirs` adds to `[build] source-dirs` rather than replacing it.
+- **Not transitive.** A dependency's own `[dev-dependencies]` are never walked: discovery drops the
+  root's scope at the first edge and recurses under `Build` forever after. A consumer of a consumer
+  never sees them.
+- **One name, one entry.** A name declared in both tables is rejected — a deliberate divergence
+  from Cargo, which lets the dev entry override. Here a name denotes one entry wherever it is read
+  (`dep:<name>`, `<name>/<feature>`, one discovery edge), and two specs under it have no reading.
+- **What still does not cross the edge.** `build.add_jvm_arg` reaches the test JVM only from the
+  *root* project's script, so a dev-dependency contributes classpath and sources but no JVM flags.
+  [`examples/minecraft_client_test`](../examples/minecraft_client_test) is a worked example, and
+  documents what a consumer therefore writes itself.
 
 ## 6. Operational / CLI flags (language-agnostic)
 

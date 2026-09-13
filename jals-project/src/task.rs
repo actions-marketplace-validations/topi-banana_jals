@@ -17,10 +17,11 @@ use jals_build::task::{
 };
 use jals_classpath::{
     ExpectedDigest, ExternalArtifactResolver, ExternalArtifactSpec, ExternalLocator, Fetcher,
-    LibrarySource, SourceTree, SourceTreeExtraction, SourceTreeLimits,
+    JarTransforms, LibrarySource, SourceTree, SourceTreeExtraction, SourceTreeLimits,
 };
 use jals_config::Manifest;
 use jals_exec::Exec;
+use jals_progress::{Activity, Outcome, Progress, Task};
 use jals_storage::{
     ArtifactCache, CacheBackend, CacheKey, CacheNamespace, Change, ContentDigest, DirKey, FileKey,
     ProjectStorage, ProjectView, ProvenanceFold, RelativePath, SourceBackend,
@@ -112,11 +113,22 @@ pub(crate) struct RootBuildScriptOutput {
 ///
 /// Whether a fetch may reach the network is not here: it is carried by the `Fetcher` the execution
 /// is handed, so the two cannot be paired wrongly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskRuntime {
     /// Ceiling on any single fetch, including a size projected out of fetched JSON with
     /// `tasks.json_u64`. A fetch buffers up to this many bytes before its digest is checked.
     pub(crate) max_fetch_bytes: u64,
+    /// Where each node reports what it is doing.
+    ///
+    /// This is the right home for it and not a convenience: the type is already documented as
+    /// carrying "ceilings on how an execution runs, not inputs that change what it produces", and
+    /// is deliberately excluded from the memo key for exactly that reason. An observer has the same
+    /// property — a plan watched and a plan unwatched must produce the same bytes — so folding it
+    /// in here is what keeps it out of every provenance in the crate.
+    ///
+    /// It costs the type its `Copy`: `Progress` is an `Arc` handle, so the node loop clones one
+    /// refcount bump per node.
+    pub(crate) progress: Progress,
 }
 
 /// Whether a root run may apply the exclusive source-tree publications its plan declares.
@@ -145,6 +157,8 @@ pub struct RootBuildScriptOptions<'a> {
     /// Whether exclusive source-tree publications may touch the project. See
     /// [`SourcePublication`].
     pub publications: SourcePublication,
+    /// Where the root's task nodes report what they are doing.
+    pub progress: &'a Progress,
 }
 
 /// Identity of one memoized snapshot task execution, plus the runtime it executes under.
@@ -153,7 +167,7 @@ pub struct RootBuildScriptOptions<'a> {
 /// fingerprint — see [`snapshot_provenance`](BuildTaskExecutor::snapshot_provenance), which folds
 /// exactly those and nothing else. `runtime` is deliberately *not* part of that key: it carries
 /// ceilings on how an execution runs, not inputs that change what it produces.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SnapshotTaskOptions<'a> {
     /// Stable identity of the project the plan belongs to — a graph node's digest.
     pub(crate) identity: ContentDigest,
@@ -242,13 +256,27 @@ struct OwnedFile {
     digest: String,
 }
 
-/// Wire version of a memoized snapshot execution. Bump it whenever the record's meaning changes for
-/// unchanged bytes; a mismatch is a miss, never a misread.
+/// Wire version of a memoized snapshot execution. Bump it whenever the *record's* meaning changes
+/// for unchanged bytes; a mismatch is a miss, never a misread.
+///
+/// It versions this record and nothing below it. What a `jals-classpath` transform writes is
+/// versioned by that crate and folded into the provenance by [`Self::fold_transform_versions`], so
+/// a remap or a merge that starts producing different bytes invalidates every memo here without
+/// this number moving. That is deliberate and was learned the expensive way: this record names the
+/// artifacts a *previous* transform produced and reusing it is what stops the new transform from
+/// running at all, so for two rounds a shipped fix was invisible behind a warm cache — a remapped
+/// jar that kept its signature block, and a merged jar that kept saying `Multi-Release: false` and
+/// killed the client in the same static initializer. Both were fixed by remembering to bump this
+/// as well. Nothing has to be remembered now.
 ///
 /// 2: a publication records the intent it was declared with, which decides where the consumer
 /// routes it. The plan fingerprint already folds that intent into the provenance, so a pre-intent
 /// record is unreachable by key as well — this is the belt to that's braces.
-const TASK_EXECUTION_VERSION: u32 = 2;
+///
+/// 3, 4, 5: the outer half of three rounds of `jals-classpath`'s own `REMAP_OUTPUT_VERSION` /
+/// `MERGE_OUTPUT_VERSION`, back when that half was a thing a person had to write down. Kept as
+/// history: they are why the fold exists.
+const TASK_EXECUTION_VERSION: u32 = 5;
 
 /// A [`BuildTaskExecution`] recorded in the verified cache, addressed by what produced it.
 ///
@@ -348,7 +376,11 @@ impl BuildTaskExecutor {
             .filter_map(|root| DirKey::parse(root).ok())
             .collect();
         let view = storage.view();
-        let prepared = prepare_build_script(
+        // The root's script phase, reported the way a dependency node's is — the two are the same
+        // phase, and a reader waiting on `build.rhai` should not have to know which project it
+        // belongs to before the line appears.
+        let script = options.progress.begin(Activity::Script, "");
+        let prepared = match prepare_build_script(
             &view,
             storage.artifacts(),
             BuildScriptCacheScope::ROOT,
@@ -356,7 +388,23 @@ impl BuildTaskExecutor {
             options.environment,
             options.limits,
         )
-        .await?;
+        .await
+        {
+            Ok(prepared) => {
+                script.finish(if prepared.is_some() {
+                    Outcome::Completed
+                } else {
+                    // No `[build] script` at all: nothing ran, and saying so is what keeps a
+                    // `--timings` report honest about which phases cost anything.
+                    Outcome::Skipped
+                });
+                prepared
+            }
+            Err(error) => {
+                script.finish(Outcome::Failed);
+                return Err(error.into());
+            }
+        };
         let Some(prepared) = prepared else {
             Self::reject_blocked_roots(
                 &Self::owned_publication_roots(&view, &source_roots)?,
@@ -397,8 +445,9 @@ impl BuildTaskExecutor {
             &view,
             storage.artifacts_mut(),
             &plan,
-            TaskRuntime {
+            &TaskRuntime {
                 max_fetch_bytes: options.limits.max_fetch_bytes,
+                progress: options.progress.clone(),
             },
             options.host,
         )
@@ -528,7 +577,7 @@ impl BuildTaskExecutor {
             view,
             cache,
             plan,
-            options.runtime,
+            &options.runtime,
             BuildTaskHost::Snapshot,
         )
         .await?;
@@ -545,12 +594,26 @@ impl BuildTaskExecutor {
         fold.version(TASK_EXECUTION_VERSION)
             .digest(options.identity)
             .digest(Self::plan_fingerprint(plan)?);
+        Self::fold_transform_versions(&mut fold);
         // The feature set is already ordered and deduplicated by `BTreeSet`, and every append is
         // length-framed, so two different selections can never fold to one digest.
         for feature in options.features {
             fold.bytes(feature.as_bytes());
         }
         Ok(fold.finish())
+    }
+
+    /// Fold the output versions of the `jals-classpath` jar transforms this record can name the
+    /// artifacts of.
+    ///
+    /// A task's own inputs say what went *into* a remap or a merge and nothing about what that
+    /// transform does with them, so without this a bump over there would be replayed straight past:
+    /// the memo hits, the task never runs, and the jar the fix replaced is served again. Every
+    /// transform is folded rather than only the ones this plan happens to reach — which
+    /// over-invalidates a task that remaps nothing, on the rare deliberate occasion a version moves,
+    /// and is the cheap side of the trade.
+    fn fold_transform_versions(fold: &mut ProvenanceFold) {
+        JarTransforms::fold(fold);
     }
 
     /// A recorded execution whose every artifact is still present, or `None` — a partially evicted
@@ -661,7 +724,7 @@ impl BuildTaskExecutor {
         view: &ProjectView,
         cache: &mut ArtifactCache<C>,
         plan: &TaskPlan,
-        runtime: TaskRuntime,
+        runtime: &TaskRuntime,
         host: BuildTaskHost,
     ) -> Result<BuildTaskExecution, BuildTaskRunError> {
         match host {
@@ -686,13 +749,27 @@ impl BuildTaskExecutor {
             if !reachable.contains(&node.id) {
                 continue;
             }
-            let value =
-                Self::execute_node(exec, fetcher, view, cache, &values, &node.kind, runtime)
-                    .await
-                    .map_err(|message| BuildTaskRunError::Node {
+            // One unit per node, named here rather than inside each arm: the plan's own
+            // vocabulary is the phase vocabulary a reader wants, and deriving it once is what keeps
+            // a node added later from arriving as unnamed work.
+            let report = Self::node_report(&runtime.progress, &node.kind);
+            let value = match Self::execute_node(
+                exec, fetcher, view, cache, &values, &node.kind, runtime, &report,
+            )
+            .await
+            {
+                Ok(value) => {
+                    report.finish(Outcome::Completed);
+                    value
+                }
+                Err(message) => {
+                    report.finish(Outcome::Failed);
+                    return Err(BuildTaskRunError::Node {
                         id: node.id,
                         message,
-                    })?;
+                    });
+                }
+            };
             values[node.id.index()] = Some(value);
         }
 
@@ -722,29 +799,69 @@ impl BuildTaskExecutor {
                     intent,
                     ..
                 } => {
-                    let tree = Self::source_tree(&values, *tree)
-                        .map_err(BuildTaskRunError::Terminal)?
-                        .clone();
-                    if tree.files.is_empty() {
-                        return Err(BuildTaskRunError::Terminal(format!(
-                            "publication owner `{owner}` produced an empty source tree"
-                        )));
+                    let report = runtime.progress.begin(Activity::Publish, owner.clone());
+                    // The unit spans the whole publication, and every way out of it says how it
+                    // ended: closing it after the `values` lookup would time a slice index rather
+                    // than the work the activity is named for, and leaving a failure to `Drop`
+                    // would report `Abandoned`, which means the emitter has a hole in it.
+                    let published = (|| {
+                        let tree = Self::source_tree(&values, *tree)
+                            .map_err(BuildTaskRunError::Terminal)?
+                            .clone();
+                        if tree.files.is_empty() {
+                            return Err(BuildTaskRunError::Terminal(format!(
+                                "publication owner `{owner}` produced an empty source tree"
+                            )));
+                        }
+                        let destination = DirKey::parse(destination).map_err(|error| {
+                            BuildTaskRunError::Terminal(format!(
+                                "publication owner `{owner}` has invalid destination: {error:?}"
+                            ))
+                        })?;
+                        Ok(BuildTaskPublication {
+                            owner: owner.clone(),
+                            destination,
+                            tree,
+                            intent: *intent,
+                        })
+                    })();
+                    match published {
+                        Ok(publication) => {
+                            output.publications.push(publication);
+                            report.finish(Outcome::Completed);
+                        }
+                        Err(error) => {
+                            report.finish(Outcome::Failed);
+                            return Err(error);
+                        }
                     }
-                    let destination = DirKey::parse(destination).map_err(|error| {
-                        BuildTaskRunError::Terminal(format!(
-                            "publication owner `{owner}` has invalid destination: {error:?}"
-                        ))
-                    })?;
-                    output.publications.push(BuildTaskPublication {
-                        owner: owner.clone(),
-                        destination,
-                        tree,
-                        intent: *intent,
-                    });
                 }
             }
         }
         Ok(output)
+    }
+
+    /// The unit of work one plan node is, or `None` for a node that is not worth watching.
+    ///
+    /// A value node — a URL, a digest, a byte count, a projection out of already-fetched JSON — is
+    /// arithmetic, and a line for it would bury the four steps that actually take minutes. A
+    /// [`TaskNodeKind::Fetch`] is deliberately absent too: the resolver beneath it reports the
+    /// fetch itself, with the locator's own name and the transfer's byte count, and this would be
+    /// the same news with less in it.
+    fn node_report(progress: &Progress, node: &TaskNodeKind) -> Task {
+        let (activity, subject) = match node {
+            TaskNodeKind::ExtractJava { prefix, .. } => (Activity::Extract, prefix.as_str()),
+            TaskNodeKind::NestedJar { member, .. } => (Activity::Extract, member.as_str()),
+            TaskNodeKind::RemapJar { .. } => (Activity::Remap, ""),
+            TaskNodeKind::MergeJars { .. } => (Activity::Merge, ""),
+            TaskNodeKind::DecompileJava { prefix, .. } => (Activity::Decompile, prefix.as_str()),
+            // A value node is arithmetic — a URL, a digest, a byte count, a projection out of
+            // already-fetched JSON — and a line for it would bury the four steps that take minutes.
+            // A `Fetch` is deliberately silent here too: the resolver beneath it reports the
+            // transfer itself, with the locator's own name and its byte count.
+            _ => return Task::silent(),
+        };
+        progress.begin(activity, subject)
     }
 
     /// Publication destinations declared by a plan, in terminal order.
@@ -1007,6 +1124,10 @@ impl BuildTaskExecutor {
         Ok(state)
     }
 
+    // One arm per `TaskNodeKind`, and every parameter is something one of them needs: how to
+    // execute, what may fetch, what to read, where to publish, what the earlier nodes produced,
+    // the node itself, its ceilings, and the unit the caller opened for it.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_node<F: Fetcher, C: CacheBackend>(
         exec: &Exec,
         fetcher: &F,
@@ -1014,7 +1135,8 @@ impl BuildTaskExecutor {
         cache: &mut ArtifactCache<C>,
         values: &[Option<TaskValue>],
         node: &TaskNodeKind,
-        runtime: TaskRuntime,
+        runtime: &TaskRuntime,
+        report: &Task,
     ) -> Result<TaskValue, String> {
         match node {
             TaskNodeKind::HttpsUrl { value } => {
@@ -1079,7 +1201,9 @@ impl BuildTaskExecutor {
                     max_bytes,
                     namespace: CacheNamespace::BuildTaskArtifact,
                 };
-                let key = ExternalArtifactResolver::resolve(fetcher, cache, &spec).await?;
+                let key =
+                    ExternalArtifactResolver::resolve(fetcher, cache, &spec, &runtime.progress)
+                        .await?;
                 match kind {
                     TaskFetchKind::Jar => Ok(TaskValue::Jar(key)),
                     TaskFetchKind::Json => {
@@ -1180,6 +1304,7 @@ impl BuildTaskExecutor {
                         max_file_bytes: 16 * 1_048_576,
                         max_total_bytes: 1_024 * 1_048_576,
                     },
+                    report,
                 )
                 .await
                 .map(TaskValue::SourceTree)
@@ -1213,6 +1338,7 @@ impl BuildTaskExecutor {
                         direction: Self::remap_direction(*direction),
                         hierarchy: &hierarchy,
                     },
+                    report,
                 )
                 .await
                 .map(TaskValue::Jar)
@@ -1220,7 +1346,7 @@ impl BuildTaskExecutor {
             TaskNodeKind::MergeJars { base, overlay } => {
                 let base = Self::jar(values, *base)?.clone();
                 let overlay = Self::jar(values, *overlay)?.clone();
-                jals_classpath::JarMerge::merge(exec, cache, &base, &overlay)
+                jals_classpath::JarMerge::merge(exec, cache, &base, &overlay, report)
                     .await
                     .map(TaskValue::Jar)
             }
@@ -1238,6 +1364,7 @@ impl BuildTaskExecutor {
                         max_file_bytes: 16 * 1_048_576,
                         max_total_bytes: 1_024 * 1_048_576,
                     },
+                    report,
                 )
                 .await
                 .map(TaskValue::SourceTree)
@@ -1408,14 +1535,23 @@ mod tests {
             self.network
         }
 
-        fn fetch_admitted(&self, locator: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+        fn retry(&self) -> jals_classpath::RetrySchedule {
+            jals_classpath::RetrySchedule::none()
+        }
+
+        fn delay(&self, _: u32) -> impl Future<Output = ()> {
+            ready(())
+        }
+
+        fn fetch_admitted(
+            &self,
+            locator: &str,
+            _: &jals_progress::Task,
+        ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            ready(
-                self.responses
-                    .get(locator)
-                    .cloned()
-                    .ok_or_else(|| format!("unexpected fetch `{locator}`")),
-            )
+            ready(self.responses.get(locator).cloned().ok_or_else(|| {
+                jals_classpath::FetchError::permanent(format!("unexpected fetch `{locator}`"))
+            }))
         }
     }
 
@@ -1481,6 +1617,7 @@ mod tests {
                 &mut storage,
                 &mut BuildScriptSession::new(),
                 RootBuildScriptOptions {
+                    progress: &Progress::SILENT,
                     manifest: &manifest(),
                     environment: &BuildScriptEnvironment::new(),
                     limits: &BuildScriptLimits::default(),
@@ -1503,6 +1640,7 @@ mod tests {
                 &mut storage,
                 &mut BuildScriptSession::new(),
                 RootBuildScriptOptions {
+                    progress: &Progress::SILENT,
                     manifest: &manifest(),
                     environment: &BuildScriptEnvironment::new(),
                     limits: &BuildScriptLimits::default(),
@@ -1541,6 +1679,7 @@ mod tests {
                 &mut storage,
                 &mut BuildScriptSession::new(),
                 RootBuildScriptOptions {
+                    progress: &Progress::SILENT,
                     manifest: &manifest(),
                     environment: &BuildScriptEnvironment::new(),
                     limits: &BuildScriptLimits::default(),
@@ -1660,5 +1799,42 @@ mod tests {
             );
             assert!(storage.view().file(&manual).is_err());
         });
+    }
+
+    /// The jar transforms' output versions reach the task provenance.
+    ///
+    /// This record names the artifacts a remap or a merge produced and replays them without the
+    /// task running, so a transform whose bytes changed has to reach the *key* — the memo is what
+    /// stops the new transform from ever executing. It went unnoticed twice while the rule was a
+    /// comment asking for [`TASK_EXECUTION_VERSION`] to be bumped alongside, so the fold is what
+    /// enforces it and this is what keeps the fold.
+    #[test]
+    fn a_jar_transform_version_reaches_the_task_provenance() {
+        let plan = TaskPlan::new();
+        let features = BTreeSet::new();
+        let options = SnapshotTaskOptions {
+            identity: ContentDigest::of(b"node"),
+            features: &features,
+            runtime: TaskRuntime {
+                max_fetch_bytes: 1,
+                progress: Progress::SILENT,
+            },
+        };
+        let provenance = BuildTaskExecutor::snapshot_provenance(&plan, &options)
+            .expect("the empty plan fingerprints");
+
+        // The same fold with the transform versions left out. Written here rather than reached
+        // through a flag so that deleting the call in `snapshot_provenance` fails this rather than
+        // changing what both sides compute.
+        let mut without = ProvenanceFold::new(b"jals.build-task.snapshot\0");
+        without
+            .version(TASK_EXECUTION_VERSION)
+            .digest(options.identity)
+            .digest(BuildTaskExecutor::plan_fingerprint(&plan).expect("fingerprints"));
+        assert_ne!(
+            provenance,
+            without.finish(),
+            "a task memo that does not fold in what a transform writes replays the old bytes"
+        );
     }
 }

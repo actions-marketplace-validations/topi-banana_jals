@@ -7,7 +7,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use jals_classpath::{Fetcher, NativeProjectPlan, ProjectInputOptions, ProjectInputs, SourceFile};
-use jals_config::Manifest;
+use jals_config::{DependencyScope, Manifest};
 use jals_storage::{CacheNamespace, NativeStorage};
 
 /// The build features a test project resolves with nothing selected — its own `[features] default`
@@ -27,14 +27,26 @@ impl Fetcher for NoFetch {
         jals_classpath::NetworkPolicy::Online
     }
 
-    fn fetch_admitted(&self, _: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+    fn retry(&self) -> jals_classpath::RetrySchedule {
+        jals_classpath::RetrySchedule::none()
+    }
+
+    fn delay(&self, _: u32) -> impl Future<Output = ()> {
+        ready(())
+    }
+
+    fn fetch_admitted(
+        &self,
+        _: &str,
+        _: &jals_progress::Task,
+    ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
         ready(Self::refuse())
     }
 }
 
 impl NoFetch {
     /// Diverges: being asked at all is the failure this fixture asserts against.
-    fn refuse() -> Result<Vec<u8>, String> {
+    fn refuse() -> Result<Vec<u8>, jals_classpath::FetchError> {
         panic!("unexpected fetch")
     }
 }
@@ -48,14 +60,26 @@ impl Fetcher for OfflineFetch {
         jals_classpath::NetworkPolicy::Offline
     }
 
-    fn fetch_admitted(&self, _: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+    fn retry(&self) -> jals_classpath::RetrySchedule {
+        jals_classpath::RetrySchedule::none()
+    }
+
+    fn delay(&self, _: u32) -> impl Future<Output = ()> {
+        ready(())
+    }
+
+    fn fetch_admitted(
+        &self,
+        _: &str,
+        _: &jals_progress::Task,
+    ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
         ready(Self::refuse())
     }
 }
 
 impl OfflineFetch {
     /// Diverges: being asked at all is the failure this fixture asserts against.
-    fn refuse() -> Result<Vec<u8>, String> {
+    fn refuse() -> Result<Vec<u8>, jals_classpath::FetchError> {
         panic!("unexpected fetch")
     }
 }
@@ -129,6 +153,7 @@ fixture = { git = "https://example.invalid/fixture.git" }
         .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -181,6 +206,7 @@ fixture = {{ git = "{locator}" }}
         .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -220,6 +246,7 @@ fixture = {{ git = "{locator}" }}
         .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -233,6 +260,7 @@ fixture = {{ git = "{locator}" }}
             &mut storage,
             &plan.plan,
             ProjectInputOptions::Compile,
+            &jals_progress::Progress::SILENT,
         )
         .await;
         let [SourceFile::Artifact(source)] = inputs.source_dep_sources.as_slice() else {
@@ -298,6 +326,7 @@ fixture = {{ git = "{locator}", rev = "{rev}" }}
 
         let mut first = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -313,6 +342,7 @@ fixture = {{ git = "{locator}", rev = "{rev}" }}
 
         let mut second = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),

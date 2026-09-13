@@ -35,12 +35,12 @@ use jals_exec::Yielder;
 use jals_syntax::SyntaxKind::{
     AMP, AMP_AMP, ARG_LIST, ASSIGNMENT_EXPR, BANG, BANG_EQ, BOOLEAN_KW, BYTE_KW, CALL_EXPR, CARET,
     CAST_EXPR, CATCH_CLAUSE, CHAR_KW, CHAR_LITERAL, COMMA, CONSTRUCTOR_DECL, DOT, DOUBLE_KW,
-    ELLIPSIS, EQ, EQ_EQ, FALSE_KW, FIELD_ACCESS, FIELD_DECL, FLOAT_KW, FLOAT_LITERAL,
-    FOR_EACH_STMT, GT, IDENT, INSTANCEOF_KW, INT_KW, INT_LITERAL, LAMBDA_EXPR, LBRACK,
-    LOCAL_VAR_DECL, LONG_KW, LSHIFT, LT, LT_EQ, METHOD_DECL, MINUS, NEW_EXPR, NULL_KW, PARAM,
-    PERCENT, PIPE, PIPE_PIPE, PLUS, RECORD_COMPONENT, RESOURCE, RETURN_STMT, SHORT_KW, SLASH, STAR,
-    STRING_LITERAL, SUPER_KW, TERNARY_EXPR, TEXT_BLOCK, THIS_KW, TILDE, TRUE_KW, TYPE_PATTERN,
-    VAR_KW, VOID_KW,
+    ELLIPSIS, ENUM_CONSTANT, EQ, EQ_EQ, FALSE_KW, FIELD_ACCESS, FIELD_DECL, FLOAT_KW,
+    FLOAT_LITERAL, FOR_EACH_STMT, GT, IDENT, INSTANCEOF_KW, INT_KW, INT_LITERAL, LAMBDA_EXPR,
+    LBRACK, LOCAL_VAR_DECL, LONG_KW, LSHIFT, LT, LT_EQ, METHOD_DECL, MINUS, NEW_EXPR, NULL_KW,
+    PARAM, PERCENT, PIPE, PIPE_PIPE, PLUS, RECORD_COMPONENT, RESOURCE, RETURN_STMT, SHORT_KW,
+    SLASH, STAR, STRING_LITERAL, SUPER_KW, TERNARY_EXPR, TEXT_BLOCK, THIS_KW, TILDE, TRUE_KW,
+    TYPE_PATTERN, VAR_KW, VOID_KW,
 };
 use jals_syntax::ast::{self, AstNode};
 use jals_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
@@ -581,8 +581,9 @@ impl TypeInference {
             .copied()
             .filter(|&id| {
                 let member = index.member(id);
+                // Precise, not the diagnostic relation: see [`Ty::is_applicable_to`].
                 let fits = |arg_ty: Option<&Ty>, target: &Ty| {
-                    arg_ty.is_none_or(|ty| ty.is_assignable_to(target, Some(index)))
+                    arg_ty.is_none_or(|ty| ty.is_applicable_to(target, index))
                 };
                 let declared = |param: &crate::Param| {
                     index.member_type_to_ty(member.file, member.owner, Some(id), &param.ty)
@@ -656,7 +657,7 @@ impl TypeInference {
         } else {
             // The class supertype, which is the only one a `super(…)` can name. An interface has no
             // constructor to reach.
-            index.superclass_of(enclosing)?
+            index.direct_superclass(enclosing)?
         };
         let args: Vec<ast::Expr> = call
             .args()
@@ -748,9 +749,9 @@ impl TypeInference {
             left.params.iter().zip(&right.params).all(|(from, to)| {
                 index
                     .member_type_to_ty(left.file, left.owner, Some(left_id), &from.ty)
-                    .is_assignable_to(
+                    .is_applicable_to(
                         &index.member_type_to_ty(right.file, right.owner, Some(right_id), &to.ty),
-                        Some(index),
+                        index,
                     )
             })
         };
@@ -784,18 +785,23 @@ impl TypeInference {
             ast::Expr::NameRef(n) => {
                 let name = jals_syntax::decoded_ident(&Collect::first_ident_token(n.syntax())?)
                     .into_owned();
-                // A bare call is an implicit `this` first (JLS §15.12.1); a `static` import is what
-                // answers when the enclosing type has no such method. Falling back to the enclosing
-                // type when *neither* has it keeps the report about the call the source wrote.
-                let enclosing = index.enclosing_item(file, call.syntax());
-                let owner = enclosing
-                    .filter(|&item| {
+                // A bare call names the *innermost enclosing type of which the method is a member*
+                // (JLS §15.12.1), which need not be the innermost type at all: a nested, local, or
+                // anonymous class calling its outer class's method is ordinary Java, and reading
+                // only the nearest one found nothing there. A `static` import answers when no
+                // enclosing type has it. Falling back to the innermost when *nothing* has it keeps
+                // the report about the call the source wrote.
+                let lexical = index.enclosing_items(file, call.syntax());
+                let owner = lexical
+                    .iter()
+                    .copied()
+                    .find(|&item| {
                         index
                             .resolve_member(item, &name, Namespace::Method)
                             .is_some()
                     })
                     .or_else(|| index.static_import_owner(file, &name, Namespace::Method))
-                    .or(enclosing)?;
+                    .or_else(|| lexical.first().copied())?;
                 Some((owner, name))
             }
             _ => None,
@@ -820,7 +826,7 @@ impl TypeInference {
         // is exactly right, because `super.f()` may bind to the superclass's own `f`. Answering with
         // the enclosing type instead would bind an overridden member to the override.
         if Cst::is_super(receiver) {
-            return index.superclass_of(index.enclosing_item(file, receiver.syntax())?);
+            return index.direct_superclass(index.enclosing_item(file, receiver.syntax())?);
         }
         // Through `member_receiver`, so a type variable is looked up on its bound and an array on
         // `Object` (JLS §4.4, §10.7) — the two shapes that resolved to nothing at all.
@@ -959,6 +965,30 @@ impl<'a> Inferer<'a> {
         let mut yielder = Yielder::new();
         for node in root.descendants() {
             yielder.tick().await;
+            // An `enum` constant writes no type and *is* an instance of the enum that declares it
+            // (JLS §8.9.3), so this is the only place its binding can be typed. Without it a bare
+            // constant name inside its own enum had no type at all: `red.name()` resolved to
+            // nothing, and `println(red)` had no argument type to select an overload against.
+            if node.kind() == ENUM_CONSTANT
+                && let Some(name) = Collect::first_ident_token(&node)
+                && let Some(item) = self.enclosing_item(&node)
+            {
+                let ty = self.item_ty(item);
+                self.set_def_type(Collect::token_start(&name), ty);
+            }
+            // A **multi-catch** parameter's type is the *lub* of its arms (JLS §14.20), not the
+            // first of them. Its erasure — what the local's descriptor says, and what the verifier
+            // computes by merging the handler's two entry states — is their nearest common
+            // superclass, and typing it as one arm emitted an `invokevirtual` on that arm against a
+            // value the verifier knows only as the common supertype.
+            if node.kind() == CATCH_CLAUSE
+                && let Some(common) = self.multi_catch_ty(&node)
+            {
+                for (token, _) in ast::Declarators::dims_of(&node) {
+                    self.set_def_type(Collect::token_start(&token), common.clone());
+                }
+                continue;
+            }
             if Self::declares_typed_bindings(node.kind()) {
                 let ty = node.children().find_map(ast::Type::cast);
                 if !ty.as_ref().is_some_and(Cst::is_var_type) {
@@ -1116,6 +1146,41 @@ impl<'a> Inferer<'a> {
         }
     }
 
+    /// The type a `catch (A | B e)` binding has: the nearest class every arm is a subtype of.
+    ///
+    /// `None` for a single-arm `catch`, which the ordinary declared-type path already handles, and
+    /// for one whose arms this index cannot relate — where staying with the written type is the
+    /// lenient answer this module prefers to a guess.
+    fn multi_catch_ty(&self, node: &SyntaxNode) -> Option<Ty> {
+        let (index, file) = self.project?;
+        // The arm *count* decides whether there is a question at all, and counting is free — a
+        // single-arm `catch` is the overwhelmingly common shape and the ordinary declared-type path
+        // resolves the same name for the same node anyway, so resolving here first would be a
+        // second project-wide lookup thrown away.
+        let written: Vec<ast::Type> = node.children().filter_map(ast::Type::cast).collect();
+        if written.len() < 2 {
+            return None;
+        }
+        let arms: Vec<ItemId> = written
+            .into_iter()
+            .map(|written| {
+                let name = written.simple_name()?;
+                let qualified = written
+                    .is_qualified()
+                    .then(|| written.qualified_text())
+                    .flatten();
+                index
+                    .resolve_type_name(file, &name, qualified.as_deref())
+                    .project_id()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // The erasure of the arms' lub, which the binding gets. `None` — no shared class the index
+        // holds — keeps the written type, which is this side's fallback and stays here rather than
+        // in the index, because the backend that asks the same question wants `java.lang.Throwable`
+        // instead.
+        Some(index.item_ty(index.common_superclass(&arms)?))
+    }
+
     fn set_def_type(&mut self, name_start: usize, ty: Ty) {
         if let Some(&id) = self.def_by_name_start.get(&name_start) {
             self.inference.def_types[id.0 as usize] = ty;
@@ -1176,7 +1241,7 @@ impl<'a> Inferer<'a> {
     /// Computes an expression's type from its (already-typed) children.
     fn compute_expr_ty(&self, expr: &ast::Expr) -> Ty {
         match expr {
-            ast::Expr::Literal(l) => Self::literal_ty(l),
+            ast::Expr::Literal(l) => self.literal_ty(l),
             ast::Expr::NameRef(n) => self.nameref_ty(n.syntax()),
             ast::Expr::Paren(p) => self.child_ty(p.expr()),
             ast::Expr::Unary(u) => self.unary_ty(u),
@@ -1302,6 +1367,18 @@ impl<'a> Inferer<'a> {
                     .unwrap_or_default();
                 self.inference.resolve_constructor(owner, &args, index)
             }),
+            // An `enum` constant's arguments are a constructor invocation too (JLS §8.9.2) — the
+            // enum's own, which is the type the constant is written inside. It reaches here rather
+            // than through `NEW_EXPR` because a constant names no type to construct: the grammar has
+            // an identifier and an argument list, and the enum around it is the owner. Without the
+            // arm `enum E { A(() -> "a"); }` gave the lambda no target type at all.
+            ENUM_CONSTANT => {
+                let args: Vec<ast::Expr> = list.children().filter_map(ast::Expr::cast).collect();
+                call.ancestors()
+                    .find(|ancestor| ancestor.kind() == SyntaxKind::ENUM_DECL)
+                    .and_then(|decl| index.declared_item(file, &decl))
+                    .and_then(|owner| self.inference.resolve_constructor(owner, &args, index))
+            }
             _ => None,
         };
         let Some(selected) = selected else {
@@ -1388,28 +1465,29 @@ impl<'a> Inferer<'a> {
             })
     }
 
-    /// The indexed type `name` resolves to from this file, or an external one by that name.
+    /// The indexed `java.lang.<name>`, or an external one by that name.
     ///
     /// A `.class` literal's type is `java.lang.Class`, and reaching *its* members — `getName()` — needs
     /// the indexed stub. An external type by that name has no members at all, so the access resolved
     /// to nothing and the call after it with it.
+    ///
+    /// Looked up by **fully qualified name**, never resolved as a simple name from this file. What a
+    /// string literal or a `.class` literal denotes is fixed by the language (§3.10.5, §15.8.2) and
+    /// is not a name the source wrote, so a type the file *could* reach by that spelling — a nested
+    /// `class String`, a same-package one, a single-type import — must not shadow it. Resolving the
+    /// simple name did both halves wrong: `"x"` in a file declaring its own `String` was typed as
+    /// that type, and every literal in every other file paid a scope walk that ends in a scan of the
+    /// whole item table to answer a question with one constant answer.
     fn java_lang_ty(&self, name: &str) -> Ty {
-        let Some((index, file)) = self.project else {
-            return Ty::Class(ClassTy::external(name));
+        let external = || Ty::Class(ClassTy::external(name));
+        let Some((index, _)) = self.project else {
+            return external();
         };
+        let mut fqn = String::from("java.lang.");
+        fqn.push_str(name);
         index
-            .resolve_type_name(file, name, None)
-            .project_id()
-            .map_or_else(
-                || Ty::Class(ClassTy::external(name)),
-                |id| {
-                    Ty::Class(ClassTy::Project {
-                        id,
-                        name: name.to_owned(),
-                        args: Vec::new(),
-                    })
-                },
-            )
+            .item_by_fqn(&fqn)
+            .map_or_else(external, |id| index.item_ty(id))
     }
 
     /// The type `this` has where `node` appears: the enclosing type declaration, raw.
@@ -1417,15 +1495,18 @@ impl<'a> Inferer<'a> {
     /// Raw — no type arguments — because inside a generic type's own body its parameters stand for
     /// themselves, and a member read through `this` substitutes them by name.
     fn self_ty(&self, node: &SyntaxNode) -> Ty {
-        let (Some(item), Some((index, _))) = (self.enclosing_item(node), self.project) else {
-            return Ty::Unknown;
-        };
-        let fqn = index.item(item).fqn.as_str();
-        Ty::Class(ClassTy::Project {
-            id: item,
-            name: fqn.rsplit('.').next().unwrap_or(fqn).to_owned(),
-            args: Vec::new(),
-        })
+        self.enclosing_item(node)
+            .map_or(Ty::Unknown, |item| self.item_ty(item))
+    }
+
+    /// An indexed type as a raw class type — no type arguments, for the reason
+    /// [`self_ty`](Self::self_ty) gives.
+    ///
+    /// The index states the type; what belongs here is only the answer for a file being inferred
+    /// with no project behind it, which the index has no way to give.
+    fn item_ty(&self, item: ItemId) -> Ty {
+        self.project
+            .map_or(Ty::Unknown, |(index, _)| index.item_ty(item))
     }
 
     fn unary_ty(&self, u: &ast::UnaryExpr) -> Ty {
@@ -1455,7 +1536,7 @@ impl<'a> Inferer<'a> {
             // `+` is string concatenation when either side is a `String`, else arithmetic.
             [PLUS] => {
                 if lhs.is_string() || rhs.is_string() {
-                    Ty::string()
+                    self.java_lang_ty("String")
                 } else {
                     lhs.binary_numeric(&rhs)
                 }
@@ -1657,7 +1738,36 @@ impl<'a> Inferer<'a> {
     /// when the receiver is an indexed project type; an external receiver (a JDK type) stays
     /// [`Ty::Unknown`], since its members are not indexed.
     fn field_access_ty(&self, fa: &ast::FieldAccess) -> Ty {
+        // `Outer.this` and `Outer.super` name an *enclosing instance*, not a member (JLS §15.8.4,
+        // §15.11.2). There is no identifier after the dot for a member lookup to use, so the
+        // ordinary path answers `Unknown` — and everything the value is then used for goes untyped
+        // with it, which is what left `Outer.this.field` and `x != Outer.this` with no type at all.
+        if let Some(ty) = self.qualified_instance_ty(fa) {
+            return ty;
+        }
         self.field_access_member_ty(fa, Namespace::Value)
+    }
+
+    /// The type `Outer.this` / `Outer.super` denotes, and `None` for an access that names a member.
+    ///
+    /// The keyword is the whole test: an access carrying one has no identifier after the dot. What
+    /// it denotes is the *named* type for `this` and that type's superclass for `super`, by the same
+    /// rule the bare `super` follows — answering `super` with the named type itself would bind an
+    /// overridden member to the override.
+    fn qualified_instance_ty(&self, fa: &ast::FieldAccess) -> Option<Ty> {
+        let keyword = fa
+            .syntax()
+            .children_with_tokens()
+            .filter_map(jals_syntax::SyntaxElement::into_token)
+            .find(|token| matches!(token.kind(), THIS_KW | SUPER_KW))?;
+        let (index, file) = self.project?;
+        let named = Cst::type_qualifier(&fa.receiver()?, index, file)?;
+        let item = if keyword.kind() == SUPER_KW {
+            index.direct_superclass(named)?
+        } else {
+            named
+        };
+        Some(index.item_ty(item))
     }
 
     /// `receiver.member` resolved in `namespace`: the member's type on the receiver's project type.
@@ -1693,7 +1803,7 @@ impl<'a> Inferer<'a> {
                     let owner = if Cst::is_super(&expr) {
                         index
                             .enclosing_item(file, expr.syntax())
-                            .and_then(|enclosing| index.superclass_of(enclosing))
+                            .and_then(|enclosing| index.direct_superclass(enclosing))
                     } else {
                         Cst::type_qualifier(&expr, index, file)
                     };
@@ -1810,12 +1920,6 @@ impl<'a> Inferer<'a> {
 }
 
 impl ProjectIndex {
-    /// How deep a chain of type-variable bounds is followed before giving up.
-    ///
-    /// `<T extends U, U extends V>` is legal and each step is one lookup; `<T extends U, U extends T>`
-    /// is not, but a resolver reads what is written and must terminate on it anyway.
-    const BOUND_DEPTH: u8 = 8;
-
     /// The scope a written type name `name` is a **type variable** of, seen from `node`: the
     /// declaring `(owner, member)` pair, or `None` when no enclosing declaration declares it.
     ///
@@ -1865,29 +1969,24 @@ impl ProjectIndex {
     ///   what `clone()` returns, which `Object`'s declaration cannot say); everything else —
     ///   `equals`, `hashCode`, `getClass` — is genuinely `Object`'s and is answered here.
     ///
-    /// Anything else is its own receiver. Bounds are followed transitively, which is why the depth
-    /// cap is here rather than at a call site.
+    /// Anything else is its own receiver. Bounds are followed transitively by
+    /// [`type_var_erasure`](ProjectIndex::type_var_erasure), which is where the depth cap lives
+    /// because that is where the transitivity is.
     fn member_receiver(&self, ty: &Ty) -> Ty {
-        let mut current = ty.clone();
-        for _ in 0..Self::BOUND_DEPTH {
-            current = match current {
-                Ty::TypeVar {
-                    owner,
-                    member,
-                    ref name,
-                } => self
-                    .type_var_bound(owner, member, name)
-                    // An unbounded variable erases to `Object`, and `Object`'s members are the ones
-                    // it really does have.
-                    .unwrap_or_else(|| self.object_ty()),
-                Ty::Array(_) => return self.object_ty(),
-                other => return other,
-            };
+        match self.type_var_erasure(ty) {
+            // An array's members are `Object`'s (JLS §10.7), and so are an *unbounded* variable's —
+            // which is also the conservative answer for a chain too deep to follow.
+            Some(Ty::Array(_)) | None => self.object_ty(),
+            Some(other) => other,
         }
-        self.object_ty()
     }
 
     /// `java.lang.Object` as a receiver type, or [`Ty::Unknown`] when it is not indexed at all.
+    ///
+    /// Deliberately **not** `ProjectIndex::item_ty` yet: this writes the qualified name where
+    /// the `name` field of [`ClassTy::Project`] is the simple one, and `Display for Ty` renders that field — so
+    /// folding it changes diagnostic and hover text and belongs in a change that reviews the
+    /// wording. Known, not latent.
     fn object_ty(&self) -> Ty {
         self.item_by_fqn("java.lang.Object")
             .map_or(Ty::Unknown, |id| {
@@ -2042,25 +2141,71 @@ impl ProjectIndex {
     /// second with the first's return type. Overload selection has already chosen one, so the
     /// substitution is done into *that* one — the same walk, stopping at the type that declares it.
     fn selected_member_ty(&self, receiver: ItemId, receiver_args: &[Ty], member: MemberId) -> Ty {
-        let declaring = self.member(member).owner;
+        let info = self.member(member);
+        self.substitution_to(receiver, receiver_args, info.owner)
+            .map_or(Ty::Unknown, |args| {
+                self.subst_member_ty(info.owner, member, &args, info.file, &info.ty)
+            })
+    }
+
+    /// The type arguments in effect at `declaring`, seen from a use of `receiver` with
+    /// `receiver_args`. `None` when `declaring` is not on `receiver`'s indexed supertype chain.
+    ///
+    /// The shared half of [`selected_member_ty`](Self::selected_member_ty) and
+    /// [`param_tys_as_seen_from`](Self::param_tys_as_seen_from): both walk to the type that declares
+    /// a member and differ only in what they project out of the frame the walk stops on. It is
+    /// written once because the walk is the part carrying the rule — the composition down the chain
+    /// (`class A<T> implements B<List<T>>` carries `T` through `B`'s own parameter) and the
+    /// [`walk_supertypes_stateful`](ProjectIndex::walk_supertypes_stateful) visited set that
+    /// terminates it on a malformed index.
+    fn substitution_to(
+        &self,
+        receiver: ItemId,
+        receiver_args: &[Ty],
+        declaring: ItemId,
+    ) -> Option<Vec<Ty>> {
         self.walk_supertypes_stateful(
             receiver,
             receiver_args.to_vec(),
-            |current, args| {
-                (current == declaring).then(|| {
-                    let info = self.member(member);
-                    self.subst_member_ty(current, member, args, info.file, &info.ty)
-                })
-            },
+            |current, args| (current == declaring).then(|| args.clone()),
             |current, args, sup| {
                 let file = self.item(current).file;
+                // A supertype's type arguments belong to the `extends` clause, not to any member,
+                // so `None` is the scope: `class Sub extends Base<T>` threads the *class's* `T`.
                 sup.args
                     .iter()
                     .map(|mt| self.subst_ty(current, None, args, file, mt))
                     .collect()
             },
         )
-        .unwrap_or(Ty::Unknown)
+    }
+
+    /// The formal parameter types of `member`, with the type arguments the path from `seen_from`
+    /// supplies bound in. `None` when `member`'s declaring type is not on `seen_from`'s indexed
+    /// supertype chain.
+    ///
+    /// [`resolved_param_tys`](ProjectIndex::resolved_param_tys) reads a member's parameters in its
+    /// **own** declaring scope, so a generic supertype's `T` stays a type variable. This is the other
+    /// half of the override question: `class Box implements Holder<String>` binds `Holder.put(T)`'s
+    /// parameter to `String` when it is asked about from `Box`, which is exactly what separates the
+    /// `put(String)` that overrides it from the `put(int)` that does not.
+    ///
+    /// `seen_from` is read **raw** — no arguments of its own — because an override is a question
+    /// about the *declaration* rather than about any instantiation of it. Leaving `seen_from`'s own
+    /// parameters as variables is what makes an identically-generic override match itself.
+    pub(crate) fn param_tys_as_seen_from(
+        &self,
+        seen_from: ItemId,
+        member: MemberId,
+    ) -> Option<Vec<Ty>> {
+        let info = self.member(member);
+        let args = self.substitution_to(seen_from, &[], info.owner)?;
+        Some(
+            info.params
+                .iter()
+                .map(|param| self.subst_ty(info.owner, Some(member), &args, info.file, &param.ty))
+                .collect(),
+        )
     }
 
     /// [`member_type_to_ty`](ProjectIndex::member_type_to_ty) for a member-type `mt` declared in
@@ -2125,11 +2270,57 @@ impl ProjectIndex {
     /// The nearest ancestor type declaration of `node` that is an indexed project item, in `file`.
     /// Shared by the [`Inferer`] (bare-call resolution) and argument checking.
     fn enclosing_item(&self, file: FileId, node: &SyntaxNode) -> Option<ItemId> {
-        let decl = node
-            .ancestors()
-            .find(|a| Collect::type_decl_kind(a.kind()).is_some())?;
-        let name = Collect::first_ident_token(&decl)?;
-        self.item_by_decl(file, Collect::token_start(&name))
+        // The *nearest* one, so the walk stops at it. Reading it off
+        // [`enclosing_items`](Self::enclosing_items) instead walks every remaining ancestor up to
+        // the `SourceFile` and heap-allocates the whole chain to answer with its head — and this is
+        // on the per-`this` and per-bare-call paths, so it runs many times in one file.
+        node.ancestors()
+            .find_map(|ancestor| self.declared_item(file, &ancestor))
+    }
+
+    /// Every type declaration lexically around `node`, innermost first.
+    ///
+    /// A bare name is looked up on the innermost enclosing type *of which it is a member* (JLS
+    /// §6.5.6.1, §15.12.1), which is not the same as the innermost enclosing type: a nested, local,
+    /// or anonymous class calling its outer class's method is ordinary Java. The whole chain is
+    /// returned rather than searched here, because the search differs by name space and only the
+    /// caller knows which.
+    fn enclosing_items(&self, file: FileId, node: &SyntaxNode) -> Vec<ItemId> {
+        let mut out = Vec::new();
+        for ancestor in node.ancestors() {
+            if let Some(item) = self.declared_item(file, &ancestor) {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    /// The item `node` *is* the declaration of, when it is one.
+    ///
+    /// An **anonymous** class body is one, which is why this is not simply a named-declaration test:
+    /// it is a type of its own, so `this` inside one is *it* rather than the class the `new` was
+    /// written in. Reading past it typed `this` as the outer class, and `test(this)` in
+    /// `new Base() { void run() { test(this); } }` selected `test(Outer)` over `test(Base)` — a
+    /// wrong overload rather than a missing one.
+    ///
+    /// The *body* is what counts and not the whole `new`: a `new Foo(arg) { … }`'s arguments are
+    /// evaluated where the `new` is written, so a node in one belongs to the enclosing class. The
+    /// body is keyed by the creation's own position, which is how the index recorded it.
+    fn declared_item(&self, file: FileId, node: &SyntaxNode) -> Option<ItemId> {
+        if Collect::type_decl_kind(node.kind()).is_some() {
+            let name = Collect::first_ident_token(node)?;
+            return self.item_by_decl(file, Collect::token_start(&name));
+        }
+        let creation = node
+            .parent()
+            .filter(|_| node.kind() == SyntaxKind::CLASS_BODY)
+            .filter(|creation| {
+                matches!(
+                    creation.kind(),
+                    SyntaxKind::NEW_EXPR | SyntaxKind::ENUM_CONSTANT
+                )
+            })?;
+        self.item_by_decl(file, usize::from(creation.text_range().start()))
     }
 }
 
@@ -2183,7 +2374,7 @@ impl Inferer<'_> {
     }
 
     /// The type of a literal, by its token kind (and suffix, for numbers).
-    fn literal_ty(l: &ast::Literal) -> Ty {
+    fn literal_ty(&self, l: &ast::Literal) -> Ty {
         fn ends_with_ignore_case(text: &str, suffix: char) -> bool {
             text.chars()
                 .next_back()
@@ -2210,7 +2401,13 @@ impl Inferer<'_> {
                 }
             }
             CHAR_LITERAL => Ty::Primitive(Primitive::Char),
-            STRING_LITERAL | TEXT_BLOCK => Ty::string(),
+            // The *indexed* `java.lang.String` wherever the index holds one. Typing a literal by
+            // name alone made it `External`, and an external type is assignable to every project
+            // type by design (it might be an unindexed project type) — so every one-argument
+            // overload was applicable to `f("")` and the winner was declaration order.
+            // `PrintStream(OutputStream)` is declared before `PrintStream(String)`, and `super("")`
+            // compiled to the first of them.
+            STRING_LITERAL | TEXT_BLOCK => self.java_lang_ty("String"),
             TRUE_KW | FALSE_KW => Ty::Primitive(Primitive::Boolean),
             NULL_KW => Ty::Null,
             _ => Ty::Unknown,
@@ -2239,13 +2436,52 @@ impl Cst {
     /// Only a simple name is handled. A fully-qualified qualifier (`java.io.PrintStream.out`) is a
     /// nested field access, not a name reference, and is not modelled.
     fn type_qualifier(receiver: &ast::Expr, index: &ProjectIndex, file: FileId) -> Option<ItemId> {
-        let ast::Expr::NameRef(name) = receiver else {
-            return None;
-        };
-        let token = Collect::first_ident_token(name.syntax())?;
-        index
-            .resolve_type_name(file, &jals_syntax::decoded_ident(&token), None)
-            .project_id()
+        match receiver {
+            ast::Expr::NameRef(name) => {
+                let token = Collect::first_ident_token(name.syntax())?;
+                index
+                    .resolve_type_name(file, &jals_syntax::decoded_ident(&token), None)
+                    .project_id()
+            }
+            // A **nested** type is spelled with a dot, so its qualifier is a field access rather
+            // than a name — `Diagnostic.Kind.ERROR` reads `Diagnostic.Kind` as a receiver whose own
+            // type is unknown, because it is not a value at all. Reading only the simple form left
+            // every constant of a nested `enum` untyped, which is the ordinary way one is named.
+            ast::Expr::FieldAccess(_) => {
+                let dotted = Self::dotted_name(receiver.syntax())?;
+                let simple = dotted.rsplit('.').next()?;
+                index
+                    .resolve_type_name(file, simple, Some(&dotted))
+                    .project_id()
+            }
+            _ => None,
+        }
+    }
+
+    /// The dotted text of an expression that is nothing but identifiers and dots, and `None` for
+    /// one holding anything else — a call, an index, a literal.
+    ///
+    /// What separates `Outer.Inner` from `outer.field` is not the shape but what the segments
+    /// resolve to, so this hands back the spelling and lets the index decide.
+    fn dotted_name(node: &SyntaxNode) -> Option<String> {
+        let mut out = String::new();
+        for element in node.descendants_with_tokens() {
+            let Some(token) = element.into_token() else {
+                continue;
+            };
+            match token.kind() {
+                IDENT => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(&jals_syntax::decoded_ident(&token));
+                }
+                DOT => {}
+                kind if kind.is_trivia() => {}
+                _ => return None,
+            }
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Whether a receiver is the bare `super`.
@@ -2291,24 +2527,13 @@ impl Cst {
     }
 
     /// The declarator-name → initializer pairs of a (possibly multi-declarator) variable or field
-    /// declaration. The CST is flat (`final int a = 1, b = 2;` has no per-declarator node), so each
-    /// direct `IDENT` token takes the next direct expression child as its initializer; a declarator
-    /// without one yields no pair. The declared `TYPE` / `MODIFIERS` children are not expressions, so
-    /// the `Expr::cast` skips them and they are never mistaken for an initializer.
-    pub(crate) fn declarator_initializers(
-        node: &SyntaxNode,
-    ) -> impl Iterator<Item = (SyntaxToken, ast::Expr)> {
-        let mut current: Option<SyntaxToken> = None;
-        node.children_with_tokens().filter_map(move |elem| {
-            if let Some(token) = elem.as_token() {
-                if token.kind() == IDENT {
-                    current = Some(token.clone());
-                }
-                return None;
-            }
-            let value = elem.into_node().and_then(ast::Expr::cast)?;
-            Some((current.take()?, value))
-        })
+    /// declaration.
+    ///
+    /// Delegates to [`ast::Declarators::initializers`], which owns the walk: the flat-CST rule that
+    /// pairs `int a = 1, b = 2;` up is the same rule `jals-lint`'s nullness rule needs, and it is
+    /// written where the other declarator reader ([`ast::Declarators::dims_of`]) already lives.
+    pub(crate) fn declarator_initializers(node: &SyntaxNode) -> Vec<(SyntaxToken, ast::Expr)> {
+        ast::Declarators::initializers(node)
     }
 }
 
@@ -2555,7 +2780,7 @@ impl crate::analysis::FileSemantics<'_> {
                 .index()
                 .enclosing_item(self.file(), &before.parent()?)?;
             return if before.kind() == SUPER_KW {
-                self.index().superclass_of(enclosing)
+                self.index().direct_superclass(enclosing)
             } else {
                 Some(enclosing)
             };

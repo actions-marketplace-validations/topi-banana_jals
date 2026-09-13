@@ -8,7 +8,8 @@ use alloc::borrow::ToOwned;
 use alloc::string::{String, ToString};
 
 use jals_classfile::ClassFile;
-use jals_config::{Dependency, FeatureSet, Manifest, ResolvedBuildFeatures};
+use jals_config::{Dependency, DependencyScope, FeatureSet, Manifest, ResolvedBuildFeatures};
+use jals_progress::{Activity, Outcome, Progress};
 use jals_storage::{
     CacheBackend, CacheKey, DirKey, EntryRef, FileKey, Name, ProjectStorage, ProjectView,
     RelativePath, SourceBackend,
@@ -74,18 +75,19 @@ pub struct ProjectInputPlan {
 }
 
 impl ProjectInputPlan {
-    /// Lower a manifest's `[dependencies]` jar entries into this plan — each binary jar plus its
-    /// optional `sources` jar — classifying every locator through `classify` (hosts decide what
-    /// resolves as a project file versus external content). A non-portable dependency name is
-    /// diagnosed into `warnings` and skipped. Shared by the native lowering and the browser host.
+    /// Lower the jar entries `scope` declares into this plan — each binary jar plus its optional
+    /// `sources` jar — classifying every locator through `classify` (hosts decide what resolves as
+    /// a project file versus external content). A non-portable dependency name is diagnosed into
+    /// `warnings` and skipped.
     pub(crate) fn add_jar_dependencies(
         &mut self,
         manifest: &Manifest,
+        scope: DependencyScope,
         features: &ResolvedBuildFeatures,
         mut classify: impl FnMut(&str) -> DependencyLocation,
         warnings: &mut Vec<Warning>,
     ) {
-        for (raw_name, dependency) in manifest.active_dependencies(features) {
+        for (raw_name, dependency) in manifest.active_dependencies(scope, features) {
             let Dependency::Jar(jar) = dependency else {
                 continue;
             };
@@ -171,6 +173,7 @@ impl ProjectInputs {
         storage: &mut ProjectStorage<S, C>,
         plan: &ProjectInputPlan,
         options: ProjectInputOptions,
+        progress: &Progress,
     ) -> Self
     where
         F: Fetcher,
@@ -196,6 +199,7 @@ impl ProjectInputs {
             &view,
             storage.artifacts_mut(),
             &plan.dependencies,
+            progress,
         )
         .await;
         let mut warnings = resolved.warnings;
@@ -221,14 +225,21 @@ impl ProjectInputs {
                 resolved_jars.push(jar);
                 continue;
             };
-            let text =
-                match MappingResolver::text(fetcher, &view, storage.artifacts_mut(), spec).await {
-                    Ok(text) => text,
-                    Err(warning) => {
-                        warnings.push(warning);
-                        continue;
-                    }
-                };
+            let text = match MappingResolver::text(
+                fetcher,
+                &view,
+                storage.artifacts_mut(),
+                spec,
+                progress,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(warning) => {
+                    warnings.push(warning);
+                    continue;
+                }
+            };
             let request = RemapRequest {
                 mappings: &text,
                 format: spec.format.clone(),
@@ -238,15 +249,23 @@ impl ProjectInputs {
                 // classpath, and that is a different caller.
                 hierarchy: &[],
             };
-            match JarRemap::remap(&exec, storage.artifacts_mut(), &jar.key, &request).await {
+            let report = progress.begin(Activity::Remap, jar.name.to_string());
+            match JarRemap::remap(&exec, storage.artifacts_mut(), &jar.key, &request, &report).await
+            {
                 Ok(key) => {
+                    report.finish(Outcome::Completed);
                     jar.key = key;
                     resolved_jars.push(jar);
                 }
-                Err(error) => warnings.push(Warning::new(
-                    WarningOrigin::Artifact(jar.key.clone()),
-                    format!("dependency `{}` could not be remapped: {error}", jar.name),
-                )),
+                Err(error) => {
+                    // Stated rather than left to `Drop`: `Abandoned` says the emitter has a hole in
+                    // it, and this is the run failing, not the reporting.
+                    report.finish(Outcome::Failed);
+                    warnings.push(Warning::new(
+                        WarningOrigin::Artifact(jar.key.clone()),
+                        format!("dependency `{}` could not be remapped: {error}", jar.name),
+                    ));
+                }
             }
         }
 
@@ -266,6 +285,7 @@ impl ProjectInputs {
                 &view,
                 storage.artifacts_mut(),
                 &plan.source_archives,
+                progress,
             )
             .await;
             warnings.extend(source_jars.warnings);
@@ -317,7 +337,8 @@ impl ProjectInputs {
                     .cloned()
                     .map(ClasspathEntry::Artifact),
             );
-            let load = ClasspathLoad::load(&exec, &view, storage.artifacts(), &entries).await;
+            let load =
+                ClasspathLoad::load(&exec, &view, storage.artifacts(), &entries, progress).await;
             warnings.extend(load.warnings);
             load.classes
         } else {
@@ -387,6 +408,7 @@ impl MemoryProjectPlan {
         storage: &mut ProjectStorage<S, C>,
         fetcher: &F,
         options: ProjectInputOptions,
+        progress: &Progress,
     ) -> (ProjectInputs, Vec<DirKey>)
     where
         F: Fetcher,
@@ -394,13 +416,14 @@ impl MemoryProjectPlan {
         C: CacheBackend,
     {
         let mut lowered = Self::from_manifest(manifest, &storage.view());
-        let mut inputs = ProjectInputs::assemble(fetcher, storage, &lowered.plan, options).await;
+        let mut inputs =
+            ProjectInputs::assemble(fetcher, storage, &lowered.plan, options, progress).await;
         lowered.warnings.append(&mut inputs.warnings);
         inputs.warnings = lowered.warnings;
         (inputs, lowered.source_roots)
     }
 
-    /// Lower `manifest`'s `[build] source_dirs` and `[build] classpath` against one immutable view.
+    /// Lower `manifest`'s source roots and `[build] classpath` against one immutable view.
     ///
     /// `[dependencies]` are deliberately *not* lowered, and this is the only place that decides so:
     /// a caller assembling a dependency graph projects each declared dependency as a graph node, so
@@ -419,6 +442,23 @@ impl MemoryProjectPlan {
         };
 
         for source in &manifest.build.source_dirs {
+            match Self::project_relative(source) {
+                Ok(path) => result.source_roots.push(DirKey::new(path)),
+                Err(message) => result.warn_path(source, message),
+            }
+        }
+        // `[test] source-dirs` too, and unconditionally, exactly as the native sibling lowers them
+        // and `NativeProjectPlan::snapshot_scopes` captures them. These roots are the *shape of the
+        // project* an index walks, and scoping them to what one invocation compiles would make the
+        // same project read differently under `jals build` and `jals test`. Nothing on a compile
+        // path reads this list — a compiler is handed the sources a host gathers per lowering — so
+        // what it decides is only which files an analysis host indexes.
+        //
+        // The two lowerings agreeing is the point: they are the only two, they are handed the same
+        // manifest, and a host picks between them by whether it has host paths, never by what it
+        // wants the project to look like. One of them answering "which roots does this project
+        // have?" differently is a project that changes shape when it moves in-memory.
+        for source in &manifest.test.source_dirs {
             match Self::project_relative(source) {
                 Ok(path) => result.source_roots.push(DirKey::new(path)),
                 Err(message) => result.warn_path(source, message),
@@ -582,6 +622,10 @@ mod tests {
         );
     }
 
+    /// Both source tables, because an index walks the project's *shape* and a `[test]` root is
+    /// part of it whatever this invocation compiles — and because the native sibling lowers them
+    /// too. Two lowerings of one manifest that disagree about which roots exist is a project that
+    /// changes shape when it moves in-memory.
     #[test]
     fn source_dirs_lower_to_sorted_deduplicated_roots() {
         let storage = MemoryStorage::memory(CodeTree::default());
@@ -592,6 +636,7 @@ mod tests {
             "generated".to_owned(),
             "../outside".to_owned(),
         ];
+        manifest.test.source_dirs = vec!["src/test/java".to_owned(), "generated".to_owned()];
 
         let lowered = MemoryProjectPlan::from_manifest(&manifest, &storage.view());
 
@@ -600,8 +645,9 @@ mod tests {
             vec![
                 DirKey::parse("generated").expect("portable key"),
                 DirKey::parse("src/main/java").expect("portable key"),
+                DirKey::parse("src/test/java").expect("portable key"),
             ],
-            "`.` normalizes to the same root and duplicates collapse"
+            "`.` normalizes to the same root and duplicates collapse, across both tables"
         );
         assert_eq!(lowered.warnings.len(), 1);
         assert!(

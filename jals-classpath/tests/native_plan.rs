@@ -10,7 +10,7 @@ use std::str::FromStr;
 use jals_classpath::{
     ClasspathEntry, Fetcher, NativeProjectPlan, ProjectInputOptions, ProjectInputs, SourceFile,
 };
-use jals_config::Manifest;
+use jals_config::{DependencyScope, Manifest};
 use jals_storage::{CacheNamespace, DirKey, NativeStorage};
 
 /// The build features a test project resolves with nothing selected — its own `[features] default`
@@ -30,14 +30,26 @@ impl Fetcher for NoFetch {
         jals_classpath::NetworkPolicy::Online
     }
 
-    fn fetch_admitted(&self, _: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+    fn retry(&self) -> jals_classpath::RetrySchedule {
+        jals_classpath::RetrySchedule::none()
+    }
+
+    fn delay(&self, _: u32) -> impl Future<Output = ()> {
+        ready(())
+    }
+
+    fn fetch_admitted(
+        &self,
+        _: &str,
+        _: &jals_progress::Task,
+    ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
         ready(Self::refuse())
     }
 }
 
 impl NoFetch {
     /// Diverges: being asked at all is the failure this fixture asserts against.
-    fn refuse() -> Result<Vec<u8>, String> {
+    fn refuse() -> Result<Vec<u8>, jals_classpath::FetchError> {
         panic!("unexpected fetch")
     }
 }
@@ -70,6 +82,7 @@ classpath = ["./libs/dep.jar"]
         .unwrap();
         NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -86,6 +99,65 @@ classpath = ["./libs/dep.jar"]
         &plan.plan.classpath[0],
         ClasspathEntry::ProjectFile(file) if file.to_string() == "libs/dep.jar"
     ));
+}
+
+/// `[test] source-dirs` is a source root of the project too, and under either scope.
+///
+/// Nothing on a compile path reads this list — a compiler is handed the sources `jals-cli`'s own
+/// per-lowering `discover_sources` gathers — so what it decides is which files an *analysis* host
+/// indexes. Leaving the test tree out put every file in it outside `Workspace::owns_path`, so the
+/// language server answered one from a detached group with no `[package] features` and reported
+/// each `#[test]` in it as an error, and `jals lint` saw a named test file's siblings not at all.
+/// Unconditional for the reason `snapshot_scopes` captures the same tree unconditionally: the shape
+/// of a project must not depend on which subcommand asked.
+#[test]
+fn the_test_source_dirs_are_source_roots_under_either_scope() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("src/main/java")).unwrap();
+    fs::create_dir_all(project.path().join("src/test/java")).unwrap();
+    let manifest = manifest(
+        r#"
+[build]
+source-dirs = ["src/main/java"]
+
+[test]
+source-dirs = ["src/test/java"]
+"#,
+    );
+
+    let roots = jals_exec::tokio_rt::run(|exec| async move {
+        let storage = NativeStorage::native(
+            project.path(),
+            project.path().join("target/jals/cache"),
+            exec,
+        )
+        .await
+        .unwrap();
+        [DependencyScope::Build, DependencyScope::Test].map(|scope| {
+            NativeProjectPlan::from_manifest(
+                &manifest,
+                scope,
+                &features(&manifest),
+                project.path(),
+                &storage.view(),
+            )
+            .source_roots
+        })
+    })
+    .expect("test runtime bootstraps");
+    for (scope, source_roots) in [DependencyScope::Build, DependencyScope::Test]
+        .iter()
+        .zip(&roots)
+    {
+        assert_eq!(
+            source_roots,
+            &[
+                DirKey::parse("src/main/java").unwrap(),
+                DirKey::parse("src/test/java").unwrap()
+            ],
+            "source roots under {scope:?}"
+        );
+    }
 }
 
 #[test]
@@ -111,6 +183,7 @@ fn in_project_path_dependency_auto_detects_conventional_source_root() {
         .unwrap();
         NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -143,6 +216,7 @@ fn sibling_path_dependency_is_scanned_and_published() {
             .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             &project,
             &storage.view(),
@@ -156,6 +230,7 @@ fn sibling_path_dependency_is_scanned_and_published() {
             &mut storage,
             &plan.plan,
             ProjectInputOptions::Compile,
+            &jals_progress::Progress::SILENT,
         )
         .await;
         let [SourceFile::Artifact(source)] = inputs.source_dep_sources.as_slice() else {
@@ -193,6 +268,7 @@ fn missing_path_dependency_is_a_warning_not_a_panic() {
         .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             project.path(),
             &storage.view(),
@@ -227,6 +303,7 @@ trailing = { path = "../sibling", dir = "src/" }
             .unwrap();
         let mut plan = NativeProjectPlan::from_manifest(
             &manifest,
+            DependencyScope::Build,
             &features(&manifest),
             &project,
             &storage.view(),
@@ -282,11 +359,13 @@ classpath = ["../sibling-classes", "{absolute_class}"]
                 .unwrap();
             NativeProjectPlan::assemble_native(
                 &manifest,
+                DependencyScope::Build,
                 &features(&manifest),
                 &project,
                 &mut storage,
                 &NoFetch,
                 options,
+                &jals_progress::Progress::SILENT,
             )
             .await
         })

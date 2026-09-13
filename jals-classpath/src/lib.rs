@@ -18,6 +18,8 @@ mod jar;
 #[cfg(feature = "archive")]
 mod load;
 #[cfg(feature = "archive")]
+mod manifest;
+#[cfg(feature = "archive")]
 mod mappings;
 #[cfg(feature = "native")]
 mod native;
@@ -28,7 +30,7 @@ mod remap;
 #[cfg(feature = "archive")]
 mod zip;
 
-pub use io::{Fetcher, NetworkPolicy};
+pub use io::{FetchError, Fetcher, NetworkPolicy, RetrySchedule};
 pub use resolve::{
     DependencyLocation, DependencyResolver, DependencySpec, ExpectedDigest,
     ExternalArtifactResolver, ExternalArtifactSpec, ExternalLocator, MappingLocation,
@@ -50,7 +52,7 @@ pub use project::{
     MemoryProjectPlan, ProjectInputOptions, ProjectInputPlan, ProjectInputs, SourceFile,
 };
 #[cfg(feature = "archive")]
-pub use remap::{JarMerge, JarRemap, NestedJar, RemapRequest};
+pub use remap::{JarMerge, JarRemap, JarTransforms, NestedJar, RemapRequest};
 
 use alloc::string::String;
 use core::fmt;

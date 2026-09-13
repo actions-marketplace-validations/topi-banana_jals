@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/jinja",
   "jals-build",
   "jals-classfile",
   "jals-classpath",
@@ -16,7 +17,9 @@ members = [
   "jals-javac",
   "jals-lint",
   "jals-lsp",
+  "jals-native",
   "jals-playground",
+  "jals-progress",
   "jals-project",
   "jals-syntax",
   "jals-tests",
@@ -43,8 +46,8 @@ clap = { version = "4.6.1", features = ["derive"] }
 crc32fast = { version = "1", default-features = false }
 futures = { version = "0.3" }
 hashbrown = { version = "0.17" }
-# Host-only progress rendering for `jals test`, the one command whose work is long enough to want
-# a live display. Confined to `jals-cli`: the portable crates render nothing.
+# Host-only progress rendering. Confined to `jals-cli`: portable crates report *what* they are
+# doing through `jals-progress` and draw no terminal UI at all.
 indicatif = { version = "0.18" }
 # `default-features = false`: `jals-build`'s host half (`SubprocessToolchain`) is behind its
 # `native` feature. Consumers that spawn `javac`/`java` (jals-cli) opt in with
@@ -66,8 +69,15 @@ jals-hir = { path = "jals-hir" }
 jals-javac = { path = "jals-javac" }
 jals-lint = { path = "jals-lint" }
 jals-lsp = { path = "jals-lsp" }
+# Featureless by design, like `jinja`: a Java package written in Rust is pure data plus closures,
+# so a plain `cargo check` is this crate's portability check and a package author's crate needs
+# nothing else on its dependency line.
+jals-native = { path = "jals-native" }
+jals-progress = { path = "jals-progress" }
 jals-project = { path = "jals-project", default-features = false }
 jals-syntax = { path = "jals-syntax" }
+# Featureless by design: rendering a template is pure computation over `core + alloc`.
+jinja = { path = "crates/jinja" }
 miniz_oxide = { version = "0.9", default-features = false, features = [
   "with-alloc",
 ] }
@@ -108,6 +118,18 @@ serde = { version = "1.0.219", default-features = false, features = [
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 similar = { version = "3" }
 text-size = { version = "1.1.1" }
+# The engine that runs what the `jals-wasm` backend emits, behind `jals-build`'s `wasm-run`.
+# Pinned to a `next` revision rather than a published release because the GC proposal is
+# implemented there and in no version on crates.io: the backend's output opens with a `rec` group
+# of `struct` types, and 0.10.0 refuses it at the first type section ("rec group usage requires
+# `gc` proposal to be enabled"). Move to the crates.io release once 0.11 ships. A `rev` rather than
+# `branch = "next"`, so `Cargo.lock` and what resolution actually picks cannot drift apart.
+# `default-features = false` keeps it `no_std + alloc`, which is what lets the portable core and the
+# browser both hold it; `parallel-parser` needs `std` and threads and is deliberately off.
+tinywasm = { git = "https://github.com/explodingcamera/tinywasm", rev = "c67ce64bfc88eada4d2b611e30b2dd307a7f7526", default-features = false, features = [
+  "parser",
+  "validate",
+] }
 tokio = { version = "1", features = ["net", "rt"] }
 # Non-unix only: adapts tokio's stdin/stdout into futures' `Async{Read,Write}` for the LSP loop
 # (async-lsp's `stdio` pipe helpers are unix-only). See jals-lsp/src/server.rs.

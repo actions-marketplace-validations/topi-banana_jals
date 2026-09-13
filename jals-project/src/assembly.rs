@@ -21,8 +21,9 @@ use jals_classpath::{
     ClasspathEntry, Fetcher, MemoryProjectPlan, ProjectInputOptions, ProjectInputPlan,
     ProjectInputs,
 };
-use jals_config::Manifest;
+use jals_config::{DependencyScope, Manifest};
 use jals_exec::Exec;
+use jals_progress::Progress;
 use jals_storage::{
     CacheBackend, CacheKey, DirKey, Name, ProjectStorage, RelativePath, SourceBackend,
 };
@@ -137,6 +138,7 @@ impl ProjectScript {
         manifest: &Manifest,
         storage: &mut ProjectStorage<S, C>,
         preprocess: GraphPreprocess<'_, F>,
+        scope: DependencyScope,
         options: ProjectInputOptions,
     ) -> Result<MemoryProjectAssembly, GraphResolveError>
     where
@@ -145,9 +147,11 @@ impl ProjectScript {
         C: CacheBackend,
     {
         // `preprocess` is consumed by the phase it names, but the graph plan needs the same fetch
-        // capability again when it resolves. The field is a shared reference, so copy it out first.
+        // capability again when it resolves — and the same place to report to. Both fields are
+        // shared references, so copy them out first.
         let fetcher = preprocess.fetcher;
-        let graph = MemoryProjectGraph::discover(manifest, &storage.view())
+        let progress = preprocess.progress;
+        let graph = MemoryProjectGraph::discover(manifest, scope, &storage.view())
             .await
             .map_err(GraphResolveError::unreported)?;
         let discovered = graph.warnings.clone();
@@ -161,7 +165,7 @@ impl ProjectScript {
         // so stripping the table here as well would state the same rule a second time, in the one
         // place a reader cannot check it from.
         let (inputs, source_roots) =
-            MemoryProjectPlan::assemble(manifest, storage, fetcher, options).await;
+            MemoryProjectPlan::assemble(manifest, storage, fetcher, options, progress).await;
         Ok(self
             .project(
                 &graph,
@@ -173,6 +177,7 @@ impl ProjectScript {
                 fetcher,
                 storage,
                 options,
+                progress,
             )
             .await)
     }
@@ -180,6 +185,10 @@ impl ProjectScript {
     /// The projection steps shared by both adapters, independent of how the root plan was lowered:
     /// resolve the graph plan, normalize binary-node compile entries onto their resolved jars, and
     /// merge the root's inputs with the graph's.
+    // One more input than clippy's ceiling, and no two of them are the same kind of thing: the
+    // graph, its assembly, the root's own projection, what may fetch, what to read and write
+    // through, what the inputs are for, and where to report.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn project<F, S, C>(
         &self,
         graph: &PreprocessedProjectGraph,
@@ -188,6 +197,7 @@ impl ProjectScript {
         fetcher: &F,
         storage: &mut ProjectStorage<S, C>,
         options: ProjectInputOptions,
+        progress: &Progress,
     ) -> MemoryProjectAssembly
     where
         F: Fetcher,
@@ -229,7 +239,8 @@ impl ProjectScript {
         task_classpath.extend(graph_assembly.task_classpath.iter().cloned());
 
         let graph_inputs =
-            ProjectInputs::assemble(fetcher, storage, &graph_assembly.plan, options).await;
+            ProjectInputs::assemble(fetcher, storage, &graph_assembly.plan, options, progress)
+                .await;
 
         // A binary node's captured bytes and its resolved jar are the same content reached two ways.
         // Compiling against both would put one library on the classpath twice, so the captured
@@ -406,14 +417,26 @@ mod tests {
             jals_classpath::NetworkPolicy::Online
         }
 
-        fn fetch_admitted(&self, locator: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+        fn retry(&self) -> jals_classpath::RetrySchedule {
+            jals_classpath::RetrySchedule::none()
+        }
+
+        fn delay(&self, _: u32) -> impl Future<Output = ()> {
+            ready(())
+        }
+
+        fn fetch_admitted(
+            &self,
+            locator: &str,
+            _: &jals_progress::Task,
+        ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
             ready(Self::refuse(locator))
         }
     }
 
     impl UnreachableFetcher {
         /// Diverges: being asked at all is the failure this fixture asserts against.
-        fn refuse(locator: &str) -> Result<Vec<u8>, String> {
+        fn refuse(locator: &str) -> Result<Vec<u8>, jals_classpath::FetchError> {
             panic!("this assembly must not fetch, but asked for `{locator}`")
         }
     }
@@ -423,6 +446,7 @@ mod tests {
     macro_rules! inert {
         () => {
             GraphPreprocess {
+                progress: &jals_progress::Progress::SILENT,
                 exec: &jals_exec::Exec::inline(),
                 fetcher: &UnreachableFetcher,
                 environment: &BuildScriptEnvironment::new(),
@@ -490,6 +514,7 @@ mod tests {
                     &root_manifest(),
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Editor,
                 )
                 .await
@@ -533,7 +558,13 @@ mod tests {
             ] {
                 let mut storage = project();
                 let assembly = ProjectScript::skipped()
-                    .resolve_memory(&manifest, &mut storage, inert!(), options)
+                    .resolve_memory(
+                        &manifest,
+                        &mut storage,
+                        inert!(),
+                        DependencyScope::Build,
+                        options,
+                    )
                     .await
                     .expect("an in-tree path dependency resolves offline");
                 assert!(
@@ -586,6 +617,7 @@ mod tests {
                     &manifest,
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Editor,
                 )
                 .await
@@ -615,6 +647,7 @@ mod tests {
                     &invalid,
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Editor,
                 )
                 .await
@@ -703,6 +736,7 @@ mod tests {
                     &manifest,
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Editor,
                 )
                 .await
@@ -766,6 +800,7 @@ mod tests {
                     &root_manifest(),
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Compile,
                 )
                 .await
@@ -822,7 +857,13 @@ mod tests {
                     .await
                     .expect("an in-memory publication is infallible");
                 let assembly = ProjectScript::from_parts(None, vec![task_key.clone()])
-                    .resolve_memory(&manifest, &mut storage, inert!(), options)
+                    .resolve_memory(
+                        &manifest,
+                        &mut storage,
+                        inert!(),
+                        DependencyScope::Build,
+                        options,
+                    )
                     .await
                     .expect("an in-tree path dependency resolves offline");
 
@@ -936,6 +977,7 @@ mod tests {
                     &root_manifest(),
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Compile,
                 )
                 .await
@@ -1017,6 +1059,7 @@ mod tests {
                     &root_manifest(),
                     &mut storage,
                     inert!(),
+                    DependencyScope::Build,
                     ProjectInputOptions::Compile,
                 )
                 .await
@@ -1071,6 +1114,7 @@ mod tests {
                 &mut storage,
                 &mut jals_build::build_script::BuildScriptSession::new(),
                 RootBuildScriptOptions {
+                    progress: &jals_progress::Progress::SILENT,
                     manifest: &manifest,
                     environment: &BuildScriptEnvironment::new(),
                     limits: &BuildScriptLimits::default(),

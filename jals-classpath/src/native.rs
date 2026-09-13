@@ -8,15 +8,18 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use jals_config::{
-    Dependency, GitDependency, GitRef, Manifest, PathDependency, ResolvedBuildFeatures,
+    Dependency, DependencyScope, GitDependency, GitRef, Manifest, PathDependency,
+    ResolvedBuildFeatures,
 };
-use jals_exec::tokio_rt::on_blocking_pool;
+use jals_exec::tokio_rt::{on_blocking_pool, sleep_millis};
+use jals_progress::{Progress, Task};
 use jals_storage::{
     CacheKey, CacheNamespace, ContentDigest, DirKey, EntryRef, FileKey, MemoryCache, Name,
     NativeScope, NativeSource, NativeStorage, ProjectStorage, ProjectView, ProvenanceFold,
@@ -25,8 +28,9 @@ use jals_storage::{
 
 use crate::io::Fetch;
 use crate::{
-    ClasspathEntry, DependencyLocation, ExternalLocator, Fetcher, LibrarySource, NetworkPolicy,
-    ProjectInputOptions, ProjectInputPlan, ProjectInputs, Warning, WarningOrigin,
+    ClasspathEntry, DependencyLocation, ExternalLocator, FetchError, Fetcher, LibrarySource,
+    NetworkPolicy, ProjectInputOptions, ProjectInputPlan, ProjectInputs, RetrySchedule, Warning,
+    WarningOrigin,
 };
 
 /// A fetcher backed by `reqwest`'s async client.
@@ -34,21 +38,81 @@ pub struct ReqwestFetcher {
     client: reqwest::Client,
     project_root: PathBuf,
     network: NetworkPolicy,
+    retry: RetrySchedule,
 }
 
 impl ReqwestFetcher {
-    /// Build the host fetch adapter for one project. Relative and `file://` locators are read by
-    /// this adapter; HTTP remains the only network capability, and `network` is whether that
-    /// capability may be used.
+    /// How long a connection may take to establish.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long a transfer may go without delivering anything.
     ///
-    /// There is deliberately no `Default`: it could answer neither question, and one that guessed
-    /// the policy is exactly how a host ends up fetching under `--offline`.
-    pub fn for_project(project_root: PathBuf, network: NetworkPolicy) -> Self {
+    /// Deliberately *not* a whole-request timeout. A release's client jar is hundreds of
+    /// megabytes, and a ceiling on the total transfer would fail a slow link that was making
+    /// steady progress — which is a build broken by the fix for a build that broke.
+    const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Build the host fetch adapter for one project. Relative and `file://` locators are read by
+    /// this adapter; HTTP remains the only network capability, `network` is whether that
+    /// capability may be used, and `retry` is how many further attempts a transient failure gets.
+    ///
+    /// There is deliberately no `Default`: it could answer none of those questions, and one that
+    /// guessed the policy is exactly how a host ends up fetching under `--offline`.
+    pub fn for_project(
+        project_root: PathBuf,
+        network: NetworkPolicy,
+        retry: RetrySchedule,
+    ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Self::client(),
             project_root,
             network,
+            retry,
         }
+    }
+
+    /// The HTTP client, with the two timeouts that make a retry reachable.
+    ///
+    /// A hung connection never returns, so it never becomes a failure the retry loop can classify:
+    /// without these, retrying buys nothing for exactly the case it was added for. The builder
+    /// configures nothing but timeouts and can therefore only fail if the statically-linked rustls
+    /// backend will not initialize; a client with no timeouts is still better than no client, and
+    /// it keeps `for_project` infallible at its six call sites.
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .read_timeout(Self::READ_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Whether another attempt at `error` could plausibly succeed.
+    ///
+    /// The classification exists only here — one line further up every one of these is a `String`
+    /// — so this is the whole of what the retry loop has to go on.
+    ///
+    /// `is_body` is deliberately absent. A truncated body is not obviously transient, and
+    /// [`fetch_bounded_admitted`](Fetcher::fetch_bounded_admitted) streams: treating a body error
+    /// as retryable would restart a partly-received jar from byte zero, three times over.
+    fn classify(error: &reqwest::Error) -> FetchError {
+        let transient = error.is_timeout()
+            || error.is_connect()
+            || error.status().is_some_and(Self::retryable_status);
+        let message = error.to_string();
+        if transient {
+            FetchError::transient(message)
+        } else {
+            FetchError::permanent(message)
+        }
+    }
+
+    /// Which statuses another attempt could get past.
+    ///
+    /// Every 5xx but 501 (which says the server will not implement the method, however often it is
+    /// asked), plus 408 and 429. Stated as a range rather than a list of codes so that a
+    /// vendor-specific one is covered by construction — the CI failure this was written for was a
+    /// Cloudflare 522, which no list assembled from the RFCs would have contained.
+    fn retryable_status(status: reqwest::StatusCode) -> bool {
+        matches!(status.as_u16(), 408 | 429) || (status.is_server_error() && status != 501)
     }
 }
 
@@ -57,41 +121,52 @@ impl Fetcher for ReqwestFetcher {
         self.network
     }
 
-    async fn fetch_admitted(&self, locator: &str) -> Result<Vec<u8>, String> {
+    fn retry(&self) -> RetrySchedule {
+        self.retry
+    }
+
+    async fn delay(&self, millis: u32) {
+        sleep_millis(millis).await;
+    }
+
+    async fn fetch_admitted(&self, locator: &str, report: &Task) -> Result<Vec<u8>, FetchError> {
         if let Some(path) = locator.strip_prefix("file://") {
             let path = path.to_owned();
             return on_blocking_pool(move || {
-                fs::read(&path).map_err(|error| format!("reading {path}: {error}"))
+                fs::read(&path)
+                    .map_err(|error| FetchError::permanent(format!("reading {path}: {error}")))
             })
             .await;
         }
         if !ExternalLocator::is_url(locator) {
             let path = self.project_root.join(locator);
             return on_blocking_pool(move || {
-                fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))
+                fs::read(&path).map_err(|error| {
+                    FetchError::permanent(format!("reading {}: {error}", path.display()))
+                })
             })
             .await;
         }
+        // Streamed rather than buffered whole by `Response::bytes`, for the same reason its bounded
+        // sibling is: a jar is tens of megabytes over a link that may be slow, and a transfer
+        // nobody can watch is exactly the wait this crate is asked about.
         let response = self
             .client
             .get(locator)
             .send()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| Self::classify(&error))?
             .error_for_status()
-            .map_err(|error| error.to_string())?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| format!("reading response: {error}"))
+            .map_err(|error| Self::classify(&error))?;
+        Self::stream(response, None, report).await
     }
 
     async fn fetch_bounded_admitted(
         &self,
         locator: &str,
         max_bytes: usize,
-    ) -> Result<Vec<u8>, String> {
+        report: &Task,
+    ) -> Result<Vec<u8>, FetchError> {
         if let Some(path) = locator.strip_prefix("file://") {
             return Self::read_file_bounded(PathBuf::from(path), max_bytes).await;
         }
@@ -99,62 +174,95 @@ impl Fetcher for ReqwestFetcher {
             let path = self.project_root.join(locator);
             return Self::read_file_bounded(path, max_bytes).await;
         }
-        let mut response = self
+        let response = self
             .client
             .get(locator)
             .send()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| Self::classify(&error))?
             .error_for_status()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| Self::classify(&error))?;
         if response
             .content_length()
             .is_some_and(|length| length > max_bytes as u64)
         {
-            return Err(format!("response exceeds the limit of {max_bytes} bytes"));
+            return Err(FetchError::permanent(format!(
+                "response exceeds the limit of {max_bytes} bytes"
+            )));
         }
+        Self::stream(response, Some(max_bytes), report).await
+    }
+}
+
+impl ReqwestFetcher {
+    /// The most this reserves up front for a response that stated no ceiling of its own.
+    const RESERVE_CAP: usize = 8 * 1024 * 1024;
+
+    /// Read a response chunk by chunk, reporting as it goes and refusing at `max_bytes`.
+    ///
+    /// One reader for both entry points: the bounded one differs only in having a ceiling, and two
+    /// copies of a loop that both counts bytes and enforces a limit is two places to get the limit
+    /// wrong.
+    async fn stream(
+        mut response: reqwest::Response,
+        max_bytes: Option<usize>,
+        report: &Task,
+    ) -> Result<Vec<u8>, FetchError> {
+        // A length the server stated is what turns a spinner into a bar. A response without one
+        // stays a spinner rather than being given a guessed total, because a bar that reaches 100%
+        // and keeps going is worse than no bar.
+        if let Some(length) = response.content_length() {
+            report.set_total(length);
+        }
+        // `Content-Length` is the server's claim, not a fact, and the unbounded entry point has no
+        // ceiling of its own — so the reservation is capped rather than trusted. A `Vec` that grows
+        // past the cap costs an amortized copy next to a network wait; one sized from a header
+        // reading `8589934592` is an allocation failure before the first byte arrives.
         let mut bytes = Vec::with_capacity(
             response
                 .content_length()
                 .and_then(|length| usize::try_from(length).ok())
                 .unwrap_or_default()
-                .min(max_bytes),
+                .min(max_bytes.unwrap_or(Self::RESERVE_CAP)),
         );
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|error| format!("reading response: {error}"))?
+            .map_err(|error| FetchError::permanent(format!("reading response: {error}")))?
         {
-            if bytes
-                .len()
-                .checked_add(chunk.len())
-                .is_none_or(|length| length > max_bytes)
+            if let Some(max_bytes) = max_bytes
+                && bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_none_or(|length| length > max_bytes)
             {
-                return Err(format!("response exceeds the limit of {max_bytes} bytes"));
+                return Err(FetchError::permanent(format!(
+                    "response exceeds the limit of {max_bytes} bytes"
+                )));
             }
             bytes.extend_from_slice(&chunk);
+            report.set_done(bytes.len() as u64);
         }
         Ok(bytes)
     }
-}
 
-impl ReqwestFetcher {
-    async fn read_file_bounded(path: PathBuf, max_bytes: usize) -> Result<Vec<u8>, String> {
+    async fn read_file_bounded(path: PathBuf, max_bytes: usize) -> Result<Vec<u8>, FetchError> {
         on_blocking_pool(move || {
-            let file = fs::File::open(&path)
-                .map_err(|error| format!("opening {}: {error}", path.display()))?;
+            let file = fs::File::open(&path).map_err(|error| {
+                FetchError::permanent(format!("opening {}: {error}", path.display()))
+            })?;
             let limit = u64::try_from(max_bytes)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
             let mut bytes = Vec::new();
-            file.take(limit)
-                .read_to_end(&mut bytes)
-                .map_err(|error| format!("reading {}: {error}", path.display()))?;
+            file.take(limit).read_to_end(&mut bytes).map_err(|error| {
+                FetchError::permanent(format!("reading {}: {error}", path.display()))
+            })?;
             if bytes.len() > max_bytes {
-                return Err(format!(
+                return Err(FetchError::permanent(format!(
                     "{} exceeds the limit of {max_bytes} bytes",
                     path.display()
-                ));
+                )));
             }
             Ok(bytes)
         })
@@ -185,15 +293,24 @@ impl NativeProjectPlan {
     /// `fetcher` is the caller's, never one built here: it carries the [`NetworkPolicy`] the host
     /// chose, and constructing a replacement is how this function used to fetch under `--offline`.
     /// The parameter sits where the portable sibling `MemoryProjectPlan::assemble` puts it.
+    // Eight parameters, and every one of them is a distinct input this lowering cannot derive: the
+    // manifest, which of its two dependency tables to read, the features that select within it,
+    // where the project is, what to read and write through, what may fetch, what the inputs are
+    // for, and where to report. Bundling any of them would be a struct whose only purpose is to be
+    // unpacked one line later.
+    #[allow(clippy::too_many_arguments)]
     pub async fn assemble_native<F: Fetcher>(
         manifest: &Manifest,
+        scope: DependencyScope,
         features: &ResolvedBuildFeatures,
         project_root: &Path,
         storage: &mut NativeStorage,
         fetcher: &F,
         options: ProjectInputOptions,
+        progress: &Progress,
     ) -> (ProjectInputs, Vec<DirKey>) {
-        let mut native = Self::from_manifest(manifest, features, project_root, &storage.view());
+        let mut native =
+            Self::from_manifest(manifest, scope, features, project_root, &storage.view());
         native.materialize_external_sources(storage, options).await;
         native
             .materialize_external_classpath(storage, options)
@@ -202,14 +319,23 @@ impl NativeProjectPlan {
             .materialize_git_sources(project_root, storage, fetcher)
             .await;
         native.materialize_path_sources(project_root, storage).await;
-        let mut inputs = ProjectInputs::assemble(fetcher, storage, &native.plan, options).await;
+        let mut inputs =
+            ProjectInputs::assemble(fetcher, storage, &native.plan, options, progress).await;
         native.warnings.append(&mut inputs.warnings);
         inputs.warnings = native.warnings;
         (inputs, native.source_roots)
     }
 
+    /// Lower the source roots, the `[build] classpath`, and the dependency entries `scope`
+    /// declares into the portable plan.
+    ///
+    /// `scope` is the host's, never inferred: the two callers ask different questions. The
+    /// projection path hands over a manifest whose dependency tables `ProjectScript::root_only`
+    /// already emptied — every declared entry is a graph node there — so only `jals lint`'s
+    /// graph-less fallback reaches this with entries still in place.
     pub fn from_manifest(
         manifest: &Manifest,
+        scope: DependencyScope,
         features: &ResolvedBuildFeatures,
         project_root: &Path,
         view: &ProjectView,
@@ -228,6 +354,23 @@ impl NativeProjectPlan {
         };
 
         for source in &manifest.build.source_dirs {
+            match Self::project_relative(project_root, source) {
+                Some(path) => result.source_roots.push(DirKey::new(path)),
+                None => result
+                    .external_source_roots
+                    .push(Self::resolve_host_path(project_root, source)),
+            }
+        }
+        // `[test] source-dirs` too, and unconditionally, for the reason [`Self::snapshot_scopes`]
+        // captures them unconditionally: these roots are the *shape of the project* an index walks,
+        // and scoping them to what one invocation compiles would make the same project read
+        // differently under `jals build` and `jals test`. Nothing on a compile path reads this list
+        // — a compiler is handed the sources `jals-cli`'s own `discover_sources` gathers per
+        // lowering — so what it decides is only which files an analysis host indexes. Leaving them
+        // out is what put a `[test] source-dirs` file outside `Workspace::owns_path`, so the
+        // language server answered it from a detached group with no `[package] features` and
+        // reported every `#[test]` in it as an error.
+        for source in &manifest.test.source_dirs {
             match Self::project_relative(project_root, source) {
                 Some(path) => result.source_roots.push(DirKey::new(path)),
                 None => result
@@ -270,11 +413,17 @@ impl NativeProjectPlan {
 
         result.plan.add_jar_dependencies(
             manifest,
+            scope,
             features,
             |locator| Self::classify(project_root, locator),
             &mut result.warnings,
         );
-        for (raw_name, dependency) in &manifest.dependencies {
+        // `active_dependencies`, exactly as the jar half above reaches it through
+        // `add_jar_dependencies`: that is the single spelling of "is this entry present?", and one
+        // lowering answering it two ways would lower an `optional` `git`/`path` entry no selection
+        // activated — an index input, and under `Compile` a compiler input, that the same
+        // selection's jars were correctly denied.
+        for (raw_name, dependency) in manifest.active_dependencies(scope, features) {
             if matches!(dependency, Dependency::Jar(_)) {
                 continue;
             }
@@ -358,7 +507,11 @@ impl NativeProjectPlan {
                 }
             }
         }
-        for dependency in manifest.dependencies.values() {
+        // `[dev-dependencies]` alongside `[dependencies]`, and unconditionally, for the same
+        // reason `[test] source-dirs` is captured above: capture is not where a command's
+        // selection applies. A snapshot scoped to the entries one subcommand resolves would make
+        // the captured tree depend on which subcommand ran.
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
             match dependency {
                 Dependency::Jar(jar) => {
                     for locator in core::iter::once(&jar.jar).chain(jar.sources.iter()) {

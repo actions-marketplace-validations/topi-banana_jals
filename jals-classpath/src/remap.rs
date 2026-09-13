@@ -4,8 +4,11 @@
 //! under `BuildTaskArtifact`. The transform is append-only on every class pool (new Utf8 /
 //! `NameAndType` / Class entries are added, refs are rewritten in place) so every external index
 //! stays stable while rates of hierarchy-aware member renaming and descriptor/signature
-//! rewriting proceed. Non-class members pass through verbatim; `META-INF/MANIFEST.MF`'s
-//! `Main-Class` is rewritten when present.
+//! rewriting proceed. Non-class members pass through verbatim with two exceptions, both of which
+//! exist because a remapped jar has to *run*: a jar signature block (`META-INF/*.{SF,DSA,RSA,EC}`)
+//! is dropped along with the manifest's per-entry digests, since rewriting every class leaves them
+//! describing bytes that no longer exist and a JVM refuses such an archive; and
+//! `META-INF/MANIFEST.MF`'s `Main-Class` is rewritten when present.
 //!
 //! [`JarMerge::merge`] unions two jars by member path: the overlay wins on conflicts, the base
 //! keeps everything else, both in deterministic input order.
@@ -13,26 +16,22 @@
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 
-use jals_classfile::{
-    Annotation, Attribute, AttributeBody, ClassFile, ClassSignature, ClassTypeSignature,
-    ConstantPool, ConstantPoolEntry, ElementValue, FieldInfo, FieldType, InnerClassEntry,
-    MethodAccessFlags, MethodInfo, MethodSignature, RecordComponentInfo, SimpleClassTypeSignature,
-    ThrowsSignature, TypeAnnotation, TypeArgument, TypeParameter, TypeSignature,
-};
+use jals_classfile::{ClassFile, ConstantPool, ConstantPoolEntry};
 use jals_exec::Exec;
+use jals_progress::Task;
 use jals_storage::{
     ArtifactCache, CacheBackend, CacheKey, CacheNamespace, ContentDigest, ProvenanceFold,
 };
 
+use crate::jar::JarPackage;
 use crate::load::{Archive, SourceTreeLimits};
+use crate::manifest::{Manifest, MetaInf};
 use crate::mappings::Mappings;
-use crate::zip::{StoredZip, WriteMember};
+use crate::zip::WriteMember;
 use crate::{MappingFormat, RemapDirection};
 
 /// Hardcoded size budget for a remapped / merged jar input. Matches the task-side
@@ -42,6 +41,80 @@ const JAR_LIMITS: SourceTreeLimits = SourceTreeLimits {
     max_file_bytes: 64 * 1_048_576,
     max_total_bytes: 1_024 * 1_048_576,
 };
+
+/// Version of what a remap *writes*, folded into every remap provenance.
+///
+/// The provenance's other inputs — the source jar, the mapping bytes, the direction, the class
+/// hierarchy — say what went in and nothing about what this crate does with it, so a change to the
+/// transform itself would be served the previous transform's jar out of the cache. Bump this
+/// whenever the bytes written for an otherwise unchanged input change; [`JarTransforms`] carries it
+/// to the consumers that memoize around this one.
+///
+/// 2: everything the `META-INF/` pass has done to a remapped jar. The signature block goes and the
+/// manifest's per-entry digests go with it — which is the change this constant should have moved
+/// for when that landed, and did not.
+///
+/// 3: `META-INF/` is matched however the archive spells it, as the JVM matches it, so a
+/// `meta-inf/`-spelled signature block goes and a `meta-inf/`-spelled manifest is stripped instead
+/// of the pass leaving half a claim standing. And a `Main-Class` folded onto continuation lines —
+/// which is every entry point whose name runs past the manifest's 72-byte cap, `jar.rs`'s own
+/// output included — is read as one attribute and written back folded, rather than being missed
+/// and left naming a class the remap has since renamed.
+///
+/// 4: the manifest is edited rather than re-rendered, so a signed manifest that mixed its line
+/// terminators or left its last section unclosed keeps what its author wrote instead of being
+/// normalized; `Main-Class` is read and written as the main attribute it is, never from an
+/// individual section, where it says nothing a JVM reads; and the output leads with its manifest,
+/// which `JarPackage::write_members` now imposes on every jar this crate emits rather than on the
+/// merged ones alone.
+const REMAP_OUTPUT_VERSION: u32 = 4;
+
+/// The same, for what a merge writes.
+///
+/// 2: a merged manifest carries `Multi-Release` when either input's did.
+///
+/// 3: the two sides' manifests are one conflict however either spells the name, the survivor is
+/// written first, and the digest strip leaves a manifest that has no digests in it alone.
+///
+/// 4: the `META-INF/` component is matched case-insensitively, so a `meta-inf/`-spelled manifest is
+/// the manifest for the conflict, the `Multi-Release` read and the digest strip alike.
+///
+/// 5: the manifest edits are [`crate::manifest`]'s, and are byte-identity wherever they change
+/// nothing — a union whose surviving manifest already said `Multi-Release: true` now keeps that
+/// manifest's own bytes rather than a re-rendering of them.
+const MERGE_OUTPUT_VERSION: u32 = 5;
+
+/// The output versions of every jar transform this crate performs.
+///
+/// Published because the versions above are not the whole rule. A consumer that memoizes *around*
+/// one of these transforms — `jals-project` records what a build task produced and replays it
+/// without re-running the task at all — names the transform's inputs in its own key and nothing
+/// about the transform, so a bump here would leave that consumer serving the previous transform's
+/// bytes out of a warm cache. That has happened twice: a remapped jar kept its signature block, and
+/// a merged jar kept saying `Multi-Release: false`, both after the fix had shipped.
+///
+/// It is a fold rather than a number a consumer copies, so the rule holds without anyone
+/// remembering it: a consumer folds this into its key once, and a transform added or bumped here
+/// moves every such key with no edit on the consumer's side.
+pub struct JarTransforms;
+
+impl JarTransforms {
+    /// Every transform's name and output version, in a fixed order.
+    ///
+    /// The name is folded beside the number so that two transforms swapping versions is not the
+    /// same fold, and so that adding one shifts nothing that came before it.
+    const VERSIONS: &'static [(&'static str, u32)] = &[
+        ("remap", REMAP_OUTPUT_VERSION),
+        ("merge", MERGE_OUTPUT_VERSION),
+    ];
+
+    /// Fold every transform's output version into `fold`.
+    pub fn fold(fold: &mut ProvenanceFold) {
+        for (name, version) in Self::VERSIONS {
+            fold.bytes(name.as_bytes()).version(*version);
+        }
+    }
+}
 
 /// Obfuscated class-hierarchy index used to walk supers/interfaces for inherited member lookups.
 #[derive(Debug, Default)]
@@ -183,6 +256,28 @@ impl NestedJar {
 pub struct JarRemap;
 
 impl JarRemap {
+    /// One class remapped, named by what it became.
+    ///
+    /// Split out of the fan-out closure so the closure is the two lines that matter — the work, and
+    /// the tick that says it happened.
+    fn remap_one(
+        position: usize,
+        cf: &mut ClassFile,
+        mappings: &Mappings,
+        index: &ClassIndex,
+    ) -> Result<(usize, String, Vec<u8>), (usize, String)> {
+        helpers::remap_class(cf, mappings, index)
+            .map(|()| {
+                let this = cf.constant_pool.class_name(cf.this_class).map_or_else(
+                    || format!("unknown{position}"),
+                    alloc::borrow::Cow::into_owned,
+                );
+                let member_name = format!("{this}.class");
+                (position, member_name, cf.write())
+            })
+            .map_err(|error| (position, error))
+    }
+
     /// Remap every `.class` member of `jar` per `request`, publishing the resulting jar under
     /// `BuildTaskArtifact`.
     ///
@@ -195,11 +290,16 @@ impl JarRemap {
     /// `[dependencies]` entry resolved on every editor reload — have no plan-level memo above them.
     /// A stale index entry costs a miss, never wrong bytes, because the artifact still comes back
     /// through a verified read.
+    ///
+    /// `report` is the caller's unit of work. A remap of a whole game jar is tens of thousands of
+    /// classes over three passes, and the fan-out in the middle counts through a
+    /// [`Ticker`](jals_progress::Ticker) — which is the whole reason that type exists.
     pub async fn remap<C: CacheBackend>(
         exec: &Exec,
         cache: &mut ArtifactCache<C>,
         jar: &CacheKey,
         request: &RemapRequest<'_>,
+        report: &Task,
     ) -> Result<CacheKey, String> {
         let provenance = request.provenance(jar);
         if let Some(key) = cache
@@ -212,6 +312,9 @@ impl JarRemap {
                 .map_err(|error| format!("remapped jar is invalid: {error:?}"))?
                 .is_some()
         {
+            // The memo answered, so nothing below runs. Reported through the caller's unit, which
+            // is what turns a silent instant into a `Fresh` line.
+            report.fresh();
             return Ok(key);
         }
 
@@ -250,18 +353,16 @@ impl JarRemap {
             .into_iter()
             .map(|(position, cf)| (position, cf, Arc::clone(&mappings), Arc::clone(&index)))
             .collect();
+        report.set_total(inputs.len() as u64);
+        let ticker = report.ticker();
         let outcomes = exec
-            .fan_out(inputs, |(position, mut cf, mappings, index)| async move {
-                helpers::remap_class(&mut cf, &mappings, &index)
-                    .map(|()| {
-                        let this = cf.constant_pool.class_name(cf.this_class).map_or_else(
-                            || format!("unknown{position}"),
-                            alloc::borrow::Cow::into_owned,
-                        );
-                        let member_name = format!("{this}.class");
-                        (position, member_name, cf.write())
-                    })
-                    .map_err(|error| (position, error))
+            .fan_out(inputs, move |(position, mut cf, mappings, index)| {
+                let ticker = ticker.clone();
+                async move {
+                    let outcome = Self::remap_one(position, &mut cf, &mappings, &index);
+                    ticker.tick();
+                    outcome
+                }
             })
             .await;
 
@@ -285,20 +386,31 @@ impl JarRemap {
         let mut out_members = Vec::with_capacity(members.len());
         let mut used_names = BTreeSet::new();
         for (position, (name, outcome)) in members.into_iter().enumerate() {
+            // A signature block describes bytes that no longer exist. Every class in this jar was
+            // rewritten, so the digests in `META-INF/*.SF` match nothing and a JVM refuses the
+            // whole archive with `SecurityException: signer information does not match` — which is
+            // why a remapped Minecraft jar compiles against but never *runs*. The block goes, and
+            // the manifest's per-entry digests go with it below: they are one claim in two halves,
+            // and keeping half is worse than keeping neither.
+            if MetaInf::is_signature(&name) {
+                continue;
+            }
             let (name, bytes) = if let Some((member_name, remapped_bytes)) =
                 remapped.remove(&position)
             {
                 // A multi-release jar stores the same class twice, once under
                 // `META-INF/versions/<n>/`. Both have the same `this_class`, so naming the output
                 // purely from it collides and fails the whole remap. Keep the versioned prefix.
-                let prefix = helpers::multi_release_prefix(&name);
+                let prefix = MetaInf::multi_release_prefix(&name);
                 (format!("{prefix}{member_name}"), remapped_bytes)
             } else {
-                let mut bytes = outcome
+                let bytes = outcome
                     .map_err(|error| format!("failed to read archive member `{name}`: {error}"))?;
-                if name == "META-INF/MANIFEST.MF" {
-                    bytes = helpers::rewrite_manifest_main_class(&bytes, &mappings);
-                }
+                let bytes = if MetaInf::is_manifest(&name) {
+                    helpers::remap_manifest(&bytes, &mappings)
+                } else {
+                    bytes
+                };
                 (name, bytes)
             };
             if !used_names.insert(name.clone()) {
@@ -306,7 +418,7 @@ impl JarRemap {
             }
             out_members.push(WriteMember { name, bytes });
         }
-        let jar_bytes = StoredZip::write(&out_members)?;
+        let jar_bytes = JarPackage::write_members(out_members)?;
 
         let key = CacheKey::new(
             CacheNamespace::BuildTaskArtifact,
@@ -420,7 +532,8 @@ impl RemapRequest<'_> {
     /// rather than its bytes so identity — not position in some file — is what the key rests on.
     fn provenance(&self, jar: &CacheKey) -> ContentDigest {
         let mut fold = ProvenanceFold::new(b"remap-jar\0");
-        fold.parent(jar)
+        fold.version(REMAP_OUTPUT_VERSION)
+            .parent(jar)
             .digest(ContentDigest::of(self.mappings.as_bytes()));
         // Through the format itself, so the match over its variants is exhaustive: a format that
         // selects a renaming from more than its tag — tiny v2's namespace pair — has to reach the
@@ -440,11 +553,27 @@ pub struct JarMerge;
 impl JarMerge {
     /// Merge two cached jars. Members of `overlay` win on path conflicts; everything else comes
     /// from `base` in its original order, followed by any `overlay`-only members in overlay order.
+    ///
+    /// A signature block is dropped from both sides, as it is by a remap and for the same reason: a
+    /// union carries members the signer never saw, and a JVM reading a signed archive that mixes
+    /// signed and unsigned classes in one package refuses it. The half of the claim that lives in
+    /// the manifest goes with it.
+    ///
+    /// The two sides' manifests are **one** conflict however either spells the name — the path
+    /// collision a case-insensitive predicate recognises is not one an exact-keyed map would.
+    /// Whichever survives is written first, but that is not decided here: this hands its union to
+    /// [`JarPackage::write_members`], which is where "the manifest leads" is written down for every
+    /// jar this crate emits. The conflict claim reaches no further than the two sides — a single
+    /// input carrying two manifests of its own is two members here as it was there, since
+    /// deduplicating *within* a side would be this function inventing a conflict its inputs did not
+    /// have.
+    /// `report` is the caller's unit of work; the two member loops count into it.
     pub async fn merge<C: CacheBackend>(
         exec: &Exec,
         cache: &mut ArtifactCache<C>,
         base: &CacheKey,
         overlay: &CacheKey,
+        report: &Task,
     ) -> Result<CacheKey, String> {
         let base_reader = cache
             .open_verified(base)
@@ -458,12 +587,37 @@ impl JarMerge {
             .ok_or_else(|| "merge overlay jar is not cached".to_owned())?;
         let base_members = Archive::decode_all_bounded(exec, base_reader, JAR_LIMITS).await?;
         let overlay_members = Archive::decode_all_bounded(exec, overlay_reader, JAR_LIMITS).await?;
+        report.set_total((base_members.len() + overlay_members.len()) as u64);
 
+        // Whether either input is a multi-release archive. Only one manifest survives a merge —
+        // the overlay's, like every other conflict — but `Multi-Release` is not a claim about the
+        // manifest's own side. It says the archive's `META-INF/versions/<n>/` entries are live, and
+        // a union carries both sides' entries, so dropping it with the losing manifest leaves those
+        // entries in the jar and invisible to the JVM. That is not academic: 1.17's flat server jar
+        // bundles log4j-api, whose `StackLocator` has a Java 8 body at the root and a Java 9 body
+        // under `versions/9/`; without the attribute the client loads the Java 8 one and dies in
+        // the first `LogManager.getLogger()` asking for a method Java 9 removed.
+        let mut multi_release = false;
         let mut overlay_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut overlay_order: Vec<String> = Vec::new();
+        // Which member the overlay's manifest is, by name. Remembered rather than looked up again
+        // by the base's spelling: `MetaInf::is_manifest` matches case-insensitively on purpose, so
+        // a base `META-INF/MANIFEST.MF` and an overlay `META-INF/manifest.mf` would never collide
+        // in a map keyed by the exact name, and the union would carry two manifests — with the
+        // base's winning, which is the documented conflict rule backwards.
+        let mut overlay_manifest: Option<String> = None;
         for (name, outcome) in overlay_members {
-            let bytes = outcome
+            report.advance(1);
+            if MetaInf::is_signature(&name) {
+                continue;
+            }
+            let mut bytes = outcome
                 .map_err(|error| format!("failed to read overlay member `{name}`: {error}"))?;
+            if MetaInf::is_manifest(&name) {
+                bytes = Manifest::write_without_digests(&bytes);
+                multi_release |= Manifest::read_multi_release(&bytes);
+                overlay_manifest.get_or_insert_with(|| name.clone());
+            }
             if overlay_map.insert(name.clone(), bytes).is_none() {
                 overlay_order.push(name);
             }
@@ -473,10 +627,41 @@ impl JarMerge {
         // `overlay_map` afterwards is exactly the overlay-only set.
         let mut out_members = Vec::new();
         for (name, outcome) in base_members {
-            let bytes = match overlay_map.remove(&name) {
-                Some(overlay_bytes) => overlay_bytes,
-                None => outcome
-                    .map_err(|error| format!("failed to read base member `{name}`: {error}"))?,
+            report.advance(1);
+            if MetaInf::is_signature(&name) {
+                continue;
+            }
+            let is_manifest = MetaInf::is_manifest(&name);
+            // The manifest is matched to the overlay's manifest however either side spells it;
+            // every other member is matched by exact path, as a zip's own identity is.
+            let shadowing = if is_manifest {
+                overlay_manifest
+                    .as_ref()
+                    .and_then(|manifest| overlay_map.remove(manifest))
+            } else {
+                overlay_map.remove(&name)
+            };
+            let bytes = if let Some(overlay_bytes) = shadowing {
+                if is_manifest {
+                    // Read even though the overlay's copy is the one that survives: the base
+                    // manifest is the only place the base side can say `Multi-Release`, and a
+                    // member that could not be read is not a member that said no. Fatal for the
+                    // same reason it is fatal in the arm below — an I/O failure is not missing
+                    // data, and answering it as "no" here is the wrong-variant-at-run-time bug
+                    // this whole block exists to prevent.
+                    let shadowed = outcome
+                        .map_err(|error| format!("failed to read base member `{name}`: {error}"))?;
+                    multi_release |= Manifest::read_multi_release(&shadowed);
+                }
+                overlay_bytes
+            } else {
+                let bytes = outcome
+                    .map_err(|error| format!("failed to read base member `{name}`: {error}"))?;
+                if is_manifest {
+                    Manifest::write_without_digests(&bytes)
+                } else {
+                    bytes
+                }
             };
             out_members.push(WriteMember { name, bytes });
         }
@@ -485,10 +670,23 @@ impl JarMerge {
                 out_members.push(WriteMember { name, bytes });
             }
         }
+        // Applied after the union is assembled rather than while it is: which manifest survives is
+        // decided by the walk above, and this has to reach whichever one did. The *first* one, for
+        // the same reason `JarPackage::write_members` hoists that one — it is the manifest a
+        // streaming reader gets, and `Multi-Release` is the one attribute this merge adds.
+        if multi_release
+            && let Some(manifest) = out_members
+                .iter_mut()
+                .find(|member| MetaInf::is_manifest(&member.name))
+        {
+            manifest.bytes = Manifest::write_multi_release(&manifest.bytes);
+        }
 
-        let jar_bytes = StoredZip::write(&out_members)?;
+        let jar_bytes = JarPackage::write_members(out_members)?;
         let mut fold = ProvenanceFold::new(b"merge-jars\0");
-        fold.parent(base).parent(overlay);
+        fold.version(MERGE_OUTPUT_VERSION)
+            .parent(base)
+            .parent(overlay);
         let key = CacheKey::new(
             CacheNamespace::BuildTaskArtifact,
             fold.finish(),
@@ -503,7 +701,26 @@ impl JarMerge {
 }
 
 mod helpers {
-    use super::*;
+    // Named rather than globbed. The list is long because this module does the class-file work, but
+    // a glob here reaches through `super` for everything the *file* imports, which is how a helper
+    // silently acquires a dependency the module above it took on for another reason.
+    use alloc::borrow::ToOwned;
+    use alloc::format;
+    use alloc::string::{String, ToString};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use jals_classfile::{
+        Annotation, Attribute, AttributeBody, ClassFile, ClassSignature, ClassTypeSignature,
+        ConstantPool, ConstantPoolEntry, ElementValue, FieldInfo, FieldType, InnerClassEntry,
+        MethodAccessFlags, MethodInfo, MethodSignature, RecordComponentInfo,
+        SimpleClassTypeSignature, ThrowsSignature, TypeAnnotation, TypeArgument, TypeParameter,
+        TypeSignature,
+    };
+
+    use super::{ClassIndex, PoolInterner};
+    use crate::manifest::Manifest;
+    use crate::mappings::Mappings;
 
     /// Whether archive member `name` carries `extension`, compared case-insensitively. Directory
     /// entries end in `/`, so they never match.
@@ -517,29 +734,21 @@ mod helpers {
         bytes.len() >= 4 && bytes.starts_with(b"PK")
     }
 
-    /// Rewrite `Main-Class:` in a manifest body when the target maps under `mappings`.
-    pub(super) fn rewrite_manifest_main_class(bytes: &[u8], mappings: &Mappings) -> Vec<u8> {
-        let Ok(text) = core::str::from_utf8(bytes) else {
-            return bytes.to_vec();
-        };
-        let mut out = String::with_capacity(text.len());
-        for line in text.split_inclusive('\n') {
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if let Some(value) = trimmed
-                .strip_prefix("Main-Class:")
-                .or_else(|| trimmed.strip_prefix("Main-Class: "))
-            {
-                let dotted = value.trim();
-                let internal = dotted.replace('.', "/");
-                if let Some(official) = mappings.remap_class(&internal) {
-                    let rewritten = official.replace('/', ".");
-                    let _ = writeln!(out, "Main-Class: {rewritten}");
-                    continue;
-                }
-            }
-            out.push_str(line);
-        }
-        out.into_bytes()
+    /// A manifest member's bytes as a remap leaves them: the entry point renamed, the digests
+    /// gone.
+    ///
+    /// The two edits are [`crate::manifest`]'s and the decision between them is this module's.
+    /// What a `Main-Class` maps to is a mapping question — the only one a manifest raises — and how
+    /// a manifest spells the answer, folded onto continuation lines within the 72-byte cap and
+    /// terminated the way the archive terminates its other lines, is not.
+    ///
+    /// Both edits are the identity when there is nothing to do, so an unsigned jar with no entry
+    /// point comes back byte for byte.
+    pub(super) fn remap_manifest(bytes: &[u8], mappings: &Mappings) -> Vec<u8> {
+        let renamed = Manifest::read_main_class(bytes)
+            .and_then(|dotted| mappings.remap_class(&dotted.replace('.', "/")))
+            .map(|official| Manifest::write_main_class(bytes, &official.replace('/', ".")));
+        Manifest::write_without_digests(renamed.as_deref().unwrap_or(bytes))
     }
 
     /// Kind of Signature attribute at a given attribute site.
@@ -1415,16 +1624,6 @@ mod helpers {
 
     /// The owned text of the `Utf8` entry at `index`, or `None` when it is absent or not a `Utf8`.
     /// Every caller here needs an owned copy so the pool can be mutated while the text is in hand.
-    /// The `META-INF/versions/<n>/` prefix of a multi-release archive member, or `""`.
-    pub(super) fn multi_release_prefix(name: &str) -> &str {
-        const ROOT: &str = "META-INF/versions/";
-        let Some(rest) = name.strip_prefix(ROOT) else {
-            return "";
-        };
-        rest.find('/')
-            .map_or("", |end| &name[..=(ROOT.len() + end)])
-    }
-
     fn utf8_owned(pool: &ConstantPool, index: u16) -> Option<String> {
         pool.utf8(index).map(alloc::borrow::Cow::into_owned)
     }
@@ -1496,24 +1695,59 @@ impl core::ops::DerefMut for PoolInterner<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::multi_release_prefix;
+    use alloc::string::String;
 
-    /// A multi-release jar stores the same class twice — once at its plain path and once under
-    /// `META-INF/versions/<n>/` — and both copies share a `this_class`. Naming the remapped output
-    /// from `this_class` alone collides, which failed the remap of the whole archive.
+    use super::helpers::remap_manifest;
+    use crate::mappings::Mappings;
+    use crate::{MappingFormat, RemapDirection};
+
+    fn mappings(text: &str) -> Mappings {
+        Mappings::parse(text, &MappingFormat::Proguard, RemapDirection::Deobfuscate)
+            .expect("parses")
+    }
+
+    /// What a remap does to a manifest is one mapping decision and two edits, and the decision is
+    /// the only half this module owns.
+    ///
+    /// The entry point is renamed because every class in the jar was, and the per-entry digests go
+    /// because they describe bytes that no longer exist — a JVM refuses an archive whose signature
+    /// claims do not check out, which is why a remapped Minecraft jar used to compile against but
+    /// never *run*.
     #[test]
-    fn multi_release_members_keep_their_version_prefix() {
-        assert_eq!(
-            multi_release_prefix("META-INF/versions/11/foo/Bar.class"),
-            "META-INF/versions/11/"
+    fn a_remapped_manifest_is_renamed_and_unsigned() {
+        let manifest = "Manifest-Version: 1.0\r\n\
+             Main-Class: a.b.C\r\n\
+             \r\n\
+             Name: a/b/C.class\r\n\
+             SHA-256-Digest: Zm9v\r\n\
+             \r\n";
+        let renamed = remap_manifest(
+            manifest.as_bytes(),
+            &mappings("com.example.Main -> a.b.C:\n"),
         );
         assert_eq!(
-            multi_release_prefix("META-INF/versions/9/Baz.class"),
-            "META-INF/versions/9/"
+            String::from_utf8(renamed).unwrap(),
+            "Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\n\r\n"
         );
-        assert_eq!(multi_release_prefix("foo/Bar.class"), "");
-        assert_eq!(multi_release_prefix("META-INF/MANIFEST.MF"), "");
-        // A truncated prefix names no version directory, so there is nothing to preserve.
-        assert_eq!(multi_release_prefix("META-INF/versions/11"), "");
+    }
+
+    /// A mapping that says nothing about the entry point leaves it alone, and an unsigned manifest
+    /// with no entry point at all comes back byte for byte: a remap edits a manifest, it does not
+    /// rewrite one.
+    #[test]
+    fn a_manifest_with_nothing_to_rename_or_strip_passes_through() {
+        let unrelated = mappings("com.example.Main -> x.Y:\n");
+        for manifest in [
+            "Manifest-Version: 1.0\r\nMain-Class: a.b.C\r\n\r\n",
+            "Manifest-Version: 1.0\r\n\r\n",
+            // Not text at all: a member this crate cannot read is one it must not replace with an
+            // empty one.
+            "\u{0}\u{1}not a manifest",
+        ] {
+            assert_eq!(
+                remap_manifest(manifest.as_bytes(), &unrelated),
+                manifest.as_bytes()
+            );
+        }
     }
 }

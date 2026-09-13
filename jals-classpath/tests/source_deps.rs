@@ -11,14 +11,26 @@ impl Fetcher for NoFetch {
         jals_classpath::NetworkPolicy::Online
     }
 
-    fn fetch_admitted(&self, _: &str) -> impl Future<Output = Result<Vec<u8>, String>> {
+    fn retry(&self) -> jals_classpath::RetrySchedule {
+        jals_classpath::RetrySchedule::none()
+    }
+
+    fn delay(&self, _: u32) -> impl Future<Output = ()> {
+        ready(())
+    }
+
+    fn fetch_admitted(
+        &self,
+        _: &str,
+        _: &jals_progress::Task,
+    ) -> impl Future<Output = Result<Vec<u8>, jals_classpath::FetchError>> {
         ready(Self::refuse())
     }
 }
 
 impl NoFetch {
     /// Diverges: being asked at all is the failure this fixture asserts against.
-    fn refuse() -> Result<Vec<u8>, String> {
+    fn refuse() -> Result<Vec<u8>, jals_classpath::FetchError> {
         panic!("unexpected fetch")
     }
 }
@@ -50,6 +62,7 @@ fn typed_source_dependency_roots_collect_only_java_in_stable_order() {
         &mut storage,
         &plan,
         ProjectInputOptions::Compile,
+        &jals_progress::Progress::SILENT,
     ));
     let files: Vec<_> = inputs
         .source_dep_sources
@@ -75,6 +88,7 @@ fn missing_source_root_is_diagnostic_not_missing_data() {
         &mut storage,
         &plan,
         ProjectInputOptions::Compile,
+        &jals_progress::Progress::SILENT,
     ));
     assert!(inputs.source_dep_sources.is_empty());
     assert_eq!(inputs.warnings.len(), 1);

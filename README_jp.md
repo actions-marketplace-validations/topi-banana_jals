@@ -34,7 +34,8 @@ linter・language server（LSP）を提供しており、いずれも名前解�
 - **フレームワーク不要のテスト。** テストとは `#[test]` を付けたメソッドのことで、JUnit も
   annotation processor も launcher jar も要りません。`jals test` は各テストを専用の JVM で並列に
   実行し、`cargo nextest` と同じ形で結果を報告します。`jals build` はそれらを 1 つもコンパイル
-  しません。
+  しません。`[toolchain] runtime = "wasm"` を選ぶと、同じテストを `jals` に組み込まれたエンジン上で
+  WebAssembly export として実行します——どの段階でも JDK は要りません。
 - **Cargo 風の Java ビルド。** `Cargo.toml` の Java 版にあたる `jals.toml` マニフェストが
   `jals build` / `run` / `test` / `clean` / `init` を駆動します。任意の Rhai script は `javac` より先に、
   制限付きの storage-only API だけを使って source を生成し、flag・classpath・environment を追加します。
@@ -51,14 +52,14 @@ linter・language server（LSP）を提供しており、いずれも名前解�
 
 ## ワークスペース構成
 
-`jals` はブラウザ向け playground を含む 16 個のプロダクト crate からなる Cargo ワークスペースです。
+`jals` はブラウザ向け playground を含む 17 個のプロダクト crate からなる Cargo ワークスペースです。
 
 | Crate                                | 説明                                                                                                                                                                                                                                                                                                                                                            |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`jals-editor`](jals-editor)         | definition・references・hover・completion・signature help・highlight の protocol-neutral な意味論と、UTF-8 バイト／UTF-16 座標変換。LSP とブラウザ playground で共有します。                                                                                                                                                                                    |
 | [`jals-syntax`](jals-syntax)         | 無損失な Java lexer とエラー耐性のある CST parser（`rowan`）、および CST 上の型付き AST 層。すべてのツールの共通基盤です。                                                                                                                                                                                                                                      |
 | [`jals-fmt`](jals-fmt)               | **WIP（作り直し中）。** `jals-syntax` の CST を入力とする Wadler/Prettier 方式の pretty-printer。現状は入力をそのまま返す no-op。                                                                                                                                                                                                                               |
-| [`jals-lint`](jals-lint)             | linter（`jals-cli` 経由の `jals lint`）。CST と `jals-hir` に基づくルールレジストリで、欠陥クラス別の 10 section・20 rule を `jalslint.toml` から名前で設定します。rustc/clippy の全 lint を jals rule か「採らない理由」に対応付けた台帳を持ちます。                                                                                                                        |
+| [`jals-lint`](jals-lint)             | linter（`jals-cli` 経由の `jals lint`）。CST と `jals-hir` に基づくルールレジストリで、欠陥クラス別の 10 section・21 rule を `jalslint.toml` から名前で設定します。rustc/clippy の全 lint を jals rule か「採らない理由」に対応付けた台帳を持ちます。                                                                                                                        |
 | [`jals-hir`](jals-hir)               | CST 上での名前解決・ファイル横断の型インデックス・型推論/型検査。linter と LSP が拠り所とするセマンティック層で、コンパイル済み classpath からの外部型の橋渡しも行います。                                                                                                                                                                                      |
 | [`jals-classfile`](jals-classfile)   | JVM の `.class` ファイル形式（JVMS 第 4 章）を完全にバイト一致で読み書きするモデル。                                                                                                                                                                                                                                                                            |
 | [`jals-decompile`](jals-decompile)   | パース済みの `.class` から読める Java を再構築します。型/シグネチャのレンダリング、初期化子、宣言された `throws`、そして（段階的に）バイトコードからのメソッド本体の完全な逆コンパイル。                                                                                                                                                                        |
@@ -70,8 +71,10 @@ linter・language server（LSP）を提供しており、いずれも名前解�
 | [`jals-project`](jals-project)       | stable な node identity を持つ transitive path/Git/JAR project graph を探索し、選択 root 直下の正確な `jals.toml` だけを probe し、resolved から preprocessed への phase transition を必須にして、dependency input を node-scoped な検証済み artifact としてのみ `jals-classpath` へ公開します。portable in-memory host と native acquisition host を含みます。 |
 | [`jals-build`](jals-build)           | Cargo 風のビルドオーケストレータ。`jals.toml` を `javac`/`java` の計画・clean key・プロジェクト雛形へ変換し、任意の Rhai pre-build script を revision 付き project storage 上で実行します。`jals build`/`run`/`test`/`clean`/`init` と LSP/playground の build phase を支えます。                                                                                      |
 | [`jals-lsp`](jals-lsp)               | Language Server Protocol サーバ（`jals lsp` サブコマンド）。同じ CST とセマンティック層から診断・ドキュメントシンボル・整形・hover・定義へのジャンプ・参照検索などを提供。ホスト専用。                                                                                                                                                                          |
-| [`jals-cli`](jals-cli)               | `jals` コマンドラインバイナリ。                                                                                                                                                                                                                                                                                                                                 |
+| [`jals-progress`](jals-progress)     | 実行中の作業を「データ」として表す語彙。portable な crate はここを通して事実だけを報告し、`--timings` はその台帳を自己完結した HTML ページとして描画する。描画そのものは持たない——事実がどう見えるかはホストが決める。 |
+| [`jals-cli`](jals-cli)               | `jals` コマンドラインバイナリ。端末はここが所有する: 出力は単一の `Shell` を必ず通り、cargo 風の表示がイベント列をステータス行とプログレスバーに変える。                                                                                                                                                                                                                                                                                                                                 |
 | [`jals-playground`](jals-playground) | [Yew](https://yew.rs) 製・[Trunk](https://trunkrs.dev) でビルドするブラウザ向け playground。`wasm32` にコンパイルし、構文/format/解析/Rhai build-script の各層をブラウザ上だけで動かします。                                                                                                                                                                    |
+| [`jinja`](crates/jinja)              | [minijinja](https://docs.rs/minijinja) と同形の API を持つ汎用 Jinja2 テンプレートエンジン。依存ゼロで `jals` の型を一切名指ししません。`jals-project` が `[build.resources] template` の描画に使います。プロダクト crate では唯一の非 `jals-*` crate であり、`crates/` という置き場所がそれを表しています。                                                          |
 
 残り 2 つのワークスペースメンバーは開発専用のツールで、製品には含まれません:
 [`jals-tests`](jals-tests)（実世界の Java に対して parser の健全性とフォーマッタの忠実度を
@@ -90,12 +93,14 @@ jals/
 ├── jals-classpath/   # classpath + 依存関係の解決      (no_std + wasm 対応コア)
 ├── jals-config/      # jals.toml/jalsfmt.toml/jalslint.toml モデル (no_std, wasm 対応)
 ├── jals-exec/        # current-thread 実行 + worker fan-out (no_std, wasm 対応)
+├── jals-progress/    # 実行中の作業をデータ化 + --timings        (no_std, wasm 対応)
 ├── jals-storage/     # revision付きproject storage      (no_std, wasm 対応)
 ├── jals-project/     # transitive source-project graph   (no_std + wasm 対応コア)
 ├── jals-build/       # Cargo 風の javac/java ビルドプランナ (no_std + wasm 対応コア)
 ├── jals-lsp/         # LSP サーバ (async-lsp, `jals lsp`)  (std, ホスト専用)
 ├── jals-cli/         # `jals` バイナリ                     (std)
 ├── jals-playground/  # ブラウザ playground (Yew + Trunk -> wasm)
+├── crates/jinja/     # Jinja2 エンジン (minijinja 同形, jals 非依存) (no_std, wasm 対応)
 ├── jals-tests/       # コーパステストハーネス (開発専用)
 └── xtask/            # codegen 自動化 (開発専用)
 ```
@@ -195,6 +200,51 @@ Linux・macOS・Windows の `x64` / `arm64` ランナーに対応しています
 `jals` はサブコマンド方式で、`fmt`（ソース整形）・`lint`（ソース lint）・`lsp`（language server）
 に加え、Cargo 風のビルドフロントエンド（`init` / `build` / `run` / `clean`）があります。
 
+### グローバルオプション
+
+すべてのサブコマンドが共有します。Cargo と同じく、サブコマンドのどちら側に書いても構いません
+（`jals --quiet build` と `jals build --quiet` は同じ実行です）。
+
+| オプション | 説明 |
+| --- | --- |
+| `-q, --quiet` | 警告とエラーだけ。ステータス行もプログレス表示も出しません。 |
+| `-v, --verbose` | より多く出します——メモヒット（`Fresh`）、個々のダウンロード、実行前の `javac`/`java` コマンド行。 |
+| `--color <auto\|always\|never>` | ANSI カラーを使うかどうか。`auto` では `NO_COLOR` / `CLICOLOR_FORCE` / `TERM=dumb` を尊重します。 |
+| `--message-format <human\|json>` | `json` は stdout に 1 行 1 JSON オブジェクトを書きます——表示が描いているのと同じイベント列です。 |
+| `--progress <auto\|always\|never>` | ライブのプログレス表示を描くかどうか。`auto` は stderr が端末のときに描きます。 |
+| `--timings[=html,json]` | 実行時間の内訳レポートを `target/jals/timings/` に書き出します。値は cargo と同じく `=` で繋ぎます。 |
+
+出力の規則はひとつです。**人間向けは stderr、スクリプト向けは stdout。** そして stdout の持ち主は
+つねに一つです。`jals test` は自身の結果オブジェクトのために stdout を保ちます——そこで
+`--message-format json` が指してきたのは元々それです——`jals run` も起動したプログラムのために
+stdout を明け渡します。一方 `--dry-run` / `--check` / `--diff` /
+パイプ入力の `jals fmt` はいずれも stdout に自前の成果物を書きます。同じ行に二つ目のスキーマを
+混ぜる代わりに、`json` との併用は拒否されます。
+
+実行は cargo と同じ体裁で自身を語り（`Preparing` / `Resolving` / `Downloaded` / `Extracting` /
+`Remapping` / `Decompiling` / `Indexing` / `Compiling` / `Packaging` / `Fresh` / `Finished`）、
+各行はそれがどのパッケージについてかを示します。stderr が端末なら作業単位ごとにプログレスバーが
+出ます。ダウンロードは個別に告げるのではなくフェーズごとに 1 行へ集約され、`-v` で 1 件ずつに
+戻ります:
+
+```console
+$ jals build --features 1.21.6
+   Preparing hellomod v0.1.0
+   Preparing minecraft v0.1.0
+  Downloaded 2 files (58.1 MiB) in 2.5s
+  Extracting minecraft v0.1.0 (META-INF/versions/26.2/server-26.2.jar)
+     Merging minecraft v0.1.0
+ Decompiling [00:00:41] [=========>          ] 8213/29184 minecraft v0.1.0 (net/minecraft)
+  Publishing minecraft v0.1.0 (minecraft-26.2)
+   Compiling hellomod v0.1.0
+   Remapping hellomod v0.1.0 (1 class)
+   Packaging hellomod v0.1.0 (target/jals/remap/hellomod-0.1.0.jar)
+    Finished `default` profile in 184.02s
+```
+
+`--timings` は自己完結した HTML ページ——作業単位ごとのバー、並列度のプロット、アクティビティ別の
+内訳——と、その隣に上書きされる `jals-timings.html` を書きます。`cargo build --timings` と同じ運用です。
+
 ### ファイルをその場でフォーマット
 
 ```sh
@@ -247,7 +297,7 @@ jals lint src/Main.java src/Util.java
 jals lint src/
 ```
 
-`jals lint` は **10 section・20 rule** を、名前解決と型推論（`jals-hir`）を使って検出します。単なる
+`jals lint` は **10 section・21 rule** を、名前解決と型推論（`jals-hir`）を使って検出します。単なる
 構文木上のパターンマッチではありません。解決できない名前・型不一致・報告されていない検査例外
 （`[correctness]`）、`[package] features` に応じたプレビュー機能と方言構文（`[compatibility]`）、
 定数条件による到達不能分岐と握り潰された例外（`[suspicious]`）、未使用の束縛・import・`private`
@@ -304,6 +354,7 @@ jals build                  # javac でコンパイル
 jals build --dry-run        # コンパイルせず javac コマンドを表示
 jals run                    # コンパイルしてから [run] main-class を実行
 jals run -- arg1 arg2       # ...プログラムへ引数を渡す
+jals run --invoke f -- 7    # jals-wasm プロジェクトで export された static メソッドを呼ぶ
 jals test                   # `#[test]` メソッドを 1 テスト 1 JVM で実行
 jals test --list            # 実行せずにテスト一覧を表示
 jals clean                  # ビルド出力（target/classes・target/test-classes）を削除
@@ -365,7 +416,12 @@ remap 済み Minecraft の例は [`examples/minecraft`](examples/minecraft)
 `[build] remap` により全 43 リリース向けに jar を package し、そのうち難読化された 39
 リリースでは再難読化します。source tree は 43 リリースで 1 つです。その範囲内で Mojang が
 rename した唯一の API を dialect の `#[cfg]` が引き受け、その述語である threshold feature の
-chain は build script と resource template も読みます。
+chain は build script と resource template も読みます。この mod の `jals test` は実際の Minecraft
+client を起動して assert します。しかも同じ 43 リリースのいずれでもです。それを行う harness は
+`[dev-dependencies]` に 1 行書くだけの別 project —
+[`examples/minecraft_client_test`](examples/minecraft_client_test) — で、build は解決せず jar にも
+入りません。この harness が各リリースの runtime jar 約 60 本を pin し、client API 用の threshold
+chain を自前で持つため、mod 側の test はリリース名を一切書きません。
 
 root Rhai phase 自体は capability 制限されていますが、その compiler/JVM 引数、classpath、subprocess
 environment directive は、後続の明示的な `jals build` / `run` による JDK process へ意図的に反映され
@@ -531,6 +587,13 @@ WebAssembly module として出力します（manifest の既定値 `{ type = "j
 JDK stub に対して解決するので、解決済みの `[dependencies]` jar は editor の classpath には載っても
 コンパイラの classpath には載りません。まだ lowering のない構文は誤ったコードを吐かず、Build output
 タブに*報告*されます。
+
+module は、タブがそのまま**実行**もできる唯一の成果物です。背後のエンジンが `core + alloc` 上の
+interpreter であり、playground の他の部分と同じく `wasm32` にコンパイルされるためです。Build output
+タブに入力欄が現れ、そこに書いた export 済みの `static` メソッドが、続く引数とともに呼ばれます。空のまま
+でも実行は起こります — module を instantiate すると start function が走り、そこにクラスの `static`
+初期化子が lowering されています。`.jar` に *Run* はありません。その class file には JVM が必要で、
+ブラウザタブには JVM を起動するプロセスがないからです。
 
 ```sh
 # 初回のみ: wasm ターゲットと Trunk を用意

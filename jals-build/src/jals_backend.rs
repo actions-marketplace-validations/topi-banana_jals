@@ -20,8 +20,11 @@ use alloc::vec::Vec;
 use jals_hir::{FileAnalysis, FileId, FileSemantics, ProjectIndex, TypedFile};
 use jals_javac::lower::Compile;
 use jals_javac::wasm::CompileWasm;
+use jals_progress::{Activity, Outcome};
 use jals_storage::{ContentDigest, ProvenanceFold, RelativePath};
 use jals_syntax::{Parse, SyntaxNode};
+
+use jals_native::NativePackageSet;
 
 use crate::backend::{Backend, BackendFuture, BackendOutcome, BackendRequest};
 
@@ -31,15 +34,37 @@ enum Target {
     /// One class file per declared type, for a JVM.
     ClassFiles { class_version: u16 },
     /// One WebAssembly module for the whole project, with the host's collector managing objects.
-    Wasm,
+    ///
+    /// Carries whether `assert` checks are emitted, because wasm has no run-time flag for them —
+    /// see [`Assertions`](crate::Assertions).
+    Wasm { assertions: bool },
 }
 
 /// Compiles with `jals-javac`, in this process.
 pub struct JalsBackend {
     target: Target,
+    /// The native packages `[build] native-packages` selected, which the wasm target compiles
+    /// beside the project's own sources and imports one host function per `native` method of.
+    ///
+    /// Held by the backend rather than passed on the request because it is *configuration*: it
+    /// changes what comes out for unchanged input, which is exactly what
+    /// [`config_digest`](Backend::config_digest) exists to fold. The class-file target never reads
+    /// it — `[build] native-packages` under any backend but `jals-wasm` is a manifest error
+    /// (`jals_config::ValidationError::NativePackagesWithoutWasmBackend`), so a selection cannot
+    /// reach one.
+    natives: NativePackageSet,
 }
 
 impl JalsBackend {
+    /// The project-relative path the whole-project WebAssembly module is published under.
+    ///
+    /// One name, because there is one module: wasm has no dynamic loading and no classpath, so the
+    /// unit is the project rather than the declared type. Published as a constant because three
+    /// places have to agree on it — this backend writes it, `jals run` reads it back to execute,
+    /// and the playground offers it as a download — and a literal repeated in each is three places
+    /// to edit and two chances to be wrong.
+    pub const WASM_MODULE: &'static str = "project.wasm";
+
     /// The class-file major version each `--release N` produces: 45 for Java 1.1, then one per
     /// release (JVMS §4.1 Table 4.1-A).
     ///
@@ -63,6 +88,7 @@ impl JalsBackend {
             target: Target::ClassFiles {
                 class_version: Self::major_version(release.unwrap_or(25)),
             },
+            natives: NativePackageSet::empty(),
         }
     }
 
@@ -70,9 +96,15 @@ impl JalsBackend {
     ///
     /// `release` has no meaning here: there is no class-file version to pick, and no JVM to accept
     /// it. What bounds the output instead is the language subset with a wasm representation.
-    pub(crate) const fn wasm() -> Self {
+    ///
+    /// `assertions` takes the place `-ea` has on the other target: a JVM decides at start-up
+    /// whether a class file's `assert` checks run, and a wasm host has no such moment.
+    pub(crate) const fn wasm(assertions: crate::Assertions, natives: NativePackageSet) -> Self {
         Self {
-            target: Target::Wasm,
+            target: Target::Wasm {
+                assertions: assertions.enabled(),
+            },
+            natives,
         }
     }
 
@@ -83,6 +115,13 @@ impl JalsBackend {
     /// inside this future would swallow every one of those yields — the host's current-thread
     /// runtime would sit on one compile for its whole duration.
     async fn compile_all(&self, request: &BackendRequest<'_>) -> BackendOutcome {
+        // One unit for the whole compile, counted in files. A per-file *line* would be the wrong
+        // shape — cargo says `Compiling <package>` once, not once per module — but the bar under it
+        // is what makes a hundred-file project look like progress instead of a hang.
+        let report =
+            request
+                .progress
+                .begin_bounded(Activity::Compile, "", request.tree.len() as u64);
         let mut roots: Vec<(FileId, SyntaxNode)> = Vec::with_capacity(request.tree.len());
         let mut messages = Vec::new();
         for (index, source) in request.tree.iter().enumerate() {
@@ -94,7 +133,17 @@ impl JalsBackend {
             roots.push((file, Parse::parse(text).await.syntax()));
         }
         if !messages.is_empty() {
+            report.finish(Outcome::Failed);
             return BackendOutcome::failed(messages);
+        }
+        // A selected native package's Java, parsed into the same compile. It is laid out, lowered
+        // and called exactly as the project's own sources are — the one thing it is not is the
+        // module's exported surface, which is why it travels as a second list all the way into
+        // `CompileWasm::project` rather than being appended here.
+        let project_files = roots.len();
+        for (offset, (_, source)) in self.natives.sources().enumerate() {
+            let file = FileId(u32::try_from(project_files + offset).unwrap_or(u32::MAX));
+            roots.push((file, Parse::parse(source.text).await.syntax()));
         }
 
         // Each file's own analysis first: it needs no index, so it is the half that could be
@@ -105,8 +154,16 @@ impl JalsBackend {
         }
 
         // The stdlib stubs stand in for `java.base`: the JVM supplies the implementations at run
-        // time, so a compile only ever needs the signatures.
-        let index = ProjectIndex::builder(&roots).with_stdlib().build().await;
+        // time, so a compile only ever needs the signatures. A native package's Java is the
+        // opposite case and is folded in as its own origin: it *is* compiled into the artifact, so
+        // what it does not declare the program does not have, and it outranks a stub of the same
+        // name.
+        let (project_roots, native_roots) = roots.split_at(project_files);
+        let index = ProjectIndex::builder(project_roots)
+            .with_native_packages(native_roots)
+            .with_stdlib()
+            .build()
+            .await;
 
         // Bind each analysis to the index, then force the inference. The bindings must outlive the
         // witnesses that borrow their memo cells, so both vectors are held for the whole compile.
@@ -119,24 +176,37 @@ impl JalsBackend {
         for binding in &semantics {
             typed_files.push(binding.typed().await);
         }
+        let (typed_project, typed_natives) = typed_files.split_at(project_files);
 
         let class_version = match self.target {
             Target::ClassFiles { class_version } => class_version,
             // wasm has no dynamic loading and no classpath, so the whole project is one module
             // rather than one artifact per declared type.
-            Target::Wasm => {
-                return match CompileWasm::project(&typed_files, &index) {
-                    Ok(module) => match RelativePath::parse("project.wasm") {
-                        Ok(path) => BackendOutcome::compiled(alloc::vec![(path, module)]),
-                        Err(error) => BackendOutcome::failed(alloc::vec![format!("{error:?}")]),
-                    },
-                    Err(error) => BackendOutcome::failed(alloc::vec![format!("{error}")]),
-                };
+            Target::Wasm { assertions } => {
+                // The whole project is one module, so this arm *is* the wasm compile — and it
+                // returns past the `finish` below. Ending the unit here is what keeps a green
+                // wasm build from reporting `Abandoned`, which says the emitter has a hole in it.
+                let options = jals_javac::wasm::WasmOptions { assertions };
+                let outcome =
+                    match CompileWasm::project(typed_project, typed_natives, &index, options) {
+                        Ok(module) => match RelativePath::parse(Self::WASM_MODULE) {
+                            Ok(path) => BackendOutcome::compiled(alloc::vec![(path, module)]),
+                            Err(error) => BackendOutcome::failed(alloc::vec![format!("{error:?}")]),
+                        },
+                        Err(error) => BackendOutcome::failed(alloc::vec![format!("{error}")]),
+                    };
+                report.finish(if outcome.success() {
+                    Outcome::Completed
+                } else {
+                    Outcome::Failed
+                });
+                return outcome;
             }
         };
 
         let mut classes = Vec::new();
-        for (source, typed) in request.tree.iter().zip(&typed_files) {
+        for (source, typed) in request.tree.iter().zip(typed_project) {
+            report.advance(1);
             match Compile::file(*typed, class_version) {
                 Ok(compiled) => {
                     for class in compiled {
@@ -154,8 +224,10 @@ impl JalsBackend {
             }
         }
         if messages.is_empty() {
+            report.finish(Outcome::Completed);
             BackendOutcome::compiled(classes)
         } else {
+            report.finish(Outcome::Failed);
             BackendOutcome::failed(messages)
         }
     }
@@ -167,7 +239,7 @@ impl Backend for JalsBackend {
     fn id(&self) -> &'static str {
         match self.target {
             Target::ClassFiles { .. } => jals_config::BackendKind::Jals {}.tag_name(),
-            Target::Wasm => jals_config::BackendKind::JalsWasm {}.tag_name(),
+            Target::Wasm { .. } => jals_config::BackendKind::JalsWasm {}.tag_name(),
         }
     }
 
@@ -180,13 +252,23 @@ impl Backend for JalsBackend {
         fold.bytes(jals_javac::VERSION.as_bytes())
             .bytes(match self.target {
                 Target::ClassFiles { .. } => b"class",
-                Target::Wasm => b"wasm",
+                Target::Wasm { .. } => b"wasm",
             })
+            // One slot, two meanings, because the two targets have one number each that changes
+            // what comes out: the class-file version there, and whether `assert` checks are
+            // emitted here. Folding the wasm one is what keeps a test compile's module out of an
+            // ordinary build's cache entry — without it, `jals build` would be served the
+            // assertion-checking module a `jals test` left behind, and vice versa.
             .version(match self.target {
                 Target::ClassFiles { class_version } => u32::from(class_version),
-                Target::Wasm => 0,
+                Target::Wasm { assertions } => u32::from(assertions),
             })
-            .digest(request.options.digest());
+            .digest(request.options.digest())
+            // What the selected native packages contribute: their names, their versions, the Java
+            // they publish, and the import keys they bind. Not the Rust bodies behind those keys —
+            // nothing can observe one — which is why a package carries an author-set version and
+            // that version is in here.
+            .bytes(&self.natives.provenance());
         fold.finish()
     }
 
@@ -200,7 +282,7 @@ impl Backend for JalsBackend {
                 "jals-javac: {} source(s) -> class files at major version {class_version}",
                 request.tree.len()
             ),
-            Target::Wasm => format!(
+            Target::Wasm { .. } => format!(
                 "jals-javac: {} source(s) -> one WebAssembly module (host-managed memory)",
                 request.tree.len()
             ),
@@ -243,6 +325,7 @@ mod tests {
         ];
         let options = BackendOptions::default();
         let request = BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
             options: &options,
@@ -277,6 +360,7 @@ mod tests {
         )];
         let options = BackendOptions::default();
         let request = BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
             options: &options,
@@ -304,7 +388,7 @@ mod tests {
             jals_config::BackendKind::Jals {}.tag_name()
         );
         assert_eq!(
-            JalsBackend::wasm().id(),
+            JalsBackend::wasm(crate::Assertions::Disabled, NativePackageSet::empty()).id(),
             jals_config::BackendKind::JalsWasm {}.tag_name()
         );
     }
@@ -316,19 +400,35 @@ mod tests {
         let tree = [source("Main.java", "public class Main {}")];
         let options = BackendOptions::default();
         let request = BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
             options: &options,
         };
         assert_ne!(
             JalsBackend::new(Some(25)).config_digest(&request),
-            JalsBackend::wasm().config_digest(&request),
+            JalsBackend::wasm(crate::Assertions::Disabled, NativePackageSet::empty())
+                .config_digest(&request),
             "two targets are two sets of artifacts"
         );
         assert_ne!(
             JalsBackend::new(Some(21)).config_digest(&request),
             JalsBackend::new(Some(25)).config_digest(&request),
             "a class-file version is part of the output"
+        );
+        // The wasm half of the same slot, and the one claim in `config_digest` nothing was
+        // asserting: `Assertions` decides whether the module carries the `assert` checks, so a
+        // test compile's module and a build's are two artifacts. Reverting the wasm arm to a
+        // constant `.version(0)` — the regression the comment there warns about — passed every
+        // gate without this line, and `Backend::config_digest` has no production caller yet
+        // (`CacheNamespace::BackendOutput` memoization is still the TODO in `backend.rs`), so
+        // this test is the only thing holding the property until one exists.
+        assert_ne!(
+            JalsBackend::wasm(crate::Assertions::Disabled, NativePackageSet::empty())
+                .config_digest(&request),
+            JalsBackend::wasm(crate::Assertions::Enabled, NativePackageSet::empty())
+                .config_digest(&request),
+            "an assertion-checking module is not the module a build produces"
         );
     }
 

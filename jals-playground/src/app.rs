@@ -30,7 +30,7 @@ use futures::lock::Mutex;
 use jals_build::build_script::{BuildScriptEnvironment, BuildScriptLimits, BuildScriptOutput};
 use jals_classpath::{LibrarySource, ProjectInputOptions, SourceFile};
 use jals_config::fmt::Config;
-use jals_config::{FeatureSet, Manifest, ManifestParseError};
+use jals_config::{DependencyScope, FeatureSet, Manifest, ManifestParseError};
 use jals_hir::{LoweredClasspath, ProjectIndex};
 use jals_project::{
     GraphOutcome, ProjectAnchor, ProjectDiagnostic, ProjectDiagnostics, ProjectScript, ScriptFile,
@@ -41,7 +41,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::compile::Compile;
+use crate::compile::{Compile, Execute};
 use crate::components::{EditorPane, FileTree, Header, PaneTab, ResultPane, TreeEntry};
 use crate::download::Download;
 use crate::fetcher::BrowserFetcher;
@@ -348,11 +348,19 @@ pub enum Msg {
         name: String,
         bytes: Vec<u8>,
         summary: String,
+        runnable: bool,
     },
     /// A compile produced no artifact, with the reason to show in the Build output tab.
     CompileFailed { generation: u64, message: String },
     /// The user pressed *Download* in the Build output tab.
     Download,
+    /// The run box's text changed: an exported method name and its arguments.
+    RunCommandChanged(String),
+    /// The user pressed *Run* in the Build output tab.
+    ///
+    /// No generation and no `spawn_local`, unlike a compile: running a module is synchronous and
+    /// bounded by the module itself, so there is nothing in flight for a newer press to invalidate.
+    RunModule,
     /// The right pane's tab selection changed.
     SelectTab(PaneTab),
 }
@@ -392,6 +400,21 @@ pub struct App {
     /// rather than in the pane's props so a render never clones the bytes and the download stays a
     /// direct response to the user's click.
     compile_artifact: Option<(String, Vec<u8>)>,
+    /// Whether that artifact is one this host can execute — a WebAssembly module, never a jar.
+    /// What decides it is the compile that produced it, not a test on the file name.
+    compile_runnable: bool,
+    /// The run box's text: an exported method name and its arguments, or empty to instantiate the
+    /// module and stop, which still runs its static initialisers.
+    run_command: String,
+    /// What the last run said, or `None` before one. Cleared by the next compile, since a report
+    /// about the previous module would outlive the module it describes.
+    run_output: Option<String>,
+    /// The native packages this tab offers, and the console its `jals.io` writes into.
+    ///
+    /// Built once for the tab rather than per run: the console is host state a package captured,
+    /// so a fresh registry per run would hand every run a different buffer and the one that was
+    /// written to would be thrown away.
+    natives: crate::natives::Natives,
     /// Which tab the right pane shows.
     result_tab: PaneTab,
     /// The latest build-script/classpath status line shown in the [`Header`], if any.
@@ -490,6 +513,10 @@ impl App {
             syntax_dump: None,
             compile_output: None,
             compile_artifact: None,
+            natives: crate::natives::Natives::new(),
+            compile_runnable: false,
+            run_command: String::new(),
+            run_output: None,
             result_tab: PaneTab::Syntax,
             deps_status: None,
             format_notice: None,
@@ -540,6 +567,18 @@ impl App {
     }
 
     /// Invalidate older compiles and capture the new compile generation.
+    /// A module's own output followed by this host's report of the call.
+    ///
+    /// One string rather than two panes because the Run box has one: the program's output is what
+    /// the reader came for, and the report — "returned 3", "the call trapped" — is the frame around
+    /// it. A run that wrote nothing is just the report, with no blank line in front of it.
+    fn joined(written: String, report: String) -> String {
+        if written.is_empty() {
+            return report;
+        }
+        format!("{written}\n{report}")
+    }
+
     fn advance_compile(&self) -> BuildToken {
         self.compile_generation
             .set(self.compile_generation.get().wrapping_add(1));
@@ -1037,6 +1076,7 @@ impl App {
                 &manifest,
                 &mut storage,
                 jals_project::GraphPreprocess {
+                    progress: &jals_progress::Progress::SILENT,
                     exec: &exec,
                     // A dependency's build-task fetches go through the same CORS proxy as
                     // dependency resolution; nothing else in the browser can reach a host.
@@ -1045,6 +1085,9 @@ impl App {
                     root_features: &features,
                     limits: &BuildScriptLimits::default(),
                 },
+                // The playground builds and never runs a test, so `[dev-dependencies]` are not
+                // part of what it resolves.
+                DependencyScope::Build,
                 ProjectInputOptions::Editor,
             )
             .await
@@ -1582,12 +1625,26 @@ impl Component for App {
                 };
                 self.result_tab = PaneTab::Output;
                 // Dropped before the compile rather than after it fails, so a stale jar is never
-                // downloadable while a newer compile is in flight.
+                // downloadable while a newer compile is in flight. The Run box and the last run's
+                // report go with it: both describe these bytes, and leaving them up renders a
+                // button whose handler finds no artifact and does nothing at all.
                 self.compile_artifact = None;
+                self.compile_runnable = false;
+                self.run_output = None;
                 let manifest = match ConfigParseError::parse_manifest(&self.manifest_src) {
                     Ok(manifest) => manifest,
                     Err(error) => {
                         self.compile_output = Some(format!("{MANIFEST_PATH}: {}", error.message));
+                        return true;
+                    }
+                };
+                // Resolved on this task, where the registry lives: a selection holds `Rc`s of the
+                // packages' host state, so it cannot cross into the compile future's own scope
+                // and back — it is built here and moved in.
+                let natives = match self.natives.select(&manifest) {
+                    Ok(natives) => natives,
+                    Err(error) => {
+                        self.compile_output = Some(format!("{MANIFEST_PATH}: {error}"));
                         return true;
                     }
                 };
@@ -1610,12 +1667,13 @@ impl Component for App {
                     if !token.is_current() {
                         return;
                     }
-                    let message = match Compile::workspace(&manifest, &files).await {
+                    let message = match Compile::workspace(&manifest, &files, natives).await {
                         Ok(artifact) => Msg::CompileFinished {
                             generation: token.captured,
                             name: artifact.name,
                             bytes: artifact.bytes,
                             summary: artifact.summary,
+                            runnable: artifact.runnable,
                         },
                         Err(error) => Msg::CompileFailed {
                             generation: token.captured,
@@ -1633,12 +1691,17 @@ impl Component for App {
                 name,
                 bytes,
                 summary,
+                runnable,
             } => {
                 if generation != self.compile_generation.get() {
                     return false;
                 }
                 self.compile_output = Some(summary);
                 self.compile_artifact = Some((name, bytes));
+                self.compile_runnable = runnable;
+                // A report about the module that was there before this compile describes bytes
+                // nothing holds any more.
+                self.run_output = None;
                 self.result_tab = PaneTab::Output;
                 true
             }
@@ -1651,6 +1714,8 @@ impl Component for App {
                 }
                 self.compile_output = Some(message);
                 self.compile_artifact = None;
+                self.compile_runnable = false;
+                self.run_output = None;
                 self.result_tab = PaneTab::Output;
                 true
             }
@@ -1659,6 +1724,39 @@ impl Component for App {
                     Download::save(name, bytes);
                 }
                 false
+            }
+            Msg::RunCommandChanged(command) => {
+                self.run_command = command;
+                // No re-render: the DOM already holds what was typed, so redrawing would only
+                // fight the cursor. The value still travels to the pane as a prop, because the
+                // node does not always survive — switching to the Syntax tab, or a compile whose
+                // artifact is not runnable, unmounts it — and a box that came back empty while
+                // this field kept the old text ran a command nobody could see.
+                false
+            }
+            Msg::RunModule => {
+                let Some((_, bytes)) = &self.compile_artifact else {
+                    return false;
+                };
+                // Failure is a line in the same place success is: what the engine refused — an
+                // export that is not there, an argument that is not an `i32` — is the answer to
+                // what was asked, not an error about the playground.
+                let selection = ConfigParseError::parse_manifest(&self.manifest_src)
+                    .map_err(|error| format!("{MANIFEST_PATH}: {}", error.message))
+                    .and_then(|manifest| self.natives.select(&manifest));
+                self.run_output = Some(match selection {
+                    Ok(natives) => match Execute::run(bytes, &self.run_command, &natives) {
+                        // Whatever the module wrote through a native package comes first: it is
+                        // the program's own output, and the report below is this host describing
+                        // the call. Drained rather than read, so the next run reports only its own.
+                        Ok(report) => Self::joined(self.natives.take_console(), report),
+                        Err(error) => {
+                            Self::joined(self.natives.take_console(), format!("error: {error}"))
+                        }
+                    },
+                    Err(error) => format!("error: {error}"),
+                });
+                true
             }
             Msg::SelectTab(tab) => {
                 self.result_tab = tab;
@@ -1727,6 +1825,11 @@ impl Component for App {
                             output={self.compile_output.clone()}
                             artifact={self.compile_artifact.as_ref().map(|(name, _)| name.clone())}
                             on_download={link.callback(|_| Msg::Download)}
+                            runnable={self.compile_runnable}
+                            run_command={self.run_command.clone()}
+                            on_run_command={link.callback(Msg::RunCommandChanged)}
+                            on_run={link.callback(|_| Msg::RunModule)}
+                            run_output={self.run_output.clone()}
                         />
                     </main>
                 </div>

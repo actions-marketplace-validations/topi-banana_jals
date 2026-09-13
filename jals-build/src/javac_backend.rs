@@ -18,6 +18,8 @@ use jals_config::{BackendKind, Manifest};
 use jals_exec::Exec;
 use jals_storage::{ContentDigest, ProvenanceFold};
 
+use jals_progress::{Activity, Outcome};
+
 use crate::backend::{
     Backend, BackendError, BackendFuture, BackendOutcome, BackendRequest, BackendSelection,
 };
@@ -178,13 +180,25 @@ impl Backend for JavacBackend {
         Box::pin(async move {
             let sources = self.staged_sources(req);
             let request = self.compile_request(&sources);
-            let outcome = self
-                .compiler
-                .compile(&request)
-                .await
-                .map_err(|error| BackendError::Launch(error.to_string()))?;
+            // One unit with no count: `javac` is a single process that says nothing until it is
+            // finished, so a spinner is the honest picture. The in-process backend, which can see
+            // each file go past, opens a bounded one instead.
+            let report = req.progress.begin(Activity::Compile, "");
+            let outcome = match self.compiler.compile(&request).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    report.finish(Outcome::Failed);
+                    return Err(BackendError::Launch(error.to_string()));
+                }
+            };
             // The exit code is the whole result; see `BackendOutcome::from_code` for why.
-            Ok(BackendOutcome::from_code(outcome.code))
+            let outcome = BackendOutcome::from_code(outcome.code);
+            report.finish(if outcome.success() {
+                Outcome::Completed
+            } else {
+                Outcome::Failed
+            });
+            Ok(outcome)
         })
     }
 
@@ -213,13 +227,15 @@ impl BackendSelection {
         project_root: &Path,
         staged: &StagedTree,
         inputs: &HostCompileInputs<'_>,
+        assertions: crate::Assertions,
+        natives: jals_native::NativePackageSet,
         exec: &Exec,
     ) -> Self {
         match manifest.build.backend {
             BackendKind::Javac {} => Self::Available(Box::new(
                 JavacBackend::new(manifest, project_root, staged, inputs, exec).await,
             )),
-            other => Self::in_process(other, manifest.build.release),
+            other => Self::in_process(other, manifest.build.release, assertions, natives),
         }
     }
 }
@@ -274,6 +290,7 @@ mod tests {
         options: &'a BackendOptions,
     ) -> BackendRequest<'a> {
         BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
             tree: sources,
             classpath: &[],
             options,
@@ -447,6 +464,8 @@ mod tests {
                 &root,
                 &staged,
                 &inputs,
+                crate::Assertions::Disabled,
+                jals_native::NativePackageSet::empty(),
                 &Exec::inline(),
             ));
             match selection {

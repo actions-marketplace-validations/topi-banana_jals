@@ -21,14 +21,28 @@
 
 use expect_test::expect;
 use jals_hir::{FileAnalysis, FileId, FileSemantics, ProjectIndex, TypedFile};
-use jals_javac::wasm::{CompileWasm, ExportKind, Instr, Module};
+use jals_javac::wasm::{CompileWasm, ExportKind, Instr, Module, WasmOptions};
 use jals_syntax::SyntaxNode;
 use std::fmt::Write as _;
 
 /// Compile every source as one module — which is what "the whole project" means for a target with
 /// no dynamic loading and no classpath — and stop at the module rather than at its bytes.
 fn module_of(sources: &[&str]) -> Module {
-    let roots: Vec<(FileId, SyntaxNode)> = sources
+    module_with(sources, WasmOptions::default())
+}
+
+/// [`module_of`], with the compile options stated.
+fn module_with(sources: &[&str], options: WasmOptions) -> Module {
+    module_of_parts(sources, &[], options)
+}
+
+/// A module compiled from the project's own `sources` plus a native package's `libraries`.
+///
+/// The two lists differ in exactly one way — a library declaration is never exported — so every
+/// test that cares about that distinction goes through here.
+fn module_of_parts(sources: &[&str], libraries: &[&str], options: WasmOptions) -> Module {
+    let texts: Vec<&str> = sources.iter().chain(libraries).copied().collect();
+    let roots: Vec<(FileId, SyntaxNode)> = texts
         .iter()
         .enumerate()
         .map(|(index, text)| {
@@ -50,11 +64,13 @@ fn module_of(sources: &[&str]) -> Module {
         .zip(&analyses)
         .map(|((file, _), analysis)| analysis.in_project(&index, *file))
         .collect();
-    let inputs: Vec<TypedFile<'_>> = semantics
+    let typed: Vec<TypedFile<'_>> = semantics
         .iter()
         .map(|binding| jals_exec::block_on_inline(binding.typed()))
         .collect();
-    CompileWasm::module(&inputs, &index).unwrap_or_else(|error| panic!("compile: {error}"))
+    let (inputs, libraries) = typed.split_at(sources.len());
+    CompileWasm::module(inputs, libraries, &index, options)
+        .unwrap_or_else(|error| panic!("compile: {error}"))
 }
 
 /// The exported function named `export`, rendered as its declared locals followed by its
@@ -76,7 +92,11 @@ fn body_of(module: &Module, export: &str) -> String {
             .collect();
         panic!("no exported function `{export}`; the module exports {names:?}")
     };
-    let func = &module.funcs[usize::try_from(*index).expect("a function index that fits")];
+    // The function index space starts with the imports, so a defined function's place in
+    // `module.funcs` is its index minus their count.
+    let defined =
+        usize::try_from(*index).expect("a function index that fits") - module.imports.len();
+    let func = &module.funcs[defined];
 
     let mut rendered = String::new();
     writeln!(rendered, "locals: {:?}", func.locals).expect("write to a String");
@@ -402,4 +422,478 @@ public class J {
         Unreachable
     "]]
     .assert_eq(&body_of(&module, "use"));
+}
+
+// --- conversions and casts erasure leaves behind -----------------------------------------------
+
+/// A widening primitive conversion (JLS §5.1.2) is silent in Java and an instruction in wasm.
+///
+/// `static long take(long x)` called as `take(1)` puts an `i32` where the signature says `i64`.
+/// Nothing on this side said so and the validator refused the module — which is exactly the failure
+/// an engine-free assertion catches on the platform this backend targets, where no validator runs.
+/// `value_as` routes a *declaration* through the numeric path and so got `long a = 1;` right all
+/// along, which is what made one source spell one conversion two ways.
+#[test]
+fn an_int_argument_widens_to_a_long_parameter() {
+    let module = module_of(&[r"
+public class Widen {
+    static long take(long x) { return x + 1; }
+    public static long run() { return take(1); }
+}
+"]);
+    expect![[r"
+        locals: []
+        I32Const(1)
+        I64ExtendI32S
+        Call(0)
+        Return
+        Unreachable
+    "]]
+    .assert_eq(&body_of(&module, "run"));
+}
+
+/// The fall-through of a dispatch chain casts nothing, so an erased receiver arrives at it as
+/// `anyref` — and the function it calls is declared over a concrete struct.
+///
+/// `<T extends C> int g(T t) { return t.m(); }` is the everyday shape. Each `ref.test` arm above
+/// casts the receiver to the type it just tested for; the fall-through tested nothing, and pushed
+/// the spilled local as it stood.
+#[test]
+fn a_dispatch_fall_through_casts_its_receiver() {
+    let module = module_of(&[r"
+public class Fall {
+    static class C { int m() { return 3; } }
+    static class D extends C { int m() { return 4; } }
+    static <T extends C> int g(T t) { return t.m(); }
+    public static int run() { return g(new D()); }
+}
+"]);
+    let body = body_of(&module, "g");
+    assert!(
+        body.contains("RefCast"),
+        "the fall-through arm must narrow the receiver it spilled:\n{body}"
+    );
+    // Two casts per arm would mean the fall-through is still pushing an `anyref`: one for the arm
+    // that tested `D`, and one for the fall-through to `C`.
+    assert_eq!(
+        body.matches("RefCast").count(),
+        2,
+        "one cast per tested arm and one for the fall-through:\n{body}"
+    );
+}
+
+/// A store into a field or an array element declared at a concrete type is a place the validator
+/// checks exactly, and erasure puts an `anyref` on the stack in front of it.
+///
+/// The premise the old code rested on — "a reference target is already the right type or the
+/// analysis would not have typed the assignment" — held only while every reference this backend
+/// produced was concrete. `b.held = id(c);` was a module `wasm-tools` refuses.
+#[test]
+fn a_store_of_an_erased_value_casts_to_what_the_place_holds() {
+    let module = module_of(&[r"
+public class Store {
+    static class Cell { int v; }
+    static class Box { Cell held; }
+    static <T> T id(T t) { return t; }
+    public static int run() {
+        Cell c = new Cell();
+        Box b = new Box();
+        b.held = id(c);
+        Cell[] a = new Cell[1];
+        a[0] = id(c);
+        return b.held.v + a[0].v;
+    }
+}
+"]);
+    let body = body_of(&module, "run");
+    // One for the field store, one for the array element store, and one for each of the two reads
+    // back through `held` / `a[0]`, which are erased the same way.
+    assert!(
+        body.matches("RefCast").count() >= 2,
+        "both the field store and the array-element store narrow what they store:\n{body}"
+    );
+}
+
+/// A method whose implementation is inherited rather than declared still has one.
+///
+/// `class C extends Base implements I {}` declares nothing at all, and its implementation of `I.f`
+/// is `Base.f`. `Base` is no subtype of `I`, so asking whether `Base.f` *overrides* `I.f` correctly
+/// answers no — and answers the wrong question. Reading that no as "nothing in this module
+/// implements it" emitted `unreachable` against a receiver whose body was one function away: a
+/// module that validated, instantiated, and trapped, where the merge base refused by name.
+#[test]
+fn an_inherited_implementation_is_dispatched_to() {
+    let module = module_of(&[r"
+public class Inherit {
+    interface I { int f(); }
+    static class Base { public int f() { return 7; } }
+    static class C extends Base implements I {}
+    public static int run() { I i = new C(); return i.f(); }
+}
+"]);
+    let body = body_of(&module, "run");
+    assert!(
+        !body.contains("Unreachable\n        Return"),
+        "the call must dispatch, not trap:\n{body}"
+    );
+    assert!(
+        body.contains("RefTest") && body.contains("Call("),
+        "an inherited implementation is reached through the dispatch chain:\n{body}"
+    );
+}
+
+/// A lambda the index could give no single abstract method is refused, not laid out.
+///
+/// A lambda is typed by its *target*, and in argument position that target is the parameter of an
+/// overload chosen after the index is built — so `use(() -> 5)` reached the layout with no method
+/// member. Skipping it left the struct declared with no body behind it: the creation emitted
+/// `struct.new_default`, the object implemented nothing, and the call through the interface found
+/// no override and became `unreachable`.
+#[test]
+fn a_lambda_with_no_abstract_method_is_refused() {
+    let source = r"
+public class Arg {
+    interface I { int f(); }
+    static int use(I i) { return i.f(); }
+    public static int run() { return use(() -> 5); }
+}
+";
+    let root = jals_exec::block_on_inline(jals_syntax::Parse::parse(source)).syntax();
+    let index = jals_exec::block_on_inline(
+        ProjectIndex::builder(&[(FileId(0), root.clone())])
+            .with_stdlib()
+            .build(),
+    );
+    let analysis = jals_exec::block_on_inline(FileAnalysis::of(&root));
+    let semantics = analysis.in_project(&index, FileId(0));
+    let typed = jals_exec::block_on_inline(semantics.typed());
+    let error = CompileWasm::module(&[typed], &[], &index, WasmOptions::default())
+        .expect_err("a refusal, not a trap");
+    assert_eq!(
+        error.to_string(),
+        "a lambda or method reference with no single abstract method is not compiled to wasm yet"
+    );
+}
+
+/// A `native` method is a host import, and the two names it is imported under are derivable from
+/// the declaration alone.
+///
+/// The module name is the declaring class's internal name and the field name is the method's name
+/// with its JVM descriptor. Both halves are pinned here because they are the *link symbol*: the
+/// host keys its implementation table on exactly these two strings, so a change to either one is a
+/// change to what every native package has to be registered under.
+#[test]
+fn a_native_method_becomes_a_host_import() {
+    let module = module_of(&[r"
+public class Native {
+    static class N { static native int f(char[] text, int at); }
+    public static int run(char[] t) { return N.f(t, 0); }
+}
+"]);
+    let imported: Vec<(&str, &str)> = module
+        .imports
+        .iter()
+        .map(|import| (import.module.as_str(), import.name.as_str()))
+        .collect();
+    assert_eq!(imported, vec![("Native$N", "f([CI)I")]);
+}
+
+/// Imports occupy the low end of the function index space, so every defined function moves up by
+/// their count — and the export section, which names indices, has to move with them.
+///
+/// The regression this pins is silent: an export that still named index 0 would name the *import*,
+/// which is a perfectly well-formed module that calls the host when it was asked for the project's
+/// own method.
+#[test]
+fn an_import_shifts_every_defined_function_index() {
+    let module = module_of(&[r"
+public class Native {
+    static native int host();
+    public static int run() { return host(); }
+}
+"]);
+    assert_eq!(module.imports.len(), 1);
+    let (_, _, exported) = module
+        .exports
+        .iter()
+        .find(|(name, ..)| name == "run")
+        .expect("`run` is exported");
+    assert_eq!(
+        *exported, 1,
+        "the one defined function sits after the import"
+    );
+    assert!(
+        body_of(&module, "run").contains("Call(0)"),
+        "the call reaches the import: {}",
+        body_of(&module, "run")
+    );
+}
+
+/// A `native` method whose body *is* there is not imported: the declaration is a Java error this
+/// backend never checks, and the honest reading of it is "there is a body".
+#[test]
+fn a_native_method_with_a_body_is_compiled_rather_than_imported() {
+    let module = module_of(&[r"
+public class Native {
+    static native int host();
+}
+"
+    .replace("native int host();", "native int host() { return 7; }")
+    .as_str()]);
+    assert!(module.imports.is_empty(), "{:?}", module.imports);
+}
+
+/// A native package's classes are compiled into the module and are *not* its surface.
+///
+/// Two failures hide behind getting this wrong, and neither is visible in a build. A library's
+/// `static` method under the same bare name as a project's takes the export, because the first one
+/// wins and the second is dropped without a word. And a `static native` method has no defined
+/// function at all, so exporting it would name an *import* index — a module that validates and
+/// calls the host when the caller asked for the project.
+#[test]
+fn a_library_class_static_method_is_not_exported() {
+    let module = module_of_parts(
+        &["public class App { public static int run() { return Lib.help() + Lib.reach(); } }"],
+        &[r"
+public class Lib {
+    public static native int reach();
+    public static int help() { return 1; }
+}
+"],
+        WasmOptions::default(),
+    );
+    let exported: Vec<&str> = module
+        .exports
+        .iter()
+        .map(|(name, ..)| name.as_str())
+        .collect();
+    assert_eq!(exported, vec!["run"], "only the project's own surface");
+    assert_eq!(
+        module.imports.len(),
+        1,
+        "the library's `native` still links"
+    );
+}
+
+/// A project method and a library method of the same bare name: the project keeps the export.
+#[test]
+fn a_library_never_takes_a_project_export() {
+    let module = module_of_parts(
+        &["public class App { public static int run() { return Lib.run(); } }"],
+        &["public class Lib { public static int run() { return 2; } }"],
+        WasmOptions::default(),
+    );
+    let project = body_of(&module, "run");
+    assert!(
+        project.contains("Call("),
+        "the exported `run` is the project's, which calls the library's: {project}"
+    );
+    assert_eq!(module.exports.len(), 1);
+}
+
+/// A body-less method that did not say `native` is still a refusal, and still its own one: what is
+/// missing there is an implementation that was expected, not one the embedder supplies.
+#[test]
+fn a_body_less_method_that_is_not_native_is_still_reported() {
+    let source = r"
+public class Missing {
+    interface Shape { int area(); }
+    static int use(Shape s) { return s.area(); }
+    public static int run() { return use(null); }
+}
+";
+    let root = jals_exec::block_on_inline(jals_syntax::Parse::parse(source)).syntax();
+    let index = jals_exec::block_on_inline(
+        ProjectIndex::builder(&[(FileId(0), root.clone())])
+            .with_stdlib()
+            .build(),
+    );
+    let analysis = jals_exec::block_on_inline(FileAnalysis::of(&root));
+    let semantics = analysis.in_project(&index, FileId(0));
+    let typed = jals_exec::block_on_inline(semantics.typed());
+    let module = CompileWasm::module(&[typed], &[], &index, WasmOptions::default());
+    // Either answer is a refusal rather than a trap; what must not happen is an import appearing
+    // for a method nobody declared `native`.
+    if let Ok(module) = module {
+        assert!(module.imports.is_empty(), "{:?}", module.imports);
+    }
+}
+
+/// `assert` is compiled into nothing by default, and that is not a gap: a JVM evaluates one only
+/// when it was started with `-ea`, so a module that always checked would be *stricter* than Java.
+///
+/// The pin is the whole default half of the contract — `jals build` behaves the same on both
+/// backends — and it is what the armed test below is the complement of.
+#[test]
+fn an_assert_compiles_to_nothing_by_default() {
+    let module =
+        module_of(&["public class S { public static int run(int n) { assert n > 0; return n; } }"]);
+    let body = body_of(&module, "run");
+    // `If` and not `Unreachable`: a body's own trailing `unreachable` is how a function that
+    // returns on every path ends, so the branch is what says a check was emitted.
+    assert!(
+        !body.contains("If"),
+        "an unarmed `assert` emits no check: {body}"
+    );
+}
+
+/// Armed, an `assert` is a conditional trap.
+///
+/// A trap and not a `throw`: Java raises `AssertionError`, which no module declares and no `catch`
+/// here could name, and the point of that error is that ordinary code does not handle it. Nothing
+/// catches a trap either, where a `throw` on the module's tag would be offered to any `catch`
+/// clause whose `ref.test` happened to accept a null payload.
+#[test]
+fn an_armed_assert_emits_a_conditional_trap() {
+    let module = module_with(
+        &["public class S { public static int run(int n) { assert n > 0; return n; } }"],
+        WasmOptions { assertions: true },
+    );
+    let body = body_of(&module, "run");
+    assert!(
+        body.contains("If") && body.contains("Else") && body.contains("  Unreachable"),
+        "an armed `assert` traps on the false arm of the condition it was written with: {body}"
+    );
+}
+
+/// The condition is lowered only when the check is emitted, so a project whose `assert` names
+/// something with no wasm representation still builds — and stops compiling the moment a test run
+/// arms it.
+///
+/// Stated rather than discovered: `jals build` and `jals test` genuinely differ on such a file,
+/// and it is the test run that reports what the build accepted.
+#[test]
+fn an_assert_condition_is_lowered_only_when_it_is_armed() {
+    let source = r#"
+public class S {
+    public static int run(int n) { assert "x" != null; return n; }
+}
+"#;
+    // Unarmed: the condition is never visited, so the `String` in it is never asked for.
+    let module = module_of(&[source]);
+    assert!(!body_of(&module, "run").contains("If"));
+
+    // Armed: it is, and there is no `String` on this target.
+    let root = jals_exec::block_on_inline(jals_syntax::Parse::parse(source)).syntax();
+    let index = jals_exec::block_on_inline(
+        ProjectIndex::builder(&[(FileId(0), root.clone())])
+            .with_stdlib()
+            .build(),
+    );
+    let analysis = jals_exec::block_on_inline(FileAnalysis::of(&root));
+    let semantics = analysis.in_project(&index, FileId(0));
+    let typed = jals_exec::block_on_inline(semantics.typed());
+    let error = CompileWasm::module(&[typed], &[], &index, WasmOptions { assertions: true })
+        .expect_err("the condition is compiled now, and it names a library type");
+    assert!(
+        error
+            .to_string()
+            .contains("`String` has no wasm representation"),
+        "the report names what it could not lower: {error}"
+    );
+}
+
+/// A superclass cycle is finished with, not followed.
+///
+/// `class A extends B {}` beside `class B extends A {}` parses and indexes — nothing rejects it
+/// before a backend sees it — and this lowering walked the chain in two places with no guard. The
+/// class ordering was worse than a hang: its `ordered.contains` check was a test against the
+/// *output*, which a caller appends to only on the way back out, so an ancestor still being
+/// visited was invisible and the recursion aborted the process with a stack overflow. Nothing
+/// catches one of those, and the input reaches an editor as readily as a build.
+///
+/// Five shapes, because the second walk is only reached once the first terminates: no constructors
+/// at all, explicit ones on both sides, a third class hanging off the cycle, and the two
+/// *self*-cycle shapes — `class C extends C {}` is the input `ProjectIndex::direct_superclass`
+/// answers `Some(C)` for by name, and until it was listed here neither backend had a fixture for it.
+///
+/// What this counts is functions, so it cannot see the shape of the emitted *types*. That half is
+/// by construction: `Layout::fill_class` declares the supertype `Layout::reserve_class` recorded
+/// rather than re-deriving it, and `Body::super_constructor` follows the same declared chain — see
+/// both doc comments. Before that, every source here emitted a module `wasm-tools validate`
+/// rejected, and this test passed.
+#[test]
+fn a_superclass_cycle_terminates_rather_than_recursing() {
+    for (source, functions) in [
+        ("class A extends B {} class B extends A {}", 0),
+        (
+            "class A extends B { A() {} } class B extends A { B() {} }",
+            2,
+        ),
+        (
+            "class A extends B {} class B extends A {} class C extends A { C() {} }",
+            1,
+        ),
+        ("class C extends C {}", 0),
+        ("class C extends C { int x; C() {} }", 1),
+    ] {
+        assert_eq!(module_of(&[source]).funcs.len(), functions, "{source}");
+    }
+}
+
+/// The super-constructor search stops at the first ancestor that *declares* one, even when that
+/// ancestor has no constructor it can call.
+///
+/// `class P { P(int x) {} }` declares a constructor and no no-arg one, so `class C extends P {}`
+/// has no reachable `super()` — javac rejects the program, and this backend emits a constructor
+/// that calls nothing rather than inventing a call.
+///
+/// Pinned because the obvious way to write this walk over a published chain is `find_map`, which
+/// compiles, passes every cycle test, and is wrong: `find_map` skips the `None` that `P` produces
+/// and keeps climbing, so `C` would call a *grandparent's* constructor and leave `P`'s fields at
+/// their defaults — in a module that validates.
+#[test]
+fn the_super_constructor_search_stops_at_the_first_ancestor_declaring_one() {
+    // `G` is what a `find_map` would climb past `P` and reach: it declares a no-arg constructor, so
+    // the wrong walk has something to emit a call to.
+    let module = module_of(&[
+        "class G { G() {} } class P extends G { P(int x) {} } class C extends P { C() {} }",
+    ]);
+    let calls: usize = module
+        .funcs
+        .iter()
+        .map(|func| {
+            func.body
+                .iter()
+                .filter(|instruction| matches!(instruction, Instr::Call(_)))
+                .count()
+        })
+        .sum();
+    // One, and exactly one: `P(int)` calls `G()`, which is a real `super()` the source implies.
+    // `C()` adds none, because `P` declares a constructor and no no-arg one — the search stops
+    // there. Under a `find_map` this is two, the second being `C()` calling `G()` directly.
+    assert_eq!(
+        calls, 1,
+        "only `P(int)`'s own `super()` is emitted; `C()` reaches no super-constructor"
+    );
+}
+
+/// ...and it does not stop *before* one: an ancestor that declares no constructor is a link in the
+/// chain, not its end.
+///
+/// The mirror of the test above, and the half nothing covered — truncating the walk to
+/// `superclasses(owner).take(1)` left every test in this crate green. `P` contributes no
+/// constructor function of its own, so a walk that stopped there would never reach `G`'s
+/// synthesised one and `C()` would skip `G`'s field initialisers, leaving `x` at zero in a module
+/// that validates.
+#[test]
+fn the_super_constructor_search_continues_past_an_ancestor_that_declares_none() {
+    let module =
+        module_of(&["class G { int x = 1; } class P extends G {} class C extends P { C() {} }"]);
+    let calls: usize = module
+        .funcs
+        .iter()
+        .map(|func| {
+            func.body
+                .iter()
+                .filter(|instruction| matches!(instruction, Instr::Call(_)))
+                .count()
+        })
+        .sum();
+    // One: `C()` reaches `G`'s synthesised initialiser through the constructor-less `P`. Under a
+    // walk that stops at the first ancestor whatever it holds, this is zero.
+    assert_eq!(
+        calls, 1,
+        "`C()` calls `G`'s initialiser through the constructor-less `P`"
+    );
 }

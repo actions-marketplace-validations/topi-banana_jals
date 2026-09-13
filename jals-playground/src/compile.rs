@@ -22,17 +22,23 @@ use std::fmt;
 
 use jals_build::{
     BackendAbsence, BackendOptions, BackendRequest, BackendSelection, BackendSource, RunTarget,
+    WasmRunOutcome, WasmRunRequest, WasmRunner,
 };
 use jals_classpath::JarPackage;
 use jals_config::{BackendKind, Manifest};
 use jals_frontend::{FrontendSelection, IrFile};
+use jals_native::NativePackageSet;
 use jals_storage::{ArtifactCache, MemoryCache, RelativePath};
 
 /// The name a project with no usable `[package] name` is packaged under.
 const FALLBACK_JAR: &str = "project.jar";
 
-/// The whole-project WebAssembly module's name, matching what `jals build` writes to disk.
-const WASM_ARTIFACT: &str = "project.wasm";
+/// The whole-project WebAssembly module's name.
+///
+/// The backend's own constant rather than a literal that matches it: the same name is what `jals
+/// build` writes to disk and what `jals run` reads back, and three copies of it is two chances to
+/// disagree.
+const WASM_ARTIFACT: &str = jals_build::JalsBackend::WASM_MODULE;
 
 /// What one compile produced: a downloadable file plus a line describing it.
 pub struct CompileArtifact {
@@ -41,6 +47,13 @@ pub struct CompileArtifact {
     pub bytes: Vec<u8>,
     /// One human-readable line about what was produced, shown in the Build output pane.
     pub summary: String,
+    /// Whether this host can execute what it just produced, which decides whether the pane offers
+    /// to. A module can be: the engine is compiled into this binary. A jar cannot — running one
+    /// needs a JVM, and a browser tab has no process to start one in.
+    ///
+    /// A field rather than a test on [`name`](Self::name), so that what decides it is the backend
+    /// that produced the artifact and not a string comparison a second reader could get wrong.
+    pub runnable: bool,
 }
 
 /// Why a compile produced no artifact. The [`Display`](fmt::Display) is what the pane shows.
@@ -115,6 +128,73 @@ impl fmt::Display for CompileFailure {
     }
 }
 
+/// Running the module a `jals-wasm` compile produced, in the tab that compiled it.
+///
+/// The browser cannot spawn `java`, which is why the *Build* button offers a `.jar` as a download
+/// rather than running it. A WebAssembly module is the case where that changes: `jals-build`'s
+/// engine is an interpreter over `core + alloc` with no host in it, so it compiles to `wasm32` like
+/// everything else here and the module runs where it was built. What `jals run --invoke` reaches
+/// and what this reaches are the same code.
+///
+/// Beside [`Compile`] and free of the DOM for the same reason it is: a compile is `(path, text)` in
+/// and bytes out, and a run is bytes in and a line out — both host-testable, neither able to touch
+/// a browser API.
+pub struct Execute;
+
+impl Execute {
+    /// Instantiate `module`, and call an export when `command` names one.
+    ///
+    /// `command` is what the user typed: an export name followed by its arguments, or nothing at
+    /// all. Split here rather than in the view, so what the pane holds is a string and what decides
+    /// its meaning is testable without one.
+    ///
+    /// An empty command is still a run — instantiating executes the module's start function, which
+    /// is where the backend lowers every `static` initialiser the project declares.
+    ///
+    /// The answer is a line rather than a value because that is what the caller does with it: the
+    /// Build output pane is text, and nothing downstream computes with a returned `i32`.
+    pub fn run(module: &[u8], command: &str, natives: &NativePackageSet) -> Result<String, String> {
+        let mut parts = command.split_whitespace();
+        let invoke = parts.next();
+        let args: Vec<String> = parts.map(ToOwned::to_owned).collect();
+        let request = WasmRunRequest {
+            module,
+            invoke,
+            args: &args,
+            // The implementations of every `native` method the module imports. Empty for a project
+            // that selected no package, which is what a module with no import section needs.
+            natives: &natives.bindings(),
+            progress: &jals_progress::Progress::SILENT,
+        };
+        let outcome = WasmRunner::run(&request).map_err(|error| error.to_string())?;
+        Ok(match outcome {
+            // Not "its static initialisers ran": the backend emits a start function only for a
+            // project with static state, so for most of them instantiating executes nothing.
+            WasmRunOutcome::Instantiated => format!(
+                "instantiated {WASM_ARTIFACT}: any static initialisers it declares have run. Name \
+                 an exported `static` method to call one."
+            ),
+            // Only an export can return, so `invoke` is the name here; the fallback keeps the arm
+            // total rather than asserting that, since a wrong line beats a panicking pane.
+            WasmRunOutcome::Returned(values) if values.is_empty() => {
+                format!(
+                    "`{}` returned (it is void)",
+                    invoke.unwrap_or(WASM_ARTIFACT)
+                )
+            }
+            WasmRunOutcome::Returned(values) => format!(
+                "`{}` returned {}",
+                invoke.unwrap_or(WASM_ARTIFACT),
+                values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        })
+    }
+}
+
 /// Namespace for compiling the in-browser workspace.
 pub struct Compile;
 
@@ -126,17 +206,25 @@ impl Compile {
     pub async fn workspace(
         manifest: &Manifest,
         files: &[(String, String)],
+        natives: NativePackageSet,
     ) -> Result<CompileArtifact, CompileFailure> {
         // Decided before any work, and by the selection rather than here: `javac` is not a "compile
         // then fail" case, it is a backend this host cannot have. `in_process` is the entry point
         // for exactly that — choosing it declares there is no process to spawn.
-        let backend =
-            match BackendSelection::in_process(manifest.build.backend, manifest.build.release) {
-                BackendSelection::Available(backend) => backend,
-                BackendSelection::Absent { id, reason } => {
-                    return Err(CompileFailure::BackendUnavailable { id, reason });
-                }
-            };
+        let backend = match BackendSelection::in_process(
+            manifest.build.backend,
+            manifest.build.release,
+            // This pipeline is *Build*. `assert` therefore compiles to nothing, exactly as an
+            // unflagged JVM treats one — the tab runs no tests.
+            jals_build::Assertions::Disabled,
+            // What `[build] native-packages` selected out of the registry this tab was built with.
+            natives,
+        ) {
+            BackendSelection::Available(backend) => backend,
+            BackendSelection::Absent { id, reason } => {
+                return Err(CompileFailure::BackendUnavailable { id, reason });
+            }
+        };
         // Asked before any work, like the backend above: a refusal the manifest already implies
         // should not arrive after the slowest step in the host has run.
         if manifest.build.remap.is_some() {
@@ -149,6 +237,7 @@ impl Compile {
         let sources = Self::lower(manifest, files).await?;
         let options = BackendOptions::from_manifest(manifest);
         let request = BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
             tree: &sources,
             // The in-process compiler reads library signatures from the embedded stubs rather than
             // from the classpath, so resolved dependency jars do not participate — the same `&[]`
@@ -167,8 +256,12 @@ impl Compile {
         // How the output is *packaged* is still this host's question: one module for the whole
         // project passes straight through, one class file per type goes into a jar.
         if matches!(manifest.build.backend, BackendKind::JalsWasm {}) {
-            let (_, bytes) = outcome.artifacts.into_iter().next().ok_or_else(|| {
-                CompileFailure::Backend("the wasm backend emitted no module".to_owned())
+            // By name and not by position, and through the outcome's own accessor rather than a
+            // `find` written here: `jals run` and `jals test` look the module up the same way, and
+            // taking whatever came first would silently offer — and execute — a second artifact
+            // the backend grew later while still calling it `WASM_ARTIFACT`.
+            let bytes = outcome.into_artifact(WASM_ARTIFACT).ok_or_else(|| {
+                CompileFailure::Backend(format!("the wasm backend emitted no {WASM_ARTIFACT}"))
             })?;
             return Ok(CompileArtifact {
                 name: WASM_ARTIFACT.to_owned(),
@@ -178,6 +271,7 @@ impl Compile {
                     bytes.len()
                 ),
                 bytes,
+                runnable: true,
             });
         }
 
@@ -201,6 +295,9 @@ impl Compile {
             name,
             bytes,
             summary,
+            // A jar is the download and nothing else here: the class files in it are for a JVM,
+            // and this host cannot start one.
+            runnable: false,
         })
     }
 
@@ -341,7 +438,12 @@ mod tests {
             files.push(generated.clone());
             files.sort();
             assert!(
-                block_on_inline(Compile::workspace(&manifest, &files)).is_ok(),
+                block_on_inline(Compile::workspace(
+                    &manifest,
+                    &files,
+                    NativePackageSet::empty()
+                ))
+                .is_ok(),
                 "`{backend}` must compile alongside the generated class"
             );
         }
@@ -361,9 +463,13 @@ mod tests {
             "[package]\nname = \"demo\"\n",
             "[build]\nbackend = { type = \"javac\" }\n",
         ] {
-            let error = block_on_inline(Compile::workspace(&manifest(source), &subset_sources()))
-                .err()
-                .expect("javac cannot run here");
+            let error = block_on_inline(Compile::workspace(
+                &manifest(source),
+                &subset_sources(),
+                NativePackageSet::empty(),
+            ))
+            .err()
+            .expect("javac cannot run here");
             assert!(
                 matches!(
                     error,
@@ -393,8 +499,12 @@ mod tests {
              [build]\nbackend = { type = \"jals\" }\n\n\
              [run]\nmain-class = \"com.example.Main\"\n",
         );
-        let artifact = block_on_inline(Compile::workspace(&manifest, &subset_sources()))
-            .expect("the subset compiles");
+        let artifact = block_on_inline(Compile::workspace(
+            &manifest,
+            &subset_sources(),
+            NativePackageSet::empty(),
+        ))
+        .expect("the subset compiles");
         assert_eq!(artifact.name, "demo.jar");
         assert!(artifact.bytes.starts_with(b"PK\x03\x04"), "not a zip");
         assert!(
@@ -408,10 +518,68 @@ mod tests {
     #[test]
     fn the_wasm_backend_yields_one_module() {
         let manifest = manifest("[build]\nbackend = { type = \"jals-wasm\" }\n");
-        let artifact = block_on_inline(Compile::workspace(&manifest, &subset_sources()))
-            .expect("the subset compiles");
-        assert_eq!(artifact.name, "project.wasm");
+        let artifact = block_on_inline(Compile::workspace(
+            &manifest,
+            &subset_sources(),
+            NativePackageSet::empty(),
+        ))
+        .expect("the subset compiles");
+        assert_eq!(artifact.name, WASM_ARTIFACT);
         assert!(artifact.bytes.starts_with(b"\0asm"), "not a wasm module");
+    }
+
+    /// One module compiled here, and executed here: the browser tab that built it is also what
+    /// runs it, with no download and no engine on the other side.
+    #[test]
+    fn a_module_runs_in_the_host_that_compiled_it() {
+        let manifest = manifest("[build]\nbackend = { type = \"jals-wasm\" }\n");
+        let artifact = block_on_inline(Compile::workspace(
+            &manifest,
+            &subset_sources(),
+            NativePackageSet::empty(),
+        ))
+        .expect("the subset compiles");
+        assert!(artifact.runnable);
+
+        // A `static` method reached by name, with its argument read against the type the export
+        // declares.
+        assert_eq!(
+            Execute::run(&artifact.bytes, "twice 21", &NativePackageSet::empty()),
+            Ok("`twice` returned 42".to_owned())
+        );
+        // A cross-file call, which is what compiling every source as one unit is for.
+        assert_eq!(
+            Execute::run(&artifact.bytes, "run", &NativePackageSet::empty()),
+            Ok("`run` returned 6".to_owned())
+        );
+        // Naming nothing is still a run.
+        let Ok(report) = Execute::run(&artifact.bytes, "", &NativePackageSet::empty()) else {
+            panic!("instantiating is a run");
+        };
+        assert!(
+            report.starts_with(&format!("instantiated {WASM_ARTIFACT}")),
+            "{report}"
+        );
+        // And what the engine refuses comes back as the answer, not as a panic.
+        let Err(error) = Execute::run(&artifact.bytes, "absent", &NativePackageSet::empty()) else {
+            panic!("there is no `absent` export");
+        };
+        assert!(error.contains("no function named `absent`"), "{error}");
+    }
+
+    /// The jar is a download and nothing more: running the class files in it needs a JVM, which a
+    /// browser tab cannot start. That is a property of the artifact, so the pane reads it off the
+    /// compile rather than guessing from the file name.
+    #[test]
+    fn a_jar_is_not_something_this_host_can_run() {
+        let manifest = manifest("[build]\nbackend = { type = \"jals\" }\n");
+        let artifact = block_on_inline(Compile::workspace(
+            &manifest,
+            &subset_sources(),
+            NativePackageSet::empty(),
+        ))
+        .expect("the subset compiles");
+        assert!(!artifact.runnable);
     }
 
     /// The playground's seed project — `new`, string concatenation, arrays and all — compiles.
@@ -428,8 +596,12 @@ mod tests {
             .iter()
             .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
             .collect();
-        let artifact = block_on_inline(Compile::workspace(&manifest, &files))
-            .expect("the seed project compiles");
+        let artifact = block_on_inline(Compile::workspace(
+            &manifest,
+            &files,
+            NativePackageSet::empty(),
+        ))
+        .expect("the seed project compiles");
         assert_eq!(artifact.name, "seed.jar");
         assert!(artifact.bytes.starts_with(b"PK\x03\x04"), "not a zip");
     }
@@ -439,9 +611,13 @@ mod tests {
     fn an_unrepresentable_path_is_rejected_rather_than_panicking() {
         let manifest = manifest("[build]\nbackend = { type = \"jals\" }\n");
         let files = vec![("a/../b.java".to_owned(), "class B {}\n".to_owned())];
-        let error = block_on_inline(Compile::workspace(&manifest, &files))
-            .err()
-            .expect("the path is not project-relative");
+        let error = block_on_inline(Compile::workspace(
+            &manifest,
+            &files,
+            NativePackageSet::empty(),
+        ))
+        .err()
+        .expect("the path is not project-relative");
         assert!(matches!(error, CompileFailure::InvalidPath(_)), "{error}");
     }
 
@@ -468,10 +644,18 @@ mod tests {
         let manifest =
             manifest("[package]\nname = \"demo\"\n\n[build]\nbackend = { type = \"jals\" }\n");
         let sources = subset_sources();
-        let first =
-            block_on_inline(Compile::workspace(&manifest, &sources)).expect("first compile");
-        let second =
-            block_on_inline(Compile::workspace(&manifest, &sources)).expect("second compile");
+        let first = block_on_inline(Compile::workspace(
+            &manifest,
+            &sources,
+            NativePackageSet::empty(),
+        ))
+        .expect("first compile");
+        let second = block_on_inline(Compile::workspace(
+            &manifest,
+            &sources,
+            NativePackageSet::empty(),
+        ))
+        .expect("second compile");
         assert_eq!(first.bytes, second.bytes);
     }
 }

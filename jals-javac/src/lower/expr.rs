@@ -29,7 +29,7 @@ use jals_syntax::SyntaxNode;
 use jals_syntax::ast::{self, AstNode as _};
 
 use crate::desc::{DescError, Descriptor};
-use crate::facts::{Facts, Hierarchy, Literal, Operator, Unary};
+use crate::facts::{Facts, Literal, Operator, Unary};
 use crate::jvm::{BinOp, Branch, Compare, Numeric, NumericStack as _};
 use crate::lower::place::Place;
 use crate::lower::{Context, Emit, LowerError, OUTER, Result};
@@ -128,6 +128,11 @@ impl Expr {
                     .ok_or(LowerError::Unsupported("a lambda outside a class body"))?;
                 // The captured values, in the order the call site's descriptor names them: the metafactory
                 // prepends them to the interface method's own arguments when it invokes the handle.
+                // The enclosing instance is one of them and it comes first, because the handle it is
+                // passed to is an instance method's and its receiver leads the handle's own type.
+                if info.receiver() {
+                    emit.load_this()?;
+                }
                 for &id in info.captured() {
                     let slot = emit
                         .slots
@@ -148,13 +153,14 @@ impl Expr {
                 let info = context.lambda_at(&span).ok_or(LowerError::Unsupported(
                     "a method reference outside a class body",
                 ))?;
-                // A *bound* reference captures its receiver, which the call site passes like any capture.
-                for &id in info.captured() {
-                    let slot = emit
-                        .slots
-                        .slot_of(id)
-                        .ok_or(LowerError::Unsupported("a receiver with no local here"))?;
-                    emit.asm.load(slot)?;
+                // A *bound* reference passes its receiver, and the receiver is whatever its
+                // qualifier evaluates to — a local, `this`, a field, or a call. Evaluated here
+                // because here is where the method reference expression itself is evaluated
+                // (JLS §15.13.3), which is what makes "exactly once" true of it.
+                if let Some(qualifier) = info.bound() {
+                    let expr = ast::Expr::cast(qualifier.clone())
+                        .ok_or(LowerError::Unsupported("a bound reference with no value"))?;
+                    Self::lower(&expr, context, emit)?;
                 }
                 Ok(emit.asm.invoke_dynamic(
                     info.bootstrap(),
@@ -317,7 +323,15 @@ impl Expr {
     /// where it gave up, and treating it as a type would turn a gap into a wrong descriptor.
     pub(crate) fn type_of(node: &SyntaxNode, context: &Context<'_>) -> Result<Ty> {
         match context.typed.type_of_expr(Facts::span(node)) {
-            Some(Ty::Unknown) | None => Err(DescError::Unknown.into()),
+            // Named rather than reported bare: a `Ty::Unknown` has lost every trace of what it was
+            // asked about, so a report built from one sends a reader to a whole file.
+            Some(Ty::Unknown) | None => Err(LowerError::Untyped(
+                node.text()
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join(" "),
+            )),
             Some(ty) => Ok(ty.clone()),
         }
     }
@@ -559,7 +573,7 @@ impl Expr {
     /// So a name that resolved to nothing is looked up by name on the enclosing type and then up the
     /// superclass chain, nearest first, which is the order that makes a shadowing field win.
     pub(crate) fn inherited_field(name: &str, context: &Context<'_>) -> Option<MemberId> {
-        Hierarchy::of(context.index).inherited_field(context.this_item, name)
+        context.index.inherited_field(context.this_item, name)
     }
 
     /// `receiver.name`: a field read, `static` or instance.
@@ -577,6 +591,13 @@ impl Expr {
             Self::lower(&receiver, context, emit)?;
             emit.asm.array_length()?;
             return Ok(());
+        }
+        // `Outer.this` names a lexically enclosing instance rather than a member (JLS §15.8.4), and
+        // `Outer.super` names the same instance with the lookup one level higher. The walk out
+        // through `this$0` is the one an unqualified member of that class already takes, with the
+        // target written in the source instead of derived from where a member resolved.
+        if let Some(item) = context.facts().qualified_enclosing(access) {
+            return Self::load_unqualified_receiver(item, context, emit);
         }
         let member = context.facts().field_target(access)?;
         let (owner, name, descriptor) = Self::field_ref(member, context)?;
@@ -676,8 +697,106 @@ impl Expr {
         Ok(())
     }
 
+    /// Refuse a `protected` member of a superclass in another package reached through a receiver
+    /// the current class is not assignable from.
+    ///
+    /// JVMS §4.10.1.8 is stricter than JLS §6.6.1: the language permits the access anywhere in the
+    /// top-level class, and the *verifier* permits it only through a reference of the accessing
+    /// class's own type. So `Outer.this.finalize()` written inside `Outer`'s anonymous class is
+    /// legal Java and a class file no JVM loads — javac reaches it through a synthetic `access$N`
+    /// emitted in the class that *may* make the call. This backend synthesises no such method, so it
+    /// says so rather than emitting the call: a report is recoverable and a rejected class file is
+    /// not.
+    ///
+    /// "`protected`" is derived rather than recorded: a member that is neither `public` nor
+    /// `private`, on a *superclass in another package*, is reachable at all only by being
+    /// `protected` — a package-private one would not have resolved.
+    fn check_protected_receiver(
+        call: &ast::CallExpr,
+        member: MemberId,
+        context: &Context<'_>,
+    ) -> Result<()> {
+        let info = context.index.member(member);
+        if info.modifiers.is_public
+            || info.modifiers.is_private
+            || info.modifiers.is_static
+            || info.owner == context.this_item
+            || !context.index.is_subtype(context.this_item, info.owner)
+            || Self::package_of(info.owner, context) == Self::package_of(context.this_item, context)
+        {
+            return Ok(());
+        }
+        // Only a call through *another* value can trip it. An unqualified one is reached through
+        // `this`, and so are `this.m()` and `super.m()` — the accessing class by construction, and
+        // neither carries an inferred type to read (`super`'s is deliberately unknown).
+        let Some(ast::Expr::FieldAccess(access)) = call.callee() else {
+            return Ok(());
+        };
+        let Some(receiver) = access.receiver() else {
+            return Ok(());
+        };
+        // The *bare* keyword only: `Outer.this` is a field access naming another instance, and it is
+        // the shape this check exists for.
+        if matches!(&receiver, ast::Expr::NameRef(name)
+            if Facts::is_this(name.syntax()) || Facts::is_super(name.syntax()))
+        {
+            return Ok(());
+        }
+        // Through the *erasure*: a receiver of type-variable type is the bound at run time, and it
+        // is the bound the verifier reads too — `<T extends C & I> void m(T t) { t.clone(); }` is
+        // reached through a `C`, which is the accessing class.
+        // A variable whose bound cannot be followed is left alone: it names no class, so it names
+        // none to check accessibility against, and `project_id` answers `None` for it either way.
+        let through = Self::type_of(receiver.syntax(), context)
+            .ok()
+            .map(|ty| context.index.type_var_erasure(&ty).unwrap_or(ty))
+            .and_then(|ty| ty.project_id());
+        match through {
+            Some(item) if context.index.is_subtype(item, context.this_item) => Ok(()),
+            _ => Err(LowerError::Unsupported(
+                "a `protected` member reached through another type",
+            )),
+        }
+    }
+
+    /// The runtime package of an indexed type — everything before the last `/` of its internal name,
+    /// which is the one spelling in which a nested type's `$` is not a package separator.
+    fn package_of(item: ItemId, context: &Context<'_>) -> String {
+        let internal = Descriptor::internal_name_of(item, context.index);
+        internal
+            .rsplit_once('/')
+            .map_or_else(String::new, |(package, _)| package.to_owned())
+    }
+
+    /// An array's `clone()`, whose owner and return are the array's own type (JLS §10.7).
+    ///
+    /// The one member a call resolves to `Object.clone()` and must not be emitted as. The *owner*
+    /// is the array's own type — a `CONSTANT_Class` naming an array descriptor, which is how javac
+    /// spells it — while the descriptor stays `Object`'s, because that is the method the JVM
+    /// actually resolves. Java's covariant return is then the `checkcast` that puts the array type
+    /// back, exactly as it does for an erased generic return; emitting `Object.clone()` with no cast
+    /// left an `Object` on the stack where the next use is verified against the array.
+    fn array_clone(
+        array: &Ty,
+        call: &ast::CallExpr,
+        context: &Context<'_>,
+        emit: &mut Emit<'_, '_>,
+    ) -> Result<()> {
+        let Some(ast::Expr::FieldAccess(access)) = call.callee() else {
+            return Err(LowerError::Unsupported("an array `clone` with no receiver"));
+        };
+        Self::lower(&Self::inner(access.receiver())?, context, emit)?;
+        let owner = Descriptor::class_entry(array, context.index)?;
+        emit.asm
+            .invoke_virtual(&owner, "clone", "()Ljava/lang/Object;")?;
+        Ok(emit.asm.check_cast(&owner)?)
+    }
+
     /// A call, dispatched by how the selected member is reached.
     fn call(call: &ast::CallExpr, context: &Context<'_>, emit: &mut Emit<'_, '_>) -> Result<()> {
+        if let Some(array) = context.facts().array_clone(call) {
+            return Self::array_clone(&array, call, context, emit);
+        }
         let member = context
             .typed
             .call_target_of(Facts::span(call.syntax()))
@@ -707,6 +826,9 @@ impl Expr {
         // parses as a name reference holding a keyword, so it has neither a definition to load nor an
         // inferred type — lowering it as an ordinary expression pushes nothing at all.
         let super_qualified = Facts::is_super_call(call);
+        if Facts::is_qualified_super_call(call) {
+            return Err(LowerError::Unsupported("a qualified `super` call"));
+        }
         // Which class the `Methodref` names. Ordinarily it is where the member is *declared*, which
         // is what the member walk found. A `super.` call is the exception, and not an optional one:
         // JVMS §6.5 lets `invokespecial` name only the direct superclass or a *direct*
@@ -715,22 +837,31 @@ impl Expr {
         // interface is not `C`'s, and the class file it produced was refused at load with "interface
         // method to invoke is not in a direct superinterface". javac names the direct superclass, so
         // this does. `Iface.super.m()` (JLS §15.12.1) is the other receiver and is still not handled.
-        let (owner_item, owner) =
-            if super_qualified {
-                let superclass = context.index.superclass_of(context.this_item).ok_or(
-                    LowerError::Unsupported("a `super.` call with no indexed superclass"),
-                )?;
-                (
-                    superclass,
-                    Descriptor::internal_name_of(superclass, context.index),
-                )
-            } else {
-                (
-                    info.owner,
-                    Descriptor::internal_name_of(info.owner, context.index),
-                )
-            };
-        let interface_owner = context.index.item(owner_item).kind == DefKind::Interface;
+        let (owner_item, owner) = if super_qualified {
+            let superclass = context.index.direct_superclass(context.this_item).ok_or(
+                LowerError::Unsupported("a `super.` call with no indexed superclass"),
+            )?;
+            (
+                superclass,
+                Descriptor::internal_name_of(superclass, context.index),
+            )
+        } else {
+            (
+                info.owner,
+                Descriptor::internal_name_of(info.owner, context.index),
+            )
+        };
+        Self::check_protected_receiver(call, member, context)?;
+        // Positively, for the reason `ProjectIndex::direct_interfaces` states: an `@interface` is
+        // `DefKind::AnnotationType` and *is* an interface (JLS §9.6), and `class_file` emits one with
+        // `ACC_INTERFACE` set. Asking `kind != Interface` here answered "not an interface" for it and
+        // produced an `invokevirtual` against a `Methodref` naming an interface method, which is an
+        // `IncompatibleClassChangeError` at the first call rather than anything the verifier reports
+        // — the same rule `Compile::method_reference`'s `owner_is_interface` already spells out.
+        let interface_owner = matches!(
+            context.index.item(owner_item).kind,
+            DefKind::Interface | DefKind::AnnotationType
+        );
         // The receiver comes first on the stack, below the arguments.
         if !is_static {
             match call.callee() {
@@ -758,11 +889,17 @@ impl Expr {
         if is_static {
             emit.asm
                 .invoke_static(&owner, &name, &descriptor, interface_owner)?;
-        } else if is_private || constructor || super_qualified {
-            // Not dispatched. A `private` method is one body the call site already knows, and
-            // `invokevirtual` would look it up in a table it is not in; a `super.` call names the
-            // superclass's body *because* it is not the one virtual dispatch would find — emitting
-            // `invokevirtual` for it is how an override calls itself forever.
+        } else if (is_private && owner_item == context.this_item) || constructor || super_qualified
+        {
+            // Not dispatched. A `private` method **of this class** is one body the call site already
+            // knows, and `invokevirtual` would look it up in a table it is not in; a `super.` call
+            // names the superclass's body *because* it is not the one virtual dispatch would find —
+            // emitting `invokevirtual` for it is how an override calls itself forever.
+            //
+            // A **nestmate's** private method is another class's, and `invokespecial` may name only
+            // the current class, a superclass, or a direct superinterface (JVMS §6.5) — so it takes
+            // the dispatched arm below. That is what the `NestHost` / `NestMembers` attributes are
+            // for: §5.4.4 grants a nestmate the access, and the resolution finds the body.
             emit.asm
                 .invoke_special(&owner, &name, &descriptor, interface_owner)?;
         } else if interface_owner {
@@ -918,10 +1055,10 @@ impl Expr {
                 .get_static("java/lang/Void", "TYPE", "Ljava/lang/Class;")?);
         }
         let mut named = match (literal.ty(), literal.expr()) {
-            (Some(ty), _) => context.ty_of_type(&ty)?,
+            (Some(ty), _) => context.facts().ty_of_type(&ty)?,
             // The reference form's base is parsed as an *expression* — a bare `String` is a name
             // reference — so it is resolved as a type name rather than lowered as a value.
-            (None, Some(base)) => context.ty_of_name(base.syntax())?,
+            (None, Some(base)) => context.facts().ty_of_name(base.syntax())?,
             (None, None) => return Err(LowerError::Unsupported("a `.class` with no type")),
         };
         for _ in 0..dimensions {
@@ -1596,7 +1733,7 @@ impl Expr {
                 .children()
                 .find_map(ast::Type::cast)
                 .ok_or(LowerError::Unsupported("an `instanceof` with no type"))?;
-            let target = context.ty_of_type(&ty)?;
+            let target = context.facts().ty_of_type(&ty)?;
             Self::lower(&operand, context, emit)?;
             return Ok(emit
                 .asm
@@ -1711,7 +1848,7 @@ impl Expr {
                     .children()
                     .find_map(ast::Type::cast)
                     .ok_or(LowerError::Unsupported("a `record` pattern with no type"))?;
-                let target = context.ty_of_type(&ty)?;
+                let target = context.facts().ty_of_type(&ty)?;
                 let item = target
                     .project_id()
                     .ok_or(LowerError::Unsupported("a `record` pattern on no record"))?;

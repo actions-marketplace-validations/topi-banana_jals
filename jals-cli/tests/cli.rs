@@ -2326,10 +2326,12 @@ fn fmt_writes_one_config_for_two_group_roots() {
     let (stdout, stderr, code) = run_full(&["fmt", a.to_str().unwrap(), b.to_str().unwrap()]);
 
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // The `Created` line is narration, so it is on stderr with every other status line; stdout
+    // carries only what a command was asked to produce.
     assert_eq!(
-        stdout.matches("jalsfmt.toml").count(),
+        stderr.matches("jalsfmt.toml").count(),
         1,
-        "one project, one generated config: {stdout}"
+        "one project, one generated config: {stderr}"
     );
     assert!(!dir.path().join("src/jalsfmt.toml").exists());
     assert!(!dir.path().join("other/jalsfmt.toml").exists());
@@ -2496,24 +2498,7 @@ fn the_jals_backend_compiles_without_a_jdk() {
 /// module is the only statement about the encoding that cannot be argued with.
 #[test]
 fn the_wasm_backend_emits_one_module_for_the_project() {
-    let dir = tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("jals.toml"),
-        "[package]\nname = \"demo\"\n\n[build]\nbackend = { type = \"jals-wasm\" }\n",
-    )
-    .unwrap();
-    let src = dir.path().join("src/main/java");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("Point.java"),
-        "public class Point {\n\
-         \x20   int x;\n\
-         \x20   Point(int x) { this.x = x; }\n\
-         \x20   int get() { return x; }\n\
-         \x20   public static int roundTrip(int n) { Point p = new Point(n); return p.get(); }\n\
-         }\n",
-    )
-    .unwrap();
+    let dir = wasm_run_project();
 
     let output = jals()
         .args(["build", "--manifest-path"])
@@ -2554,16 +2539,178 @@ fn the_wasm_backend_emits_one_module_for_the_project() {
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "7");
 }
 
-/// `jals run` hands a main class to `java`, which cannot be given a WebAssembly module. Saying so
-/// beats the alternative: a `classes-dir` holding a `.wasm` and a "no main class" error that is
-/// true and useless.
+/// A `jals-wasm` project scaffolded for the run tests below: one class with one `static` method
+/// and an object allocation, which is what makes the module use the GC types at all.
+fn wasm_run_project() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"demo\"\n\n[build]\nbackend = { type = \"jals-wasm\" }\n",
+    )
+    .unwrap();
+    let src = dir.path().join("src/main/java");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Point.java"),
+        "public class Point {\n\
+         \x20   int x;\n\
+         \x20   Point(int x) { this.x = x; }\n\
+         \x20   int get() { return x; }\n\
+         \x20   public static int roundTrip(int n) { Point p = new Point(n); return p.get(); }\n\
+         }\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// `jals run --invoke` compiles the project to a module and executes an export of it in this
+/// process, with no JVM and no wasm engine on the host.
+///
+/// The value lands on stdout, which is the contract `jals run` already takes the stream for: a
+/// script reads the answer there, and every status line stays on stderr.
 #[test]
-fn running_a_wasm_backed_project_explains_itself() {
+fn running_a_wasm_backed_project_invokes_an_export() {
+    let dir = wasm_run_project();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .args(["--invoke", "roundTrip", "--", "7"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "7");
+}
+
+/// Naming no export is still a run: instantiating executes the module's start function, which is
+/// where the backend lowers a class's `static` initialisers. Nothing is written to stdout, because
+/// nothing returned a value.
+#[test]
+fn running_a_wasm_backed_project_without_an_export_instantiates_it() {
+    let dir = wasm_run_project();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+/// An export that is not there reports the ones that are.
+///
+/// That list is the only evidence a caller gets for the one failure the module cannot describe
+/// itself: an export name carries no owner, so two `static` methods of one name collide and the
+/// second is dropped when the module is built.
+#[test]
+fn a_missing_export_reports_what_the_module_has() {
+    let dir = wasm_run_project();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .args(["--invoke", "absent"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no function named `absent`") && stderr.contains("roundTrip"),
+        "expected the available exports to be listed, got: {stderr}"
+    );
+}
+
+/// A wasm module has no main class, so asking for one is refused with the flag that does work.
+/// The manifest is what makes the two selectors contradict, and clap cannot see a manifest.
+#[test]
+fn a_main_class_is_refused_for_a_wasm_backed_project() {
+    let dir = wasm_run_project();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .args(["--main-class", "Point"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no main class") && stderr.contains("--invoke"),
+        "expected the wasm entry-point explanation, got: {stderr}"
+    );
+}
+
+/// Arguments with no `--invoke` are the third entry-point contradiction, and the only one clap
+/// cannot see at all: a module has nothing to hand them to, so accepting them and instantiating
+/// anyway would succeed having done something nobody asked for.
+#[test]
+fn arguments_without_an_export_are_refused_for_a_wasm_backed_project() {
+    let dir = wasm_run_project();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .args(["--", "7"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no entry point to pass them to") && stderr.contains("--invoke"),
+        "expected the arguments to be refused rather than dropped, got: {stderr}"
+    );
+}
+
+/// A `[run] main-class` reaches the same contradiction as `--main-class` by a route the flag check
+/// cannot see. A warning and not a refusal — the key may be left over from the backend the project
+/// switched away from — but never silence, and never on the stdout `jals run` has taken.
+#[test]
+fn a_manifest_main_class_is_reported_for_a_wasm_backed_project() {
+    let dir = wasm_run_project();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"demo\"\n\n[run]\nmain-class = \"Point\"\n\n\
+         [build]\nbackend = { type = \"jals-wasm\" }\n",
+    )
+    .unwrap();
+
+    let output = jals()
+        .args(["run", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .args(["--invoke", "roundTrip", "--", "7"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "7");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("declares a main class") && stderr.contains("ignored"),
+        "expected the dead declaration to be reported, got: {stderr}"
+    );
+}
+
+/// And the mirror: `--invoke` names an export, and a class-file backend produces none. Ignoring
+/// the flag would run something the user did not ask for.
+#[test]
+fn an_invoke_is_refused_for_a_class_file_backend() {
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("jals.toml"),
         "[package]\nname = \"demo\"\n\n[run]\nmain-class = \"Main\"\n\n\
-         [build]\nbackend = { type = \"jals-wasm\" }\n",
+         [build]\nbackend = { type = \"jals\" }\n",
     )
     .unwrap();
     let src = dir.path().join("src/main/java");
@@ -2577,13 +2724,14 @@ fn running_a_wasm_backed_project_explains_itself() {
     let output = jals()
         .args(["run", "--manifest-path"])
         .arg(dir.path().join("jals.toml"))
+        .args(["--invoke", "one"])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("WebAssembly module") && stderr.contains("wasmtime"),
-        "expected an explanation of the wasm backend, got: {stderr}"
+        stderr.contains("--invoke one") && stderr.contains("class files"),
+        "expected the class-file backend explanation, got: {stderr}"
     );
 }
 
@@ -3171,8 +3319,9 @@ fn an_ordinary_build_compiles_no_test_method() {
     // The class exists...
     let classes = dir.path().join("target/classes/com/example");
     assert!(classes.join("Calc.class").is_file());
-    // ...and no harness was generated beside it.
-    assert!(!classes.join("JalsTest$Calc.class").exists());
+    // ...and no harness was generated beside it. The shim is named after the test class's whole
+    // qualified name, so that this file names the class the generator would actually have written.
+    assert!(!classes.join("JalsTest$com$example$Calc.class").exists());
     assert!(
         !dir.path()
             .join("target/classes/JalsTestHarness.class")
@@ -3326,4 +3475,432 @@ fn test_filters_select_and_partition_covers_every_test() {
     let mut expected = all;
     expected.sort();
     assert_eq!(sharded, expected);
+}
+
+/// A project whose build produces a `Compiling` line, without needing a JDK: the in-process backend
+/// compiles the same source `javac` would.
+fn in_process_project() -> tempfile::TempDir {
+    project(
+        "[package]\nname = \"hello\"\nversion = \"0.1.0\"\n\n[build]\nbackend = { type = \"jals\" }\n",
+    )
+}
+
+#[test]
+fn narration_goes_to_stderr_and_stdout_carries_only_machine_output() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+    let (stdout, stderr, code) = run_full(&["build", "--manifest-path", &manifest]);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("Compiling") && stderr.contains("hello v0.1.0"),
+        "the compile announces itself with the package cargo would name: {stderr}"
+    );
+    assert!(
+        stderr.contains("Finished"),
+        "a run says when it is done: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "`jals build` was not asked to produce anything on stdout: {stdout}"
+    );
+}
+
+#[test]
+fn quiet_says_nothing_a_run_did_not_have_to_say() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+    let (stdout, stderr, code) = run_full(&["--quiet", "build", "--manifest-path", &manifest]);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.is_empty() && stdout.is_empty(),
+        "a quiet run that succeeds is silent: stdout {stdout:?}, stderr {stderr:?}"
+    );
+}
+
+#[test]
+fn a_global_flag_may_be_written_on_either_side_of_the_subcommand() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+    let before = run_full(&["--quiet", "build", "--manifest-path", &manifest]);
+    let after = run_full(&["build", "--quiet", "--manifest-path", &manifest]);
+    assert_eq!(
+        (before.1, before.2),
+        (after.1, after.2),
+        "`jals --quiet build` and `jals build --quiet` are the same run"
+    );
+}
+
+#[test]
+fn a_captured_run_carries_no_escapes_and_color_always_forces_them() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+
+    // Captured output is not a terminal, so `auto` paints nothing.
+    let (_, plain, _) = run_full(&["build", "--manifest-path", &manifest]);
+    assert!(
+        !plain.contains('\u{1b}'),
+        "a redirected run must produce the same bytes every time: {plain:?}"
+    );
+    let (_, painted, _) = run_full(&["build", "--color", "always", "--manifest-path", &manifest]);
+    assert!(
+        painted.contains('\u{1b}'),
+        "`--color always` is above the TTY test: {painted:?}"
+    );
+    let (_, never, _) = run_full(&["build", "--color", "never", "--manifest-path", &manifest]);
+    assert!(!never.contains('\u{1b}'), "{never:?}");
+}
+
+#[test]
+fn message_format_json_puts_the_event_stream_on_stdout() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--message-format",
+        "json",
+        "--manifest-path",
+        &manifest,
+    ]);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(!lines.is_empty(), "the stream is not empty");
+    for line in &lines {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "every line is one JSON object: {line}"
+        );
+    }
+    assert!(
+        stdout.contains("\"event\":\"started\"") && stdout.contains("\"activity\":\"compile\""),
+        "the compile reaches the stream as the fact it is: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"event\":\"finished\""),
+        "and so does how it ended: {stdout}"
+    );
+}
+
+/// stdout has one holder. `--message-format json` claims it for the event stream, and the flags
+/// whose whole product is also stdout — `--dry-run`'s command line, `--diff`'s patch, a piped
+/// format's formatted source — are refused rather than interleaved into it.
+///
+/// This is the case the plain `build` test above cannot reach: there, nothing else wanted stdout.
+#[test]
+fn a_flag_that_owns_stdout_will_not_share_it_with_the_event_stream() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+
+    // Both commands that can print a command line instead of running one.
+    for command in ["build", "run"] {
+        let (stdout, stderr, code) = run_full(&[
+            command,
+            "--dry-run",
+            "--message-format",
+            "json",
+            "--manifest-path",
+            &manifest,
+        ]);
+        assert_ne!(
+            code, 0,
+            "`{command} --dry-run` cannot share stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("already using") && stderr.contains("`--dry-run`"),
+            "the refusal names the flag that asked: {stderr}"
+        );
+        assert!(stdout.is_empty(), "and writes neither product: {stdout}");
+    }
+
+    let source = dir.path().join("src/main/java/com/example/Main.java");
+    let source = source.display().to_string();
+    let (stdout, stderr, code) = run_full(&["fmt", "--diff", "--message-format", "json", &source]);
+    assert_ne!(code, 0, "a diff cannot share stdout either: {stdout}");
+    assert!(stderr.contains("`--diff`"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+/// `jals test`'s stdout was JSON before there was an event stream, and that older meaning wins:
+/// the command takes the stream back so a script parsing its results never meets a second schema.
+#[test]
+fn jals_test_keeps_stdout_for_its_own_json() {
+    // `test_project`, not `in_process_project`: the latter declares no `attributes` feature, so the
+    // command refuses before `--list` is reached and the assertion below would hold with
+    // `Session::owns_stdout` deleted.
+    let dir = test_project();
+    let manifest = manifest_of(&dir);
+    let (stdout, stderr, code) = run_full(&[
+        "test",
+        "--list",
+        "--message-format",
+        "json",
+        "--manifest-path",
+        &manifest,
+    ]);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("com.example.Calc#adds"),
+        "the list is what stdout carries: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("\"event\":"),
+        "no progress event reaches the stream the test list owns: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn timings_writes_a_self_contained_report() {
+    let dir = in_process_project();
+    let manifest = dir.path().join("jals.toml").display().to_string();
+    let (stdout, stderr, code) =
+        run_full(&["build", "--timings=html,json", "--manifest-path", &manifest]);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("Timing") && stderr.contains("report saved to"),
+        "the report names itself: {stderr}"
+    );
+    let timings = dir.path().join("target/jals/timings");
+    // The stable copy a bookmark keeps working against; the timestamped one sits beside it.
+    let html = std::fs::read_to_string(timings.join("jals-timings.html")).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(
+        !html.contains("http://") && !html.contains("https://") && !html.contains("<script"),
+        "a build report has to open offline"
+    );
+    assert!(html.contains("compile"), "the compile is a row: {html}");
+    let json = std::fs::read_to_string(timings.join("jals-timings.json")).unwrap();
+    assert!(json.contains("\"spans\":["), "{json}");
+    assert!(json.contains("\"activity\":\"compile\""), "{json}");
+
+    let stamped: Vec<_> = std::fs::read_dir(&timings)
+        .unwrap()
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|name| name.starts_with("jals-timings-"))
+        .collect();
+    assert_eq!(
+        stamped.len(),
+        2,
+        "one timestamped report per format, so a run never overwrites the last one: {stamped:?}"
+    );
+}
+
+#[test]
+fn timings_covers_a_command_that_never_finds_a_project() {
+    let dir = marked_project();
+    // Run *from* the project so the report lands under it: a command with no manifest writes under
+    // the directory its user is standing in, and a test that let that be the crate directory would
+    // leave a `target/` behind in the checkout.
+    let (stdout, stderr, code) = fmt_in(
+        dir.path(),
+        dir.path(),
+        &["--check", "--timings", "--no-migrate"],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("report saved to"),
+        "`--timings` answers for every command, not only the ones with a manifest: {stderr}"
+    );
+    let html = std::fs::read_to_string(dir.path().join("target/jals/timings/jals-timings.html"))
+        .expect("the report is written under the directory the command ran in");
+    assert!(html.contains("format"), "the sweep is a row: {html}");
+}
+
+/// A `jals-wasm` project whose tests run on the embedded engine: the backend that emits a module
+/// and the runtime that runs one, which `Manifest::validate` requires to travel together.
+fn wasm_test_project() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"demo\"\nfeatures = [\"attributes\"]\n\n\
+         [build]\nbackend = { type = \"jals-wasm\" }\n\n\
+         [toolchain]\nruntime = \"wasm\"\n",
+    )
+    .unwrap();
+    let src = dir.path().join("src/main/java");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Calculator.java"),
+        "public class Calculator {\n\
+         \x20   static int add(int a, int b) { return a + b; }\n\
+         \x20   #[test]\n\
+         \x20   static void addsTwoNumbers() { assert add(2, 3) == 5; }\n\
+         \x20   #[test]\n\
+         \x20   static void aFailingAssertionIsCaught() { assert add(2, 3) == 6; }\n\
+         \x20   #[test]\n\
+         \x20   #[should_fail]\n\
+         \x20   static void dividingByZeroFails() { int n = 1 / (add(1, 1) - 2); }\n\
+         \x20   #[test]\n\
+         \x20   #[ignore]\n\
+         \x20   static void notRunByDefault() { assert false; }\n\
+         }\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// `jals test` on a wasm project runs each test as a module export, in this process — no JVM, and
+/// nothing spawned at all.
+///
+/// The three verdicts are the whole contract: a holding `assert` passes, a failing one fails
+/// (which is what says the compile armed them), and `#[should_fail]` inverts a trap.
+#[test]
+fn tests_run_on_the_embedded_engine_for_a_wasm_project() {
+    let dir = wasm_test_project();
+
+    let output = jals()
+        .args(["test", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "one test fails on purpose: {stderr}"
+    );
+    assert!(
+        stderr.contains("PASS") && stderr.contains("Calculator#addsTwoNumbers"),
+        "a holding assertion passes: {stderr}"
+    );
+    assert!(
+        stderr.contains("FAIL") && stderr.contains("Calculator#aFailingAssertionIsCaught"),
+        "a failing assertion is caught, which is what arming `assert` is for: {stderr}"
+    );
+    assert!(
+        stderr.contains("Calculator#dividingByZeroFails"),
+        "`#[should_fail]` inverts the trap: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 passed, 1 failed"),
+        "the ignored test is not run: {stderr}"
+    );
+}
+
+/// `--list` answers from the tests the frontend found, with no module run at all — the ids are
+/// the ones the JVM path spells, so a filter means one thing whichever runner executes it.
+#[test]
+fn listing_a_wasm_projects_tests_names_them_the_same_way() {
+    let dir = wasm_test_project();
+
+    let output = jals()
+        .args(["test", "--list", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let listed = String::from_utf8(output.stdout).unwrap();
+    assert!(listed.contains("Calculator#addsTwoNumbers"), "{listed}");
+    assert!(
+        listed.contains("Calculator#dividingByZeroFails"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("notRunByDefault"),
+        "an `#[ignore]` is listed only when asked for: {listed}"
+    );
+}
+
+/// A wasm test run honours the filters, because it shares the planning half with the JVM one — a
+/// selection that differed between the two would make `--partition count:2/3` mean two things.
+#[test]
+fn a_filter_selects_the_same_way_on_the_embedded_engine() {
+    let dir = wasm_test_project();
+
+    let output = jals()
+        .args(["test", "adds", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "only the passing test ran: {stderr}"
+    );
+    assert!(stderr.contains("1 test run: 1 passed"), "{stderr}");
+}
+
+/// The three flags a module cannot honour are refused rather than dropped, before anything is
+/// compiled. Accepting one and doing something else is how a run comes back green having done
+/// what nobody asked for.
+#[test]
+fn the_flags_a_module_cannot_honour_are_refused() {
+    let dir = wasm_test_project();
+
+    for (flag, value, expected) in [
+        ("--timeout", Some("5"), "cannot be interrupted"),
+        ("--no-capture", None, "no standard output"),
+        ("--retries", Some("2"), "come out differently"),
+    ] {
+        let mut command = jals();
+        command
+            .args(["test", "--manifest-path"])
+            .arg(dir.path().join("jals.toml"))
+            .arg(flag);
+        if let Some(value) = value {
+            command.arg(value);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "`{flag}` must be refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "`{flag}` names why it cannot be honoured, got: {stderr}"
+        );
+    }
+}
+
+/// A wasm backend with a JVM runtime is refused with the selector that does work — the manifest is
+/// what makes the two contradict, and clap cannot see a manifest.
+#[test]
+fn a_wasm_backend_with_a_jvm_runtime_is_refused_by_jals_test() {
+    let dir = wasm_test_project();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"demo\"\nfeatures = [\"attributes\"]\n\n\
+         [build]\nbackend = { type = \"jals-wasm\" }\n",
+    )
+    .unwrap();
+
+    let output = jals()
+        .args(["test", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("runtime = \"wasm\""),
+        "the refusal names the selector that works: {stderr}"
+    );
+}
+
+/// The other direction is a *manifest* error, not a `jals test` one: it is refused wherever the
+/// manifest is read, so `jals build` and `jals run` reach it too.
+#[test]
+fn the_wasm_runtime_without_the_wasm_backend_is_refused_by_every_command() {
+    let dir = wasm_test_project();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"demo\"\nfeatures = [\"attributes\"]\n\n\
+         [toolchain]\nruntime = \"wasm\"\n",
+    )
+    .unwrap();
+
+    for command in ["build", "test"] {
+        let output = jals()
+            .args([command, "--manifest-path"])
+            .arg(dir.path().join("jals.toml"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "`jals {command}` must refuse it");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("which compiles to class files"),
+            "`jals {command}` names the pairing, got: {stderr}"
+        );
+    }
 }
