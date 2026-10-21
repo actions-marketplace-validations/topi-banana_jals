@@ -1018,7 +1018,16 @@ impl NativeProjectPlan {
                     .push(Self::resolve_host_path(project_root, source)),
             }
         }
-        for classpath in &manifest.build.classpath {
+        // A classpath-only `path` dependency contributes a classpath entry, not a source root.
+        // Gathering it here keeps both spellings on one lowering path, so a project entry and an
+        // external one are classified exactly like an authored `[build] classpath` entry.
+        let mut classpath_entries = manifest.build.classpath.clone();
+        for (_, dependency) in manifest.active_dependencies(scope, features) {
+            if let Some(path) = dependency.classpath_only_path() {
+                classpath_entries.push(path.classpath_path());
+            }
+        }
+        for classpath in &classpath_entries {
             let Some(path) = Self::project_relative(project_root, classpath) else {
                 result
                     .external_classpath
@@ -1097,6 +1106,7 @@ impl NativeProjectPlan {
                 | Dependency::Wasm(_)
                 | Dependency::Registry(_)
                 | Dependency::RegistryVersion(_) => {}
+                Dependency::Path(path) if path.is_classpath() => {}
                 Dependency::Path(path) => match Self::project_path_root(path, project_root, view) {
                     Ok(Some(key)) => result.plan.source_dependency_roots.push(key),
                     // Outside the project root: scanned from the host filesystem by
@@ -1180,6 +1190,18 @@ impl NativeProjectPlan {
                     }
                 }
                 Dependency::Path(path) => {
+                    if path.is_classpath() {
+                        let raw = path.classpath_path();
+                        if let Some(relative) = Self::project_relative(project_root, &raw) {
+                            let host = relative.to_host_path(project_root);
+                            scopes.push(if host.is_dir() {
+                                NativeScope::extension(relative, "class")
+                            } else {
+                                NativeScope::all(relative)
+                            });
+                        }
+                        continue;
+                    }
                     let base = Self::resolve_host_path(project_root, &path.path);
                     if let Ok(source) = Self::host_source_root(&base, path.dir.as_deref())
                         && let Some(relative) = Self::relative_to_project(project_root, &source)

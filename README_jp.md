@@ -412,6 +412,8 @@ core = { git = "https://github.com/example/mono", rev = "abc123", dir = "core" }
 # `features` はその dependency 自身の build.java で有効になる build feature（Cargo と同じ）。
 # `default-features = false` でその dependency 自身の `default` リストを適用しない
 render = { path = "../render", features = ["vulkan"], default-features = false }
+# mode = "classpath" は path/dir のコンパイル済みクラスを消費する（ソースは読まない）:
+stub   = { path = "../stub", dir = "target/classes", mode = "classpath" }
 ```
 
 `script` を設定すると、`build.java` は source 探索と `javac` より先に実行されます。project snapshot と

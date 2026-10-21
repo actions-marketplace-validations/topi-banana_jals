@@ -229,6 +229,52 @@ fn split_packages_lists_every_jar_that_declares_one_package() {
 }
 
 #[test]
+fn classpath_only_path_dependency_lowers_to_a_classpath_entry_not_sources() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("lib/classes/pkg")).unwrap();
+    fs::write(
+        project.path().join("lib/classes/pkg/Stub.class"),
+        b"\xca\xfe\xba\xbe",
+    )
+    .unwrap();
+    fs::create_dir_all(project.path().join("lib/src/main/java")).unwrap();
+    fs::write(
+        project.path().join("lib/src/main/java/Broken.java"),
+        b"class Broken {",
+    )
+    .unwrap();
+    let manifest = manifest(
+        "[dependencies]\nlib = { path = \"./lib\", dir = \"classes\", mode = \"classpath\" }\n",
+    );
+
+    let plan = jals_exec::tokio_rt::run(|exec| async move {
+        let storage = NativeStorage::native(
+            project.path(),
+            project.path().join("target/jals/cache"),
+            exec,
+        )
+        .await
+        .unwrap();
+        NativeProjectPlan::from_manifest(
+            &manifest,
+            DependencyScope::Build,
+            &features(&manifest),
+            project.path(),
+            &storage.view(),
+        )
+    })
+    .expect("test runtime bootstraps");
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(plan.plan.source_dependency_roots.len(), 0);
+    assert_eq!(
+        plan.plan.classpath,
+        [ClasspathEntry::ProjectDirectory(
+            DirKey::parse("lib/classes").unwrap()
+        )]
+    );
+}
+
+#[test]
 fn sibling_path_dependency_is_scanned_and_published() {
     let base = tempfile::tempdir().unwrap();
     let project = base.path().join("project");

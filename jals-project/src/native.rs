@@ -266,12 +266,18 @@ impl ProjectScript {
     /// because a test run's plan is the only place they would be lowered.
     fn root_only(manifest: &Manifest) -> Manifest {
         let mut root_only = manifest.clone();
+        // A classpath-only `path` dependency is *not* a graph node: it has no sources to lower and
+        // is lowered straight into the plan's classpath. Keeping it here is what lets
+        // `assemble_native` see it; every other non-registry entry is the graph's.
+        let keep = |dependency: &jals_config::Dependency| {
+            dependency.registry_version().is_some() || dependency.classpath_only_path().is_some()
+        };
         root_only
             .dependencies
-            .retain(|_, dependency| dependency.registry_version().is_some());
+            .retain(|_, dependency| keep(dependency));
         root_only
             .dev_dependencies
-            .retain(|_, dependency| dependency.registry_version().is_some());
+            .retain(|_, dependency| keep(dependency));
         root_only
     }
 

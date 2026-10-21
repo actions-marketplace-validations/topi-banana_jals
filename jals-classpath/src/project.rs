@@ -570,6 +570,42 @@ impl MemoryProjectPlan {
                 ),
             }
         }
+        // A classpath-only `path` dependency is an address, not a graph node: there are no sources
+        // to lower, so the portable plan lowers it exactly like a `[build] classpath` entry. The
+        // native sibling does the same, which is what keeps the two plans answering one question.
+        let classpath_only: Vec<String> = manifest
+            .dependencies
+            .values()
+            .filter_map(|dependency| dependency.classpath_only_path())
+            .map(jals_config::PathDependency::classpath_path)
+            .collect();
+        for classpath in &classpath_only {
+            let path = match Self::project_relative(classpath) {
+                Ok(path) => path,
+                Err(message) => {
+                    result.warn_path(classpath, message);
+                    continue;
+                }
+            };
+            let found = FileKey::new(path.clone())
+                .ok()
+                .and_then(|key| view.tree().lookup_file(&key))
+                .or_else(|| view.tree().lookup_dir(&DirKey::new(path)));
+            match found {
+                Some(EntryRef::File(file)) => result
+                    .plan
+                    .classpath
+                    .push(ClasspathEntry::ProjectFile(file.key().clone())),
+                Some(EntryRef::Directory(directory)) => result
+                    .plan
+                    .classpath
+                    .push(ClasspathEntry::ProjectDirectory(directory.clone())),
+                None => result.warn_path(
+                    classpath,
+                    "classpath-only path dependency is missing or invalid".to_owned(),
+                ),
+            }
+        }
 
         // Registry entries need a network-capable host: the in-memory assembly has one address
         // space and no fetcher, so it can report the entry but cannot resolve it. Saying so is

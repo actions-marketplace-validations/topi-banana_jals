@@ -429,6 +429,8 @@ core = { git = "https://github.com/example/mono", rev = "abc123", dir = "core" }
 # `features` enables build features in that dependency's own build.java (Cargo's per-dep features);
 # `default-features = false` skips that dependency's own `default` list.
 render = { path = "../render", features = ["vulkan"], default-features = false }
+# `mode = "classpath"` consumes prebuilt classes from `path`/`dir` instead of sources:
+stub   = { path = "../stub", dir = "target/classes", mode = "classpath" }
 
 # Or declare several named entry points and pick one with `jals run --bin <name>`:
 # [[bin]]
