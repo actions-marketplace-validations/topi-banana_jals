@@ -46,7 +46,7 @@ pub use manifest::{
     ManifestParseError, MappingDigest, MappingEntry, MappingError, MappingFormatKind,
     MappingSource, Package, PathDependency, Registry, RegistryDependency, RemapSite,
     ResolvedBuildFeatures, ResourcePattern, ResourcePatternError, Run, SourceFilter,
-    SourceFilterError, SourceFilterSide, UrlMappings, ValidationError, Workspace,
+    SourceFilterError, UrlMappings, ValidationError, Workspace,
 };
 pub use resolution::ResolveLowerError;
 pub use toolchain::{Compiler, Distribution, MANAGED_TOOLCHAIN_ROOT, Runtime, ToolSpec, Toolchain};

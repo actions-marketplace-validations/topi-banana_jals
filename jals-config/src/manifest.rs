@@ -2198,7 +2198,7 @@ impl SourceFilter {
 
 /// Which list of a [`SourceFilter`] carried the malformed pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceFilterSide {
+pub(crate) enum SourceFilterSide {
     /// `include`.
     Include,
     /// `exclude`.
