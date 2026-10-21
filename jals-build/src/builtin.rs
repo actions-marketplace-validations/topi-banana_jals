@@ -285,6 +285,7 @@ mod tests {
             sources,
             extra_sources,
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &EMPTY_ENV,
         }
@@ -367,6 +368,7 @@ mod tests {
             main_class: "com.example.Main",
             program_args: &[],
             extra_classpath: &[],
+            module_path: &[],
             run_env: &BTreeMap::new(),
         };
         assert!(block_on_inline(toolchain.run(&req)).unwrap().success());
@@ -419,6 +421,7 @@ mod tests {
             sources: &[],
             extra_sources: &sources,
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };

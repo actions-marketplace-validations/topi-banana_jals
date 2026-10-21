@@ -48,8 +48,8 @@ use crate::task::{TaskPlan, TaskPlanLimits};
 //
 // And before that for publication intent: `Tasks.publishTree` gained a required intent argument
 // (API), and `TaskTerminal::PublishTree` gained a required `intent` field (state).
-const BUILD_SCRIPT_API_VERSION: u32 = 10;
-const BUILD_SCRIPT_STATE_VERSION: u32 = 8;
+const BUILD_SCRIPT_API_VERSION: u32 = 11;
+const BUILD_SCRIPT_STATE_VERSION: u32 = 9;
 const BUILD_ARTIFACT_ROOT: &str = "target/jals/build";
 /// Everything `jals` owns under the project: build artifacts, the verified cache, acquired
 /// dependencies. All of it is derived, so none of it is an input to a script's fingerprint.
@@ -437,6 +437,8 @@ pub struct BuildScriptOutput {
     pub generated_sources: BTreeSet<FileKey>,
     /// Additional project classpath entries, in key order.
     pub additional_classpath: BTreeSet<FileKey>,
+    /// Additional project module-path entries, in key order.
+    pub additional_module_path: BTreeSet<FileKey>,
     /// Extra `javac` arguments in script call order.
     pub javac_args: Vec<String>,
     /// Extra JVM arguments in script call order.
@@ -512,6 +514,7 @@ struct BuildScriptStateWire {
     task_plan: TaskPlan,
     generated_sources: Vec<String>,
     additional_classpath: Vec<String>,
+    additional_module_path: Vec<String>,
     javac_args: Vec<String>,
     jvm_args: Vec<String>,
     compile_env: BTreeMap<String, String>,
@@ -826,6 +829,7 @@ struct PendingOutput {
     host_directive_bytes: usize,
     generated_sources: BTreeSet<FileKey>,
     additional_classpath: BTreeSet<FileKey>,
+    additional_module_path: BTreeSet<FileKey>,
     javac_args: Vec<String>,
     jvm_args: Vec<String>,
     compile_env: BTreeMap<String, String>,
@@ -846,6 +850,7 @@ impl PendingOutput {
             host_directive_bytes: 0,
             generated_sources: BTreeSet::new(),
             additional_classpath: BTreeSet::new(),
+            additional_module_path: BTreeSet::new(),
             javac_args: Vec::new(),
             jvm_args: Vec::new(),
             compile_env: BTreeMap::new(),
@@ -864,6 +869,7 @@ impl PendingOutput {
             generated_files: self.generated.keys().cloned().collect(),
             generated_sources: self.generated_sources.clone(),
             additional_classpath: self.additional_classpath.clone(),
+            additional_module_path: self.additional_module_path.clone(),
             javac_args: self.javac_args.clone(),
             jvm_args: self.jvm_args.clone(),
             compile_env: self.compile_env.clone(),
@@ -1071,6 +1077,7 @@ mod api {
         outputs: Vec<(FileKey, ContentDigest)>,
         generated_sources: BTreeSet<FileKey>,
         additional_classpath: BTreeSet<FileKey>,
+        additional_module_path: BTreeSet<FileKey>,
         javac_args: Vec<String>,
         jvm_args: Vec<String>,
         compile_env: BTreeMap<String, String>,
@@ -1100,6 +1107,7 @@ mod api {
                 host_directive_bytes: 0,
                 generated_sources: self.state.generated_sources,
                 additional_classpath: self.state.additional_classpath,
+                additional_module_path: self.state.additional_module_path,
                 javac_args: self.state.javac_args,
                 jvm_args: self.state.jvm_args,
                 compile_env: self.state.compile_env,
@@ -1380,6 +1388,7 @@ mod api {
         }
         let generated_sources = parse_file_set(&wire.generated_sources)?;
         let additional_classpath = parse_file_set(&wire.additional_classpath)?;
+        let additional_module_path = parse_file_set(&wire.additional_module_path)?;
         let rerun_files = parse_file_set(&wire.rerun_files)?;
         let rerun_env = parse_string_set(&wire.rerun_env)?;
         if rerun_env.iter().any(|name| !valid_environment_name(name))
@@ -1414,6 +1423,7 @@ mod api {
             outputs,
             generated_sources,
             additional_classpath,
+            additional_module_path,
             javac_args: wire.javac_args,
             jvm_args: wire.jvm_args,
             compile_env: wire.compile_env,
@@ -1489,6 +1499,8 @@ mod api {
             && state.generated_sources.iter().all(&path_fits)
             && state.additional_classpath.len() <= limits.max_array_size
             && state.additional_classpath.iter().all(&path_fits)
+            && state.additional_module_path.len() <= limits.max_array_size
+            && state.additional_module_path.iter().all(&path_fits)
             && state.rerun_files.len() <= limits.max_array_size
             && state.rerun_files.iter().all(path_fits)
             && state.rerun_env.len() <= limits.max_array_size
@@ -1692,6 +1704,11 @@ mod api {
                 .collect(),
             additional_classpath: pending
                 .additional_classpath
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            additional_module_path: pending
+                .additional_module_path
                 .iter()
                 .map(ToString::to_string)
                 .collect(),

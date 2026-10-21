@@ -1875,6 +1875,20 @@ pub struct Build {
     pub target: Option<u32>,
     /// Classpath entries (jars or directories), relative to the manifest directory.
     pub classpath: Vec<String>,
+    /// Entries for `javac --module-path` (jars or directories), relative to the manifest
+    /// directory, or a `${dependency.<name>}` reference to a resolved dependency jar.
+    ///
+    /// This is also `java --module-path` for [`jals run`](Build::modular). Literal paths are
+    /// resolved by the host exactly like [`classpath`](Build::classpath); a dependency reference
+    /// names a key of `[dependencies]`/`[dev-dependencies]` and is evaluated after resolution,
+    /// because a fetched jar has no manifest-relative spelling.
+    pub module_path: Vec<String>,
+    /// How a project that declares `module-info.java` treats the module path.
+    ///
+    /// Defaults to [`ModularMode::Classpath`], so adding `module-info.java` to an existing project
+    /// does not silently change what its dependencies' jars are put on. `auto` switches to the
+    /// module path when a module declaration is present, and `module-path` always does.
+    pub modular: ModularMode,
     /// Extra raw flags appended verbatim after the generated `javac` arguments (before the source
     /// files). An escape hatch for anything the manifest does not model yet.
     pub javac_flags: Vec<String>,
@@ -1899,6 +1913,34 @@ pub struct Build {
     /// deobfuscated classes it compiled, while the jar this produces carries the names the target
     /// runtime actually loads.
     pub remap: Option<BuildRemap>,
+}
+
+/// How `[build] module-path` is selected (`[build] modular`).
+///
+/// A named value rather than a boolean: the three states are genuinely different, and `auto`
+/// without a `module-info.java` must keep compiling exactly the way `classpath` does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModularMode {
+    /// Every input stays on the classpath, even when a `module-info.java` is present.
+    #[default]
+    Classpath,
+    /// Put dependencies and `[build] classpath` on the module path when a `module-info.java` is
+    /// among the compiled sources; stay on the classpath otherwise.
+    Auto,
+    /// Always put dependencies and `[build] classpath` on the module path.
+    ModulePath,
+}
+
+impl ModularMode {
+    /// Whether this mode puts inputs on the module path for a project with `has_module_info`.
+    pub const fn uses_module_path(self, has_module_info: bool) -> bool {
+        match self {
+            Self::Classpath => false,
+            Self::Auto => has_module_info,
+            Self::ModulePath => true,
+        }
+    }
 }
 
 /// `[test]`: what a test run compiles on top of the project, and where it puts the result.
@@ -2262,6 +2304,80 @@ impl Test {
     }
 }
 
+/// The prefix and suffix of a `[build] module-path` dependency reference.
+const MODULE_PATH_DEPENDENCY_PREFIX: &str = "${dependency.";
+const MODULE_PATH_DEPENDENCY_SUFFIX: char = '}';
+
+/// The dependency name a `[build] module-path` entry references, when it is a reference.
+///
+/// `Some("guava")` for `${dependency.guava}`, `None` for a literal path. A malformed reference
+/// (anything else that opens with `${`) is reported by [`Build::module_path_entries`].
+pub fn module_path_dependency(entry: &str) -> Option<&str> {
+    entry
+        .strip_prefix(MODULE_PATH_DEPENDENCY_PREFIX)?
+        .strip_suffix(MODULE_PATH_DEPENDENCY_SUFFIX)
+}
+
+impl Build {
+    /// Classify every `[build] module-path` entry as a literal path or a dependency reference.
+    ///
+    /// # Errors
+    /// [`ModulePathError`] for a malformed or empty entry. [`Manifest::validate`] rejects the
+    /// same shapes, so a validated manifest never fails here.
+    pub fn module_path_entries(&self) -> Result<Vec<ModulePathEntry<'_>>, ModulePathError> {
+        self.module_path
+            .iter()
+            .map(|entry| {
+                if entry.is_empty() {
+                    return Err(ModulePathError::Empty);
+                }
+                if let Some(name) = module_path_dependency(entry) {
+                    if name.is_empty() || name.contains('.') || name.contains('/') {
+                        return Err(ModulePathError::Malformed(entry.clone()));
+                    }
+                    return Ok(ModulePathEntry::Dependency(name));
+                }
+                if entry.starts_with("${") {
+                    return Err(ModulePathError::Malformed(entry.clone()));
+                }
+                Ok(ModulePathEntry::Path(entry.as_str()))
+            })
+            .collect()
+    }
+}
+
+/// One `[build] module-path` entry, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulePathEntry<'a> {
+    /// A literal path, relative to the manifest directory.
+    Path(&'a str),
+    /// A `${dependency.<name>}` reference, resolved against the dependency graph.
+    Dependency(&'a str),
+}
+
+/// A malformed `[build] module-path` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulePathError {
+    /// The entry is the empty string.
+    Empty,
+    /// The entry opens with `${` but is not exactly `${dependency.<name>}`.
+    Malformed(String),
+}
+
+impl fmt::Display for ModulePathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a `[build] module-path` entry is empty"),
+            Self::Malformed(entry) => write!(
+                f,
+                "`[build] module-path` entry `{entry}` is not a path or `${{dependency.<name>}}`"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ModulePathError {}
+
 /// The `[build] remap` step: which mapping set reobfuscates the compiled output, and where the jar
 /// goes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2442,6 +2558,8 @@ impl Default for Build {
             source: None,
             target: None,
             classpath: Vec::new(),
+            module_path: Vec::new(),
+            modular: ModularMode::default(),
             include: Vec::new(),
             exclude: Vec::new(),
             javac_flags: Vec::new(),
@@ -2896,6 +3014,36 @@ impl Manifest {
                         }
                     })?;
                 }
+            }
+        }
+
+        // `module-path` entries are paths or named dependency references. A reference is
+        // validated against both tables because a test compile sees `[dev-dependencies]` too.
+        let declared: Vec<String> = self
+            .dependencies
+            .keys()
+            .chain(self.dev_dependencies.keys())
+            .cloned()
+            .collect();
+        for entry in match self.build.module_path_entries() {
+            Ok(entries) => entries,
+            Err(ModulePathError::Empty) => {
+                return Err(ValidationError::InvalidModulePath {
+                    entry: String::new(),
+                });
+            }
+            Err(ModulePathError::Malformed(entry)) => {
+                return Err(ValidationError::InvalidModulePath { entry });
+            }
+        } {
+            if let ModulePathEntry::Dependency(name) = entry
+                && !self.dependencies.contains_key(name)
+                && !self.dev_dependencies.contains_key(name)
+            {
+                return Err(ValidationError::UnknownModulePathDependency {
+                    dependency: name.to_owned(),
+                    declared,
+                });
             }
         }
 
@@ -3541,6 +3689,18 @@ pub enum ValidationError {
         /// Which rule it broke.
         reason: ResourcePatternError,
     },
+    /// A `[build] module-path` entry is empty or is not a path / `${dependency.<name>}`.
+    InvalidModulePath {
+        /// The offending entry.
+        entry: String,
+    },
+    /// A `[build] module-path` reference names a dependency this manifest does not declare.
+    UnknownModulePathDependency {
+        /// The referenced name.
+        dependency: String,
+        /// The declared names, for an actionable message.
+        declared: Vec<String>,
+    },
     /// A `[build] script.file` is not a non-root portable project file path.
     InvalidBuildScriptFile {
         /// The invalid script file value.
@@ -3799,6 +3959,20 @@ impl fmt::Display for ValidationError {
                 pattern,
                 reason,
             } => write!(f, "invalid `[{table}] {key}` entry `{pattern}`: {reason}"),
+            Self::InvalidModulePath { entry } => write!(
+                f,
+                "invalid `[build] module-path` entry `{entry}`: expected a path or \
+                 `${{dependency.<name>}}`"
+            ),
+            Self::UnknownModulePathDependency {
+                dependency,
+                declared,
+            } => write!(
+                f,
+                "`[build] module-path` references dependency `{dependency}`, which is not declared \
+                 (declared: {})",
+                declared.join(", ")
+            ),
             Self::InvalidBuildScriptFile { file } => write!(
                 f,
                 "invalid `[build] script.file` `{file}`: expected a non-root portable file path"
@@ -6548,5 +6722,47 @@ mod tests {
                 reason: ResourcePatternError::MalformedAnyDepth,
             })
         );
+    }
+
+    #[test]
+    fn modular_mode_and_module_path_references_are_validated() {
+        let manifest: Manifest = toml::from_str(
+            "[build]\nmodular = \"auto\"\nmodule-path = [\"libs/modules\", \"${dependency.guava}\"]\n\
+             [dependencies]\nguava = { jar = \"libs/guava.jar\" }\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+        assert_eq!(manifest.build.modular, ModularMode::Auto);
+        assert_eq!(
+            manifest.build.module_path_entries().unwrap(),
+            vec![
+                ModulePathEntry::Path("libs/modules"),
+                ModulePathEntry::Dependency("guava"),
+            ]
+        );
+
+        let unknown: Manifest =
+            toml::from_str("[build]\nmodule-path = [\"${dependency.missing}\"]\n").unwrap();
+        assert_eq!(
+            unknown.validate(),
+            Err(ValidationError::UnknownModulePathDependency {
+                dependency: "missing".to_owned(),
+                declared: Vec::new(),
+            })
+        );
+
+        let malformed: Manifest =
+            toml::from_str("[build]\nmodule-path = [\"${dependency}\"]\n").unwrap();
+        assert_eq!(
+            malformed.validate(),
+            Err(ValidationError::InvalidModulePath {
+                entry: "${dependency}".to_owned(),
+            })
+        );
+
+        assert!(!ModularMode::Classpath.uses_module_path(true));
+        assert!(ModularMode::Auto.uses_module_path(true));
+        assert!(!ModularMode::Auto.uses_module_path(false));
+        assert!(ModularMode::ModulePath.uses_module_path(false));
     }
 }

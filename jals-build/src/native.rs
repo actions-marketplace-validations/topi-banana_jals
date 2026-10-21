@@ -394,6 +394,7 @@ mod tests {
             sources: &sources,
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };
@@ -404,6 +405,7 @@ mod tests {
             main_class: "Main",
             program_args: &[],
             extra_classpath: &[],
+            module_path: &[],
             run_env: &BTreeMap::new(),
         };
         let compiler = block_on_inline(<dyn Compiler>::select(&manifest, root, &exec));
@@ -426,6 +428,7 @@ mod tests {
             sources: &sources,
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };
@@ -441,6 +444,7 @@ mod tests {
             main_class: "Main",
             program_args: &[],
             extra_classpath: &[],
+            module_path: &[],
             run_env: &BTreeMap::new(),
         };
         let runtime = block_on_inline(<dyn Runtime>::select(&manifest, root, &exec))
@@ -452,6 +456,7 @@ mod tests {
             sources: &sources,
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };
@@ -507,6 +512,7 @@ mod tests {
             sources: &[],
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };
@@ -536,6 +542,7 @@ mod tests {
             sources: &[],
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };
@@ -552,6 +559,7 @@ mod tests {
             main_class: "Main",
             program_args: &[],
             extra_classpath: &[],
+            module_path: &[],
             run_env: &BTreeMap::new(),
         };
         let program = block_on_inline(toolchain.plan_run(&run_req)).program;

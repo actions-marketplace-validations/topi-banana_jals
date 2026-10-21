@@ -1343,6 +1343,7 @@ impl RunArgs {
                 main_class,
                 program_args: &self.args,
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 run_env: &inputs.run_env,
             });
         // One selection for the whole command: the same packages are compiled into the module and
@@ -1730,6 +1731,7 @@ impl TestArgs {
                 main_class: jals_frontend::HARNESS_CLASS,
                 program_args: &[],
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 run_env: &inputs.run_env,
             };
             Launcher::Jvm(
@@ -2501,6 +2503,10 @@ impl App {
 #[derive(Default)]
 struct HostProjectInputs {
     extra_classpath: Vec<PathBuf>,
+    /// Resolved `[build] module-path` entries, plus any dependency jars an `auto`/`module-path`
+    /// selection moved here. Kept apart from `extra_classpath` because the two javac options are
+    /// different namespaces: a jar on the wrong one is a `module not found` error.
+    extra_module_path: Vec<PathBuf>,
     /// Every cached archive the compiled classes are reobfuscated against: the resolved
     /// `[dependencies]` jars, then the archives the build tasks put on the classpath.
     ///
@@ -2551,6 +2557,10 @@ impl HostProjectInputs {
             .retain(|entry| seen_classpath.insert(root.join(entry)));
         self.extra_classpath
             .retain(|entry| seen_classpath.insert(entry.clone()));
+
+        let mut seen_module_path = HashSet::new();
+        self.extra_module_path
+            .retain(|entry| seen_module_path.insert(entry.clone()));
     }
 }
 
@@ -2633,6 +2643,7 @@ impl CompilePlan {
             &jals_build::HostCompileInputs {
                 extra_sources: &inputs.extra_sources,
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 extra_javac_args: &inputs.javac_args,
                 compile_env: &inputs.compile_env,
             },
@@ -2745,6 +2756,7 @@ impl CompilePlan {
 struct HostBuildScript {
     generated_sources: Vec<PathBuf>,
     additional_classpath: Vec<PathBuf>,
+    additional_module_path: Vec<PathBuf>,
     javac_args: Vec<String>,
     jvm_args: Vec<String>,
     compile_env: BTreeMap<String, String>,
@@ -2773,6 +2785,7 @@ impl From<HostBuildScript> for HostProjectInputs {
     fn from(script: HostBuildScript) -> Self {
         Self {
             extra_classpath: script.additional_classpath,
+            extra_module_path: script.additional_module_path,
             extra_sources: script.generated_sources,
             javac_args: script.javac_args,
             jvm_args: script.jvm_args,
@@ -3021,6 +3034,44 @@ impl App {
             };
             result.extra_classpath.push(path);
         }
+        // `[build] module-path` has two spellings: a literal host path, and a
+        // `${dependency.<name>}` reference that only the resolver can answer. Both become one
+        // resolved entry, because `javac` takes one option and has no way to look a name up.
+        for entry in manifest
+            .build
+            .module_path_entries()
+            .expect("Manifest::validate rejected an invalid module-path")
+        {
+            match entry {
+                jals_config::ModulePathEntry::Path(path) => {
+                    result.extra_module_path.push(root.join(path));
+                }
+                jals_config::ModulePathEntry::Dependency(name) => {
+                    let key = jals_storage::Name::new(name)
+                        .ok()
+                        .and_then(|name| assembly.inputs.named_dependency_jars.get(&name));
+                    let Some(key) = key else {
+                        shell.warn(format_args!(
+                            "module-path dependency `{name}` has no resolved jar (it is not a \
+                             registry or jar dependency)"
+                        ));
+                        continue;
+                    };
+                    let logical = jals_storage::FileKey::parse(&format!("dependencies/{name}.jar"))
+                        .expect("a dependency name is a portable file name");
+                    match storage
+                        .artifacts()
+                        .materialize_file(key, logical.path())
+                        .await
+                    {
+                        Ok(path) => result.extra_module_path.push(path),
+                        Err(error) => shell.warn(format_args!(
+                            "materializing module-path dependency `{name}` failed: {error:?}"
+                        )),
+                    }
+                }
+            }
+        }
         // Kept beside the materialized host paths below rather than derived from them: a host that
         // indexes these mounts them into its own project revision, and a materialized artifact is
         // a path under `target/jals/cache`, which that revision does not capture.
@@ -3212,6 +3263,35 @@ impl App {
             !script.host.generated_sources.is_empty(),
             lowering,
         )?;
+        // A module declaration is a property of the source set this compile was handed, not of the
+        // manifest bytes alone: an excluded `module-info.java` (M2.1) must not flip the selection,
+        // and a generated one must.
+        let has_module_info = sources
+            .iter()
+            .chain(&script.host.generated_sources)
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "module-info.java")
+            });
+        let uses_module_path = manifest.build.modular.uses_module_path(has_module_info);
+        if has_module_info && !uses_module_path {
+            session.shell().warn(format_args!(
+                "`module-info.java` is compiled with everything on the classpath; set \
+                 `[build] modular = \"auto\"` (or \"module-path\") to put resolved dependencies on \
+                 `--module-path`"
+            ));
+        }
+        if uses_module_path {
+            // `[build] classpath` entries are jars a JPMS project usually needs on the module path
+            // instead. They stay in `classpath` too, so `jals run` and a non-modular consumer keep
+            // their existing reading.
+            for entry in &manifest.build.classpath {
+                if !manifest.build.module_path.contains(entry) {
+                    manifest.build.module_path.push(entry.clone());
+                }
+            }
+        }
         // The root build script's output is root project source, so it goes through the root
         // frontend alongside the authored files. Dependency-contributed sources, which land in
         // `extra_sources` further down, deliberately do not: a dependency is lowered under its
@@ -3236,6 +3316,14 @@ impl App {
             session,
         )
         .await?;
+        if uses_module_path {
+            // Every resolved dependency jar the compile classpath carries is a module candidate.
+            // Copies are appended rather than moved: the run classpath still needs them when the
+            // program is launched by main class.
+            inputs
+                .extra_module_path
+                .extend(inputs.extra_classpath.iter().cloned());
+        }
         inputs.deduplicate(manifest, root, &sources);
         // Deduplication compares against the *authored* paths, so it must happen before lowering
         // replaces them with staged ones.
@@ -3414,6 +3502,11 @@ impl App {
                         .map(|key| key.path().to_host_path(root))
                         .collect(),
                     additional_classpath,
+                    additional_module_path: output
+                        .additional_module_path
+                        .iter()
+                        .map(|key| key.path().to_host_path(root))
+                        .collect(),
                     javac_args: output.javac_args.clone(),
                     jvm_args: output.jvm_args.clone(),
                     compile_env: output.compile_env.clone(),

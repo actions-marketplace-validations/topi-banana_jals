@@ -33,6 +33,9 @@ pub struct CompileRequest<'a> {
     /// Extra already-resolved classpath entries (the downloaded/local dependency jars), appended
     /// after the manifest's `[build] classpath`.
     pub extra_classpath: &'a [PathBuf],
+    /// Already-resolved module-path entries (dependency jars and declared paths), emitted as
+    /// `--module-path` before `-sourcepath`.
+    pub module_path: &'a [PathBuf],
     /// Extra `javac` arguments, appended after the manifest's `javac_flags` and before sources.
     pub extra_javac_args: &'a [String],
     /// Explicit environment entries for the compiler subprocess.
@@ -54,6 +57,8 @@ pub struct RunRequest<'a> {
     /// Extra already-resolved classpath entries (the dependency jars), appended after the manifest's
     /// classpath.
     pub extra_classpath: &'a [PathBuf],
+    /// Already-resolved module-path entries, emitted as `--module-path` before `-cp`.
+    pub module_path: &'a [PathBuf],
     /// Explicit environment entries for the runtime subprocess.
     pub run_env: &'a BTreeMap<String, String>,
 }

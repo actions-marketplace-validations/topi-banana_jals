@@ -88,6 +88,17 @@ public final class Build {
     }
 
     /**
+     * Add a project file — or the key {@link Output#write} returned — to the later module path.
+     *
+     * <p>A module path entry is where a JPMS project's resolved modules are discovered. It is
+     * emitted as {@code --module-path} on the JDK subprocess, independently of {@link
+     * #addClasspath(String)}; a jar usually belongs on one or the other, not both.
+     */
+    public static void addModulePath(String path) {
+        addModulePath0(Text.of(path));
+    }
+
+    /**
      * Append one {@code javac} argument, in call order.
      *
      * <p>Root-script arguments follow the manifest's {@code javac-flags} and stay before source
@@ -154,6 +165,8 @@ public final class Build {
     private static native void addSource0(char[] path);
 
     private static native void addClasspath0(char[] path);
+
+    private static native void addModulePath0(char[] path);
 
     private static native void addJavacArg0(char[] arg);
 
