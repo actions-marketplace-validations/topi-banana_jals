@@ -439,7 +439,7 @@ pub struct PathDependency {
     pub dir: Option<String>,
     /// How this dependency is consumed.
     #[serde(default)]
-    pub(crate) mode: PathMode,
+    mode: PathMode,
     /// The **build features** to enable in this dependency (Cargo's per-dependency `features`). See
     /// [`Dependency::features`] for the semantics, which are the same for both source forms.
     #[serde(default)]
@@ -456,7 +456,7 @@ pub struct PathDependency {
 /// What a [`PathDependency`] contributes to its consumer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum PathMode {
+enum PathMode {
     /// Build the dependency from its `.java` sources and lower them into the consumer's compile —
     /// the historical behavior, and the default.
     #[default]
