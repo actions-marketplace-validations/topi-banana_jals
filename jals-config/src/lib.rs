@@ -45,7 +45,7 @@ pub use manifest::{
     FeatureSet, FileMappings, FrontendKind, GitDependency, GitRef, JarDependency, Manifest,
     ManifestParseError, MappingDigest, MappingEntry, MappingError, MappingFormatKind,
     MappingSource, ModularMode, ModulePathEntry, ModulePathError, Package, PathDependency,
-    PathMode, Registry, RegistryDependency, RemapSite, ResolvedBuildFeatures, ResourcePattern,
+    Registry, RegistryDependency, RemapSite, ResolvedBuildFeatures, ResourcePattern,
     ResourcePatternError, Run, SourceFilter, SourceFilterError, UrlMappings, ValidationError,
     Workspace,
 };
