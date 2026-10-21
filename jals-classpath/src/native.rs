@@ -121,7 +121,12 @@ pub struct RegistryGraphs {
     /// Artifact specs that are fetched into the verified cache but are not classpath entries: a
     /// `tar.gz` native bundle, a `war`, a classified `-sources` jar. The lock records the package
     /// either way; only a jar can be a classpath entry.
-    pub artifacts: Vec<DependencySpec>,
+    ///
+    /// Private: the only reader is `NativeProjectPlan`, in this module, which folds these into
+    /// the plan's auxiliary half. Nothing outside `jals_classpath` sees this field, and
+    /// `RegistryGraphs` is not constructible outside it either (`warnings` is private), so any
+    /// wider visibility would be a wider surface than anything can reach.
+    artifacts: Vec<DependencySpec>,
     /// The feature-independent lock, when one was generated *and* carries at least one package.
     /// An empty lock is not a lock: a project with no registry dependency has nothing to pin, and
     /// writing `version = 1` alone would make `--locked` demand a file nothing resolves against.
