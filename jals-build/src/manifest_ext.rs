@@ -85,6 +85,15 @@ pub trait ManifestExt {
     /// validation (e.g. duplicate `[[bin]]` names).
     async fn from_file(path: &Path) -> Result<Manifest, ManifestError>;
 
+    /// Load a member manifest and apply a workspace's inherited values before validation.
+    ///
+    /// # Errors
+    /// Returns [`ManifestError`] when the file cannot be read or the inherited manifest is invalid.
+    async fn from_file_inheriting(
+        path: &Path,
+        workspace: &jals_config::Workspace,
+    ) -> Result<Manifest, ManifestError>;
+
     /// Search upward from `start_dir` for a `jals.toml`, returning its path.
     ///
     /// The project root is the returned path's parent directory; all manifest paths are resolved
@@ -124,6 +133,31 @@ impl ManifestExt for Manifest {
                 source,
             })?;
             text.parse::<Self>().map_err(|err| match err {
+                ManifestParseError::Parse { source, .. } => ManifestError::Parse {
+                    path: path.clone(),
+                    source,
+                },
+                ManifestParseError::Invalid { source, .. } => ManifestError::Invalid {
+                    path: path.clone(),
+                    source,
+                },
+            })
+        })
+        .await
+    }
+
+    async fn from_file_inheriting(
+        path: &Path,
+        workspace: &jals_config::Workspace,
+    ) -> Result<Self, ManifestError> {
+        let path = path.to_path_buf();
+        let workspace = workspace.clone();
+        jals_exec::tokio_rt::on_blocking_pool(move || {
+            let text = std::fs::read_to_string(&path).map_err(|source| ManifestError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            Self::from_str_inheriting(&text, Some(&workspace)).map_err(|err| match err {
                 ManifestParseError::Parse { source, .. } => ManifestError::Parse {
                     path: path.clone(),
                     source,

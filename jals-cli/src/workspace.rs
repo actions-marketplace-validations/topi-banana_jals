@@ -27,6 +27,8 @@ const MAX_MEMBER_DEPTH: usize = 24;
 #[derive(Debug)]
 pub struct ProjectWorkspace {
     root: PathBuf,
+    /// The root's `[workspace]` table, cloned at discovery so member loading can inherit from it.
+    workspace: Workspace,
     /// Member manifest paths, sorted and deduplicated.
     members: Vec<PathBuf>,
 }
@@ -80,9 +82,14 @@ impl ProjectWorkspace {
     pub async fn manifests(&self) -> Result<Vec<Manifest>> {
         let mut manifests = Vec::with_capacity(self.members.len());
         for path in &self.members {
-            let manifest = Manifest::from_file(path)
-                .await
-                .with_context(|| format!("loading workspace member {}", path.display()))?;
+            // The root is not a member of itself: its own `[workspace]` is a declaration, not a
+            // parent table to merge into the file that declares it.
+            let manifest = if path == &self.root.join("jals.toml") {
+                Manifest::from_file(path).await
+            } else {
+                Manifest::from_file_inheriting(path, &self.workspace).await
+            }
+            .with_context(|| format!("loading workspace member {}", path.display()))?;
             manifests.push(manifest);
         }
         Ok(manifests)
@@ -148,6 +155,7 @@ impl ProjectWorkspace {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            workspace: workspace.clone(),
             members,
         })
     }

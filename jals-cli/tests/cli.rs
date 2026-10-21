@@ -125,6 +125,59 @@ fn update_from_a_member_uses_workspace_discovery() {
     );
 }
 
+#[test]
+fn package_selects_a_workspace_member_for_build_and_run() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+         [workspace.package]\nversion = \"1.2.3\"\n",
+    )
+    .unwrap();
+    for (name, class) in [("app", "Main"), ("lib", "Lib")] {
+        std::fs::create_dir_all(dir.path().join(name).join("src/main/java")).unwrap();
+        std::fs::write(
+            dir.path().join(name).join("jals.toml"),
+            format!("[package]\nname = \"{name}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join(name)
+                .join("src/main/java")
+                .join(format!("{class}.java")),
+            format!("class {class} {{ }}\n"),
+        )
+        .unwrap();
+    }
+
+    let output = jals()
+        .args(["build", "-p", "app", "--dry-run"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Main.java"), "got: {stdout}");
+    assert!(!stdout.contains("Lib.java"), "got: {stdout}");
+
+    let missing = jals()
+        .args(["build", "-p", "missing", "--dry-run"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("was not found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
 /// Build a minimal project tree (`jals.toml` + one source) under a fresh tempdir.
 fn project(manifest: &str) -> tempfile::TempDir {
     let dir = tempdir().unwrap();

@@ -296,13 +296,18 @@ pub struct Registry {
     pub url: String,
 }
 
-/// `[workspace]`: the member patterns a root manifest shares with its subprojects.
+/// `[workspace]`: the member patterns and inherited defaults a root manifest shares with its
+/// subprojects.
 ///
 /// The **root** is the manifest carrying this table. Discovery walks upward from a project's
 /// manifest until it finds one, so a member never restates the workspace; `members` are patterns
 /// relative to the root (`"app"`, `"libs/*"`), `exclude` removes matched directories, and
 /// `default-members` must name a subset of what `members` discovers (the host validates that
 /// against the filesystem, which this pure type cannot see).
+///
+/// Inheritance is Maven-parent shaped rather than Cargo-marker shaped: a member that omits a value
+/// receives the workspace one, and a member that writes its own keeps it. `[workspace.dependencies]`
+/// are defaults by name, so a member can override one without restating the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Workspace {
@@ -318,9 +323,98 @@ pub struct Workspace {
     /// which only the host can decide.
     #[serde(default)]
     pub default_members: Vec<String>,
+    /// Values inherited by members that omit them (`[workspace.package]`).
+    #[serde(default)]
+    pub package: WorkspacePackage,
+    /// Dependency defaults by name (`[workspace.dependencies]`). A member's own entry of the same
+    /// name wins; the rest are added verbatim.
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, Dependency>,
+    /// The same defaults for `[dev-dependencies]`.
+    #[serde(default)]
+    pub dev_dependencies: BTreeMap<String, Dependency>,
+    /// Build defaults members inherit (`[workspace.build]`).
+    #[serde(default)]
+    pub build: WorkspaceBuild,
+}
+
+/// `[workspace.package]`: the package values a member may omit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkspacePackage {
+    /// The version a member inherits when it declares none.
+    pub version: Option<String>,
+}
+
+/// `[workspace.build]`: build defaults a member inherits.
+///
+/// Only values with an unambiguous "omitted" spelling live here. `source-dirs` is deliberately
+/// absent: its default is a real value (`src/main/java`), so a workspace default would silently
+/// rewrite every member that never mentioned the key.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkspaceBuild {
+    /// `javac --release N` for members that declare none.
+    pub release: Option<u32>,
+    /// `javac --source N` for members that declare neither `release` nor `source`.
+    pub source: Option<u32>,
+    /// `javac --target N` for members that declare neither `release` nor `target`.
+    pub target: Option<u32>,
+    /// Classpath entries prepended to every member's own list.
+    pub classpath: Vec<String>,
+    /// Module-path entries prepended to every member's own list.
+    pub module_path: Vec<String>,
+    /// `javac` flags prepended to every member's own list.
+    pub javac_flags: Vec<String>,
 }
 
 impl Workspace {
+    /// Apply this workspace's inherited values to a member manifest.
+    ///
+    /// Runs before [`Manifest::validate`]: a member may reference an inherited dependency in
+    /// `[features]` or `module-path`, and validating first would reject a name that is about to
+    /// exist. A member's own value always wins, except for list-valued options, where the
+    /// workspace entries are prepended and the member's keep their order after them.
+    pub fn inherit_into(&self, manifest: &mut Manifest) {
+        if manifest.package.version.is_none() {
+            manifest.package.version.clone_from(&self.package.version);
+        }
+        for (name, dependency) in &self.dependencies {
+            manifest
+                .dependencies
+                .entry(name.clone())
+                .or_insert_with(|| dependency.clone());
+        }
+        for (name, dependency) in &self.dev_dependencies {
+            manifest
+                .dev_dependencies
+                .entry(name.clone())
+                .or_insert_with(|| dependency.clone());
+        }
+
+        let build = &mut manifest.build;
+        if build.release.is_none() {
+            build.release = self.build.release;
+            if build.release.is_some() {
+                // `--release` wins over the pair, so inheriting it must not leave a member's
+                // `source`/`target` looking effective when `javac` will ignore them.
+                build.source = None;
+                build.target = None;
+            }
+        }
+        if build.release.is_none() {
+            if build.source.is_none() {
+                build.source = self.build.source;
+            }
+            if build.target.is_none() {
+                build.target = self.build.target;
+            }
+        }
+        prepend(&mut build.classpath, &self.build.classpath);
+        prepend(&mut build.module_path, &self.build.module_path);
+        prepend(&mut build.javac_flags, &self.build.javac_flags);
+    }
+
     /// Validate every pattern as a resource-style glob, and reject an empty entry.
     fn validate(&self) -> Result<(), ValidationError> {
         for (key, patterns) in [
@@ -353,8 +447,24 @@ impl Workspace {
         if self.members.is_empty() {
             return Err(ValidationError::EmptyWorkspace);
         }
+        for (name, dependency) in self.dependencies.iter().chain(&self.dev_dependencies) {
+            dependency
+                .validate(name)
+                .map_err(ValidationError::Dependency)?;
+        }
         Ok(())
     }
+}
+
+/// Prepend `defaults` to `values`, skipping ones already present.
+fn prepend(values: &mut Vec<String>, defaults: &[String]) {
+    let mut merged: Vec<String> = defaults
+        .iter()
+        .filter(|entry| !values.contains(entry))
+        .cloned()
+        .collect();
+    merged.append(values);
+    *values = merged;
 }
 
 /// The `jar` form of a [`Dependency`]: a compiled `.jar` and its optional companion `sources` jar.
@@ -3700,10 +3810,33 @@ impl FromStr for Manifest {
     type Err = ManifestParseError;
 
     fn from_str(text: &str) -> Result<Self, ManifestParseError> {
-        let manifest: Self = toml::from_str(text).map_err(|source| ManifestParseError::Parse {
-            path: Self::IN_MEMORY_NAME.to_owned(),
-            source,
-        })?;
+        Self::from_str_inheriting(text, None)
+    }
+}
+
+impl Manifest {
+    /// Parse a member manifest and apply a workspace's inherited values before validation.
+    ///
+    /// `workspace` is `None` for a standalone manifest (exactly [`FromStr`]) and for a workspace
+    /// root, whose own `[workspace]` table is not a parent of itself. The inheritance pass runs
+    /// before [`validate`](Self::validate) so an inherited dependency may be referenced by
+    /// `[features]` or `[build] module-path` in the member text.
+    ///
+    /// # Errors
+    /// [`ManifestParseError::Parse`] for invalid TOML, [`ManifestParseError::Invalid`] for a
+    /// structurally invalid manifest (including one the inherited values make invalid).
+    pub fn from_str_inheriting(
+        text: &str,
+        workspace: Option<&Workspace>,
+    ) -> Result<Self, ManifestParseError> {
+        let mut manifest: Self =
+            toml::from_str(text).map_err(|source| ManifestParseError::Parse {
+                path: Self::IN_MEMORY_NAME.to_owned(),
+                source,
+            })?;
+        if let Some(workspace) = workspace {
+            workspace.inherit_into(&mut manifest);
+        }
         manifest
             .validate()
             .map_err(|source| ManifestParseError::Invalid {
@@ -6929,5 +7062,66 @@ mod tests {
         assert!(ModularMode::Auto.uses_module_path(true));
         assert!(!ModularMode::Auto.uses_module_path(false));
         assert!(ModularMode::ModulePath.uses_module_path(false));
+    }
+
+    #[test]
+    fn workspace_inheritance_fills_omitted_values_and_member_wins() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+             [workspace.package]\nversion = \"1.2.3\"\n\
+             [workspace.dependencies]\nguava = { jar = \"libs/guava.jar\" }\n\
+             [workspace.build]\nrelease = 21\nclasspath = [\"libs/common.jar\"]\n\
+             javac-flags = [\"-Xlint:all\"]\n",
+        )
+        .unwrap();
+        let workspace = root.workspace.as_ref().unwrap();
+
+        let mut member: Manifest = toml::from_str(
+            "[package]\nname = \"app\"\n\
+             [build]\nclasspath = [\"libs/app.jar\"]\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut member);
+        assert_eq!(member.validate(), Ok(()));
+        assert_eq!(member.package.version.as_deref(), Some("1.2.3"));
+        assert!(member.dependencies.contains_key("guava"));
+        assert_eq!(member.build.release, Some(21));
+        assert_eq!(
+            member.build.classpath,
+            vec!["libs/common.jar".to_owned(), "libs/app.jar".to_owned()]
+        );
+        assert_eq!(member.build.javac_flags, vec!["-Xlint:all".to_owned()]);
+
+        let mut overriding: Manifest = toml::from_str(
+            "[package]\nname = \"lib\"\nversion = \"9.9.9\"\n\
+             [dependencies]\nguava = { jar = \"libs/other.jar\" }\n\
+             [build]\nrelease = 17\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut overriding);
+        assert_eq!(overriding.package.version.as_deref(), Some("9.9.9"));
+        assert!(matches!(
+            overriding.dependencies.get("guava"),
+            Some(Dependency::Jar(jar)) if jar.jar == "libs/other.jar"
+        ));
+        assert_eq!(overriding.build.release, Some(17));
+    }
+
+    #[test]
+    fn workspace_inheritance_runs_before_member_validation() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\"]\n\
+             [workspace.dependencies]\nstub = { jar = \"libs/stub.jar\" }\n\
+             [workspace.build]\nmodule-path = [\"${dependency.stub}\"]\n",
+        )
+        .unwrap();
+        let member: Manifest =
+            Manifest::from_str_inheriting("[package]\nname = \"app\"\n", root.workspace.as_ref())
+                .unwrap();
+        assert_eq!(
+            member.build.module_path,
+            vec!["${dependency.stub}".to_owned()]
+        );
+        assert!(member.dependencies.contains_key("stub"));
     }
 }
