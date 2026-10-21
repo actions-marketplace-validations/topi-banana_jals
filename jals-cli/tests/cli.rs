@@ -460,7 +460,7 @@ fn modular_auto_puts_classpath_on_the_module_path_when_module_info_is_present() 
 fn modular_auto_warns_about_a_split_package_on_the_module_path() {
     let dir = project(
         "[package]\nname = \"split\"\n\
-         [build]\nmodular = \"auto\"\nclasspath = [\"libs/*.jar\"]\n",
+         [build]\nmodular = \"auto\"\nclasspath = [\"libs/a.jar\", \"libs/b.jar\"]\n",
     );
     std::fs::create_dir_all(dir.path().join("libs")).unwrap();
     write_source_jar(
