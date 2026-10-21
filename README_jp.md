@@ -395,6 +395,7 @@ version = "0.1.0"
 [build]
 release = 21                        # javac --release N
 # source-dirs = ["src/main/java"]   # -sourcepath のルート。.java 探索の対象でもある
+# exclude     = ["module-info.java"] # 各 source root 配下で除外する glob
 # classes-dir = "target/classes"    # javac -d
 # classpath   = ["libs/guava.jar"]  # -classpath エントリ
 # script = { type = "java", file = "build.java" }

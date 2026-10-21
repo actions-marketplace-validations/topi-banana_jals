@@ -108,6 +108,8 @@ version = "0.1.0"
 [build]
 # script = { type = "java", file = "build.java" } # optional pre-javac phase
 source-dirs = ["src/main/java"]   # -sourcepath roots, also scanned for .java files
+# include = ["com/example/**"]    # glob selection below each source root (empty means all)
+exclude = ["module-info.java"]    # glob exclusions; an excluded file is never compiled
 classes-dir = "target/classes"    # javac -d
 # resource-dirs = ["src/main/resources"]  # packaged into the jar `[build] remap` writes
 release = 21                       # javac --release N
@@ -220,6 +222,8 @@ nothing still leaves every dependency script cached.
 | --------------- | ---------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `script`        | tagged table     | —                        | optional pre-`javac` build phase; currently `{ type = "java", file = "build.java" }`                                                                            |
 | `source-dirs`   | array of strings | `["src/main/java"]`      | `-sourcepath` (joined) **and** the roots scanned for `.java` files                                                                                              |
+| `include`       | array of strings | `[]`                     | globs selecting sources below each `source-dirs` entry (`*`, `?`, `**`); empty selects every source. An exclude wins over an include                     |
+| `exclude`       | array of strings | `[]`                     | globs skipping sources below each `source-dirs` entry; applied before the frontend cache key, so an excluded file is neither compiled nor indexed as project source |
 | `classes-dir`   | string           | `"target/classes"`       | `javac -d` (also the dir `jals clean` removes)                                                                                                                  |
 | `resource-dirs` | array of strings | `["src/main/resources"]` | files packaged into the jar `[build] remap` writes — the **jar only**, never `jals run`'s classpath; non-root dirs outside `classes-dir`, a missing one skipped |
 | `release`       | integer          | —                        | `--release N` — sets source level, target level, and bootclasspath together; when present, `source`/`target` are ignored                                        |

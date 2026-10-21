@@ -412,6 +412,7 @@ version = "0.1.0"
 [build]
 release = 21                        # javac --release N
 # source-dirs = ["src/main/java"]   # -sourcepath roots, also scanned for .java files
+# exclude     = ["module-info.java"] # globs skipped under every source root
 # classes-dir = "target/classes"    # javac -d
 # classpath   = ["libs/guava.jar"]  # -classpath entries
 # script = { type = "java", file = "build.java" }

@@ -25,6 +25,7 @@ use jals_config::fmt::Config;
 use jals_config::lint::Config as LintConfig;
 use jals_config::{
     Dependency, DependencyScope, DiscoverableConfig, FeatureSet, Manifest, ResolvedBuildFeatures,
+    SourceFilter,
 };
 use jals_exec::Exec;
 use jals_storage::{DirKey, FileKey, Name, NativeScope, NativeStorage, RelativePath};
@@ -2300,6 +2301,7 @@ impl LintProject {
                         feature_set: manifest.feature_set(),
                         build_features: features.into_features(),
                         native_sources: Self::native_layout_sources(shell, &manifest),
+                        source_filters: manifest.source_filters(),
                         ..jals_editor::ProjectLayout::new(source_roots)
                     },
                 });
@@ -2311,6 +2313,7 @@ impl LintProject {
             source_roots: inputs.source_roots,
             feature_set: inputs.feature_set,
             native_sources: Self::native_layout_sources(shell, &manifest),
+            source_filters: manifest.source_filters(),
             // What each project file's `#[cfg(feature = "…")]` evaluates against, read only when
             // `feature_set` enables the `attributes` dialect — so an attribute-free project's lint
             // output is independent of `--features`.
@@ -3456,11 +3459,28 @@ impl App {
         has_generated_sources: bool,
         lowering: Lowering,
     ) -> Result<Vec<PathBuf>> {
-        let source_roots = match lowering {
-            Lowering::Build => manifest.source_roots(root),
-            Lowering::Test | Lowering::TestOnWasm => manifest.test_source_roots(root),
-        };
-        for dir in &source_roots {
+        let build_filter = manifest
+            .build
+            .source_filter()
+            .expect("Manifest::validate rejected an invalid source filter");
+        let test_filter = manifest
+            .test
+            .source_filter()
+            .expect("Manifest::validate rejected an invalid source filter");
+        let mut source_roots: Vec<(PathBuf, SourceFilter)> = manifest
+            .source_roots(root)
+            .into_iter()
+            .map(|path| (path, build_filter.clone()))
+            .collect();
+        if matches!(lowering, Lowering::Test | Lowering::TestOnWasm) {
+            for dir in &manifest.test.source_dirs {
+                let path = root.join(dir);
+                if !source_roots.iter().any(|(declared, _)| declared == &path) {
+                    source_roots.push((path, test_filter.clone()));
+                }
+            }
+        }
+        for (dir, _) in &source_roots {
             // A declared `[test] source-dirs` that does not exist is not an error the way a
             // missing `[build] source-dirs` is: a project may keep tests in the main tree and
             // still name a test root it has not created yet.
@@ -3478,11 +3498,11 @@ impl App {
                 return Err(anyhow!("source directory {} does not exist", dir.display()));
             }
         }
-        let existing_roots: Vec<PathBuf> = source_roots
+        let existing_roots: Vec<(PathBuf, SourceFilter)> = source_roots
             .into_iter()
-            .filter(|root| root.is_dir())
+            .filter(|(root, _)| root.is_dir())
             .collect();
-        let sources = Self::collect_java_files(&existing_roots)?;
+        let sources = Self::collect_selected_java_files(&existing_roots)?;
         if sources.is_empty() && !has_generated_sources {
             return Err(anyhow!(
                 "no .java files found under {:?}",
@@ -3490,6 +3510,49 @@ impl App {
             ));
         }
         Ok(sources)
+    }
+
+    /// Collect `.java` files under each `(source root, filter)` pair.
+    ///
+    /// A filter sees the file's path *below* its own root, so the same manifest reads identically
+    /// whether a root is `src/main/java` or an absolute directory. A host path that cannot be
+    /// expressed as a portable [`RelativePath`] is kept: the filter is an authored selection, not
+    /// a way to make a legal source disappear.
+    fn collect_selected_java_files(roots: &[(PathBuf, SourceFilter)]) -> Result<Vec<PathBuf>> {
+        fn walk(
+            dir: &Path,
+            base: &Path,
+            filter: &SourceFilter,
+            out: &mut Vec<PathBuf>,
+        ) -> Result<()> {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<_, _>>()?;
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, base, filter, out)?;
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("java"))
+                {
+                    let selected = RelativePath::from_host_path(base, &path)
+                        .is_none_or(|relative| filter.accepts(&relative));
+                    if selected {
+                        out.push(path);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut out = Vec::new();
+        for (root, filter) in roots {
+            walk(root, root, filter, &mut out)
+                .with_context(|| format!("scanning directory {}", root.display()))?;
+        }
+        Ok(out)
     }
 
     /// Run the project's frontend over the discovered sources and stage the result on disk.

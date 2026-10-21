@@ -1823,6 +1823,22 @@ pub struct Build {
     /// Source roots, relative to the manifest directory. These feed `javac`'s `-sourcepath` and
     /// are the roots scanned for `.java` files. Defaults to `["src/main/java"]`.
     pub source_dirs: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the build source roots are compiled.
+    ///
+    /// Matched against a file's path *below* the `[build] source-dirs` entry it was found under,
+    /// using the resource glob grammar (`*` within a segment, `?` one character, `**` whole
+    /// segments). Empty means every source. [`exclude`](Build::exclude) wins over an include.
+    ///
+    /// The filter is applied where sources are gathered, before the frontend lowering key is
+    /// computed, so an excluded file is neither compiled nor able to affect the cache identity.
+    pub include: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the build source roots are skipped.
+    ///
+    /// Same grammar and address as [`include`](Build::include). Unlike
+    /// [`[build.resources] template`](BuildResources::template), a pattern that matches nothing is
+    /// not an error: the sources a project holds change, and a stale exclusion should not stop a
+    /// build.
+    pub exclude: Vec<String>,
     /// Output directory for `.class` files (`javac -d`), relative to the manifest directory.
     /// Defaults to `"target/classes"`.
     pub classes_dir: String,
@@ -1902,6 +1918,16 @@ pub struct Test {
     /// Extra source roots compiled only by `jals test`, relative to the manifest directory.
     /// Empty by default: `src/test/java` is opted into, not assumed.
     pub source_dirs: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the test source roots are compiled.
+    ///
+    /// The build roots keep [`Build::include`]'s selection under a test run; these patterns apply
+    /// only to the roots [`source_dirs`](Test::source_dirs) adds. Empty means every test source.
+    pub include: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the test source roots are skipped.
+    ///
+    /// Same grammar and address as [`include`](Test::include), with exclude winning. A test file
+    /// in a build root is governed by [`Build::exclude`], not this list.
+    pub exclude: Vec<String>,
     /// Output directory for a test run's `.class` files. Defaults to `"target/test-classes"`.
     pub classes_dir: String,
 }
@@ -1910,6 +1936,8 @@ impl Default for Test {
     fn default() -> Self {
         Self {
             source_dirs: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             classes_dir: DEFAULT_TEST_CLASSES_DIR.to_owned(),
         }
     }
@@ -2121,6 +2149,124 @@ impl ResourcePattern {
     }
 }
 
+/// The parsed form of `[build] include`/`exclude` (or `[test]`'s pair).
+///
+/// One vocabulary for both tables: a pattern is matched against the file's path *below* the
+/// source root it was found under, and an excluded file loses to nothing. Empty include means
+/// every source, so a project that only wants to drop `module-info.java` writes one `exclude`
+/// entry and nothing else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceFilter {
+    include: Vec<ResourcePattern>,
+    exclude: Vec<ResourcePattern>,
+}
+
+impl SourceFilter {
+    /// Parse an include/exclude pair, naming which side failed.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] for the first malformed pattern.
+    pub fn new(include: &[String], exclude: &[String]) -> Result<Self, SourceFilterError> {
+        Ok(Self {
+            include: Self::parse_all(SourceFilterSide::Include, include)?,
+            exclude: Self::parse_all(SourceFilterSide::Exclude, exclude)?,
+        })
+    }
+
+    fn parse_all(
+        side: SourceFilterSide,
+        patterns: &[String],
+    ) -> Result<Vec<ResourcePattern>, SourceFilterError> {
+        patterns
+            .iter()
+            .map(|pattern| {
+                ResourcePattern::parse(pattern).map_err(|reason| SourceFilterError {
+                    side,
+                    pattern: pattern.clone(),
+                    reason,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a file at `path` (below its source root) is selected.
+    pub fn accepts(&self, path: &RelativePath) -> bool {
+        let included = self.include.is_empty() || self.include.iter().any(|p| p.matches(path));
+        included && !self.exclude.iter().any(|p| p.matches(path))
+    }
+
+    /// Whether this filter selects every path.
+    pub fn is_unfiltered(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+}
+
+/// Which list of a [`SourceFilter`] carried the malformed pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFilterSide {
+    /// `include`.
+    Include,
+    /// `exclude`.
+    Exclude,
+}
+
+impl fmt::Display for SourceFilterSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Include => f.write_str("include"),
+            Self::Exclude => f.write_str("exclude"),
+        }
+    }
+}
+
+/// A malformed `[build]`/`[test]` source-filter glob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFilterError {
+    /// Which list the pattern came from.
+    pub side: SourceFilterSide,
+    /// The offending pattern, as written.
+    pub pattern: String,
+    /// Why the glob grammar rejected it.
+    pub reason: ResourcePatternError,
+}
+
+impl fmt::Display for SourceFilterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` entry `{}` is not a glob: {}",
+            self.side, self.pattern, self.reason
+        )
+    }
+}
+
+impl core::error::Error for SourceFilterError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+impl Build {
+    /// Parse this table's source filter.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] when a pattern is malformed; [`Manifest::validate`] already rejects
+    /// that, so a validated manifest never fails here.
+    pub fn source_filter(&self) -> Result<SourceFilter, SourceFilterError> {
+        SourceFilter::new(&self.include, &self.exclude)
+    }
+}
+
+impl Test {
+    /// Parse the filter that applies to the roots [`Test::source_dirs`] adds.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] when a pattern is malformed.
+    pub fn source_filter(&self) -> Result<SourceFilter, SourceFilterError> {
+        SourceFilter::new(&self.include, &self.exclude)
+    }
+}
+
 /// The `[build] remap` step: which mapping set reobfuscates the compiled output, and where the jar
 /// goes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2301,6 +2447,8 @@ impl Default for Build {
             source: None,
             target: None,
             classpath: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             javac_flags: Vec::new(),
             native_packages: Vec::new(),
             remap: None,
@@ -2734,6 +2882,26 @@ impl Manifest {
                     reason,
                 }
             })?;
+        }
+
+        // Source filters share the resource glob grammar but not its "a pattern must match"
+        // policy: sources appear and disappear as a project grows, so only syntax is checked.
+        for (table, include, exclude) in [
+            ("build", &self.build.include, &self.build.exclude),
+            ("test", &self.test.include, &self.test.exclude),
+        ] {
+            for (key, patterns) in [("include", include), ("exclude", exclude)] {
+                for pattern in patterns {
+                    ResourcePattern::parse(pattern).map_err(|reason| {
+                        ValidationError::InvalidSourcePattern {
+                            table,
+                            key,
+                            pattern: pattern.clone(),
+                            reason,
+                        }
+                    })?;
+                }
+            }
         }
 
         if let Some(BuildScript::Java { file }) = &self.build.script {
@@ -3367,6 +3535,17 @@ pub enum ValidationError {
         /// Which rule it broke.
         reason: ResourcePatternError,
     },
+    /// A `[build]` or `[test]` source-filter entry is not a well-formed glob.
+    InvalidSourcePattern {
+        /// Which table carried it (`build` / `test`).
+        table: &'static str,
+        /// Which list carried it (`include` / `exclude`).
+        key: &'static str,
+        /// The malformed glob.
+        pattern: String,
+        /// Which rule it broke.
+        reason: ResourcePatternError,
+    },
     /// A `[build] script.file` is not a non-root portable project file path.
     InvalidBuildScriptFile {
         /// The invalid script file value.
@@ -3619,6 +3798,12 @@ impl fmt::Display for ValidationError {
                 f,
                 "invalid `[build.resources] template` entry `{pattern}`: {reason}"
             ),
+            Self::InvalidSourcePattern {
+                table,
+                key,
+                pattern,
+                reason,
+            } => write!(f, "invalid `[{table}] {key}` entry `{pattern}`: {reason}"),
             Self::InvalidBuildScriptFile { file } => write!(
                 f,
                 "invalid `[build] script.file` `{file}`: expected a non-root portable file path"
@@ -3792,6 +3977,7 @@ impl Error for ValidationError {
             Self::Dependency(err) => Some(err),
             Self::Mapping(err) => Some(err),
             Self::InvalidFeatureRef { reason, .. } => Some(reason),
+            Self::InvalidSourcePattern { reason, .. } => Some(reason),
             Self::InvalidWorkspacePattern {
                 reason: Some(reason),
                 ..
@@ -6318,5 +6504,51 @@ mod tests {
             in_managed.validate(),
             Err(ValidationError::RemapOutputInManagedRoot { .. })
         ));
+    }
+
+    #[test]
+    fn source_filters_use_the_resource_glob_grammar_and_exclude_wins() {
+        let manifest: Manifest = toml::from_str(
+            "[build]\ninclude = [\"com/example/**\"]\nexclude = [\"**/module-info.java\"]\n\
+             [test]\nexclude = [\"**/*IT.java\"]\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+
+        let build = manifest.build.source_filter().unwrap();
+        let selected = RelativePath::parse("com/example/Main.java").unwrap();
+        let excluded = RelativePath::parse("com/example/module-info.java").unwrap();
+        let outside = RelativePath::parse("org/other/Main.java").unwrap();
+        assert!(build.accepts(&selected));
+        assert!(!build.accepts(&excluded));
+        assert!(!build.accepts(&outside));
+
+        let test = manifest.test.source_filter().unwrap();
+        assert!(!test.accepts(&RelativePath::parse("com/example/MainIT.java").unwrap()));
+        assert!(test.accepts(&RelativePath::parse("com/example/Main.java").unwrap()));
+    }
+
+    #[test]
+    fn an_empty_include_selects_every_source_and_a_malformed_entry_is_rejected() {
+        let manifest: Manifest =
+            toml::from_str("[build]\nexclude = [\"module-info.java\"]\n").unwrap();
+        assert!(
+            manifest
+                .build
+                .source_filter()
+                .unwrap()
+                .accepts(&RelativePath::parse("com/example/Main.java").unwrap())
+        );
+
+        let invalid: Manifest = toml::from_str("[test]\ninclude = [\"**bad\"]\n").unwrap();
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::InvalidSourcePattern {
+                table: "test",
+                key: "include",
+                pattern: "**bad".to_owned(),
+                reason: ResourcePatternError::MalformedAnyDepth,
+            })
+        );
     }
 }

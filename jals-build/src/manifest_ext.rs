@@ -7,11 +7,13 @@
 //! (`std::fs` reads); `jals-cli`/`jals-lsp` consume it. Dependency classification is portable and
 //! lives in `jals-classpath`'s input plan.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use jals_config::{Manifest, ManifestParseError, ValidationError};
+use jals_config::{Manifest, ManifestParseError, SourceFilter, ValidationError};
+use jals_storage::{DirKey, RelativePath};
 
 /// An error loading, parsing, or validating a manifest file from disk.
 ///
@@ -103,6 +105,14 @@ pub trait ManifestExt {
     /// lives: the main tree is where most tests are, and a separate test tree is the Java
     /// convention layered on top of that, never instead of it.
     fn test_source_roots(&self, manifest_dir: &Path) -> Vec<PathBuf>;
+
+    /// Per-root source selection for the editor index.
+    ///
+    /// Build roots carry [`Build::include`](jals_config::Build::include)'s filter; the roots
+    /// [`Test::source_dirs`](jals_config::Test::source_dirs) adds carry `[test]`'s. A root that
+    /// cannot be spelled as a portable [`DirKey`] is simply absent, which means "select every
+    /// file" — the editor must not lose a source root just because a filter cannot address it.
+    fn source_filters(&self) -> BTreeMap<DirKey, SourceFilter>;
 }
 
 impl ManifestExt for Manifest {
@@ -160,6 +170,31 @@ impl ManifestExt for Manifest {
             }
         }
         roots
+    }
+
+    fn source_filters(&self) -> BTreeMap<DirKey, SourceFilter> {
+        let build = self
+            .build
+            .source_filter()
+            .expect("Manifest::validate rejected an invalid source filter");
+        let test = self
+            .test
+            .source_filter()
+            .expect("Manifest::validate rejected an invalid source filter");
+        let mut filters = BTreeMap::new();
+        for dir in &self.build.source_dirs {
+            if let Ok(path) = RelativePath::resolve(&RelativePath::ROOT, dir) {
+                filters.insert(DirKey::new(path), build.clone());
+            }
+        }
+        for dir in &self.test.source_dirs {
+            if let Ok(path) = RelativePath::resolve(&RelativePath::ROOT, dir) {
+                filters
+                    .entry(DirKey::new(path))
+                    .or_insert_with(|| test.clone());
+            }
+        }
+        filters
     }
 }
 
