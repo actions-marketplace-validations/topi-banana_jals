@@ -3342,7 +3342,7 @@ impl App {
                 .cloned()
                 .collect();
             let split = jals_exec::tokio_rt::on_blocking_pool(move || {
-                jals_classpath::split_packages(&jars)
+                jals_classpath::NativeProjectPlan::split_packages(&jars)
             })
             .await;
             for (package, jars) in split {

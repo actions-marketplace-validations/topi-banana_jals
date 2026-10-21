@@ -217,8 +217,10 @@ fn split_packages_lists_every_jar_that_declares_one_package() {
     write("a.jar", &["com/example/A.class", "com/example/B.class"]);
     write("b.jar", &["com/example/C.class", "org/other/D.class"]);
 
-    let split =
-        jals_classpath::split_packages(&[dir.path().join("a.jar"), dir.path().join("b.jar")]);
+    let split = jals_classpath::NativeProjectPlan::split_packages(&[
+        dir.path().join("a.jar"),
+        dir.path().join("b.jar"),
+    ]);
     assert_eq!(split.len(), 1);
     let jars = split.get("com.example").expect("the shared package");
     assert_eq!(jars.len(), 2);

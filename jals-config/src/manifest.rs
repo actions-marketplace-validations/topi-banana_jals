@@ -2304,20 +2304,6 @@ impl Test {
     }
 }
 
-/// The prefix and suffix of a `[build] module-path` dependency reference.
-const MODULE_PATH_DEPENDENCY_PREFIX: &str = "${dependency.";
-const MODULE_PATH_DEPENDENCY_SUFFIX: char = '}';
-
-/// The dependency name a `[build] module-path` entry references, when it is a reference.
-///
-/// `Some("guava")` for `${dependency.guava}`, `None` for a literal path. A malformed reference
-/// (anything else that opens with `${`) is reported by [`Build::module_path_entries`].
-fn module_path_dependency(entry: &str) -> Option<&str> {
-    entry
-        .strip_prefix(MODULE_PATH_DEPENDENCY_PREFIX)?
-        .strip_suffix(MODULE_PATH_DEPENDENCY_SUFFIX)
-}
-
 impl Build {
     /// Classify every `[build] module-path` entry as a literal path or a dependency reference.
     ///
@@ -2325,13 +2311,18 @@ impl Build {
     /// [`ModulePathError`] for a malformed or empty entry. [`Manifest::validate`] rejects the
     /// same shapes, so a validated manifest never fails here.
     pub fn module_path_entries(&self) -> Result<Vec<ModulePathEntry<'_>>, ModulePathError> {
+        const PREFIX: &str = "${dependency.";
+        const SUFFIX: char = '}';
+        fn dependency_name(entry: &str) -> Option<&str> {
+            entry.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)
+        }
         self.module_path
             .iter()
             .map(|entry| {
                 if entry.is_empty() {
                     return Err(ModulePathError::Empty);
                 }
-                if let Some(name) = module_path_dependency(entry) {
+                if let Some(name) = dependency_name(entry) {
                     if name.is_empty() || name.contains('.') || name.contains('/') {
                         return Err(ModulePathError::Malformed(entry.clone()));
                     }
