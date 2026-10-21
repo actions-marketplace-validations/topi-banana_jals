@@ -1922,12 +1922,12 @@ pub struct Test {
     ///
     /// The build roots keep [`Build::include`]'s selection under a test run; these patterns apply
     /// only to the roots [`source_dirs`](Test::source_dirs) adds. Empty means every test source.
-    pub include: Vec<String>,
+    pub(crate) include: Vec<String>,
     /// Glob patterns selecting which `.java` files under the test source roots are skipped.
     ///
     /// Same grammar and address as [`include`](Test::include), with exclude winning. A test file
     /// in a build root is governed by [`Build::exclude`], not this list.
-    pub exclude: Vec<String>,
+    pub(crate) exclude: Vec<String>,
     /// Output directory for a test run's `.class` files. Defaults to `"target/test-classes"`.
     pub classes_dir: String,
 }
@@ -2194,11 +2194,6 @@ impl SourceFilter {
         let included = self.include.is_empty() || self.include.iter().any(|p| p.matches(path));
         included && !self.exclude.iter().any(|p| p.matches(path))
     }
-
-    /// Whether this filter selects every path.
-    pub const fn is_unfiltered(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
-    }
 }
 
 /// Which list of a [`SourceFilter`] carried the malformed pattern.
@@ -2223,11 +2218,11 @@ impl fmt::Display for SourceFilterSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFilterError {
     /// Which list the pattern came from.
-    pub side: SourceFilterSide,
+    pub(crate) side: SourceFilterSide,
     /// The offending pattern, as written.
-    pub pattern: String,
+    pub(crate) pattern: String,
     /// Why the glob grammar rejected it.
-    pub reason: ResourcePatternError,
+    pub(crate) reason: ResourcePatternError,
 }
 
 impl fmt::Display for SourceFilterError {
