@@ -397,7 +397,7 @@ release = 21                        # javac --release N
 # source-dirs = ["src/main/java"]   # -sourcepath のルート。.java 探索の対象でもある
 # exclude     = ["module-info.java"] # 各 source root 配下で除外する glob
 # classes-dir = "target/classes"    # javac -d
-# classpath   = ["libs/guava.jar"]  # -classpath エントリ
+# classpath   = ["libs/guava.jar"]  # -classpath エントリ（glob と jar 入りディレクトリを展開）
 # module-path = ["libs/modules"]    # --module-path エントリ
 # modular     = "auto"              # module-info.java があれば解決済み依存を --module-path に載せる
 # script = { type = "java", file = "build.java" }

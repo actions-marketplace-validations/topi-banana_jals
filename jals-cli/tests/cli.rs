@@ -571,6 +571,28 @@ fn module_info_with_classpath_mode_points_at_the_module_path_setting() {
 }
 
 #[test]
+fn build_classpath_globs_expand_into_deterministic_javac_arguments() {
+    let dir = project("[package]\nname = \"globs\"\n[build]\nclasspath = [\"libs/*.jar\"]\n");
+    std::fs::create_dir_all(dir.path().join("libs")).unwrap();
+    std::fs::write(dir.path().join("libs/b.jar"), b"b").unwrap();
+    std::fs::write(dir.path().join("libs/a.jar"), b"a").unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("libs/a.jar"), "got: {stdout}");
+    assert!(stdout.contains("libs/b.jar"), "got: {stdout}");
+    assert!(!stdout.contains("*.jar"), "got: {stdout}");
+    let a = stdout.find("libs/a.jar").unwrap();
+    let b = stdout.find("libs/b.jar").unwrap();
+    assert!(a < b, "glob expansion must be sorted; got: {stdout}");
+}
+
+#[test]
 fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
     let dir = tempdir().unwrap();
     std::fs::write(

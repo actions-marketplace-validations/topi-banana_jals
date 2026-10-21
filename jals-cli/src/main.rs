@@ -3288,6 +3288,10 @@ impl App {
             session,
         )
         .await?;
+        // A `[build] classpath` glob is a host filesystem question, so it is resolved here, once,
+        // before invocation planning. The native plan expands again for hosts that reach it
+        // directly (the LSP); expanded entries fall through unchanged.
+        jals_classpath::expand_build_classpath(manifest, root);
         let sources = Self::discover_sources(
             manifest,
             root,
@@ -3323,6 +3327,7 @@ impl App {
                 }
             }
         }
+        manifest.build.module_path = jals_classpath::expanded_module_path_entries(manifest, root);
         // The root build script's output is root project source, so it goes through the root
         // frontend alongside the authored files. Dependency-contributed sources, which land in
         // `extra_sources` further down, deliberately do not: a dependency is lowered under its

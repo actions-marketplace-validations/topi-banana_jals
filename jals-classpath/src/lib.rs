@@ -54,7 +54,8 @@ pub use mapping_text::MappingText;
 #[cfg(feature = "native")]
 pub use native::{
     LockMode, NativeProjectPlan, RegistryGraphs, RegistryResolution, RegistryResolver,
-    ReqwestFetcher,
+    ReqwestFetcher, expand_build_classpath, expand_classpath_entry, expanded_classpath_entries,
+    expanded_module_path_entries,
 };
 #[cfg(feature = "archive")]
 pub use project::{

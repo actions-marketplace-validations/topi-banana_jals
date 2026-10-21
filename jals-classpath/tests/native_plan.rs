@@ -11,7 +11,7 @@ use jals_classpath::{
     ClasspathEntry, Fetcher, NativeProjectPlan, ProjectInputOptions, ProjectInputs, SourceFile,
 };
 use jals_config::{DependencyScope, Manifest};
-use jals_storage::{CacheNamespace, DirKey, NativeScope, NativeStorage, RelativePath};
+use jals_storage::{CacheNamespace, DirKey, FileKey, NativeScope, NativeStorage, RelativePath};
 
 /// The build features a test project resolves with nothing selected — its own `[features] default`
 /// closure. Every one of these fixtures declares no features, so this is the empty set; it exists so
@@ -285,6 +285,42 @@ fn classpath_only_path_dependency_lowers_to_a_classpath_entry_not_sources() {
             == &NativeScope::extension(RelativePath::parse("lib/src/main/java").unwrap(), "java")),
         "{scopes:?}"
     );
+}
+
+#[test]
+fn classpath_globs_and_jar_directories_expand_deterministically() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("libs")).unwrap();
+    fs::write(project.path().join("libs/b.jar"), b"b").unwrap();
+    fs::write(project.path().join("libs/a.jar"), b"a").unwrap();
+    fs::write(project.path().join("libs/readme.txt"), b"x").unwrap();
+
+    for spelling in ["libs/*.jar", "libs"] {
+        let manifest = manifest(&format!("[build]\nclasspath = [\"{spelling}\"]\n"));
+        let root = project.path().to_path_buf();
+        let plan = jals_exec::tokio_rt::run(|exec| async move {
+            let storage = NativeStorage::native(&root, root.join("target/jals/cache"), exec)
+                .await
+                .unwrap();
+            NativeProjectPlan::from_manifest(
+                &manifest,
+                DependencyScope::Build,
+                &features(&manifest),
+                &root,
+                &storage.view(),
+            )
+        })
+        .expect("test runtime bootstraps");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            plan.plan.classpath,
+            [
+                ClasspathEntry::ProjectFile(FileKey::parse("libs/a.jar").unwrap()),
+                ClasspathEntry::ProjectFile(FileKey::parse("libs/b.jar").unwrap()),
+            ],
+            "{spelling}"
+        );
+    }
 }
 
 #[test]

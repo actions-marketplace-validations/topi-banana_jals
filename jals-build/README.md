@@ -115,7 +115,7 @@ classes-dir = "target/classes"    # javac -d
 release = 21                       # javac --release N
 # source = 17                      # javac --source N  (only when release is unset)
 # target = 17                      # javac --target N  (only when release is unset)
-classpath = ["libs/guava.jar"]    # -classpath entries (jars or dirs)
+classpath = ["libs/guava.jar"]    # -classpath entries (jars/dirs/globs; `libs` expands its jars)
 # module-path = ["libs/modules", "${dependency.guava}"]  # javac --module-path entries
 # modular = "auto"                # "classpath" (default) | "auto" | "module-path"
 javac-flags = ["-Xlint:all"]      # appended verbatim, before the source files (cwd = project root)
@@ -231,7 +231,7 @@ nothing still leaves every dependency script cached.
 | `release`       | integer          | —                        | `--release N` — sets source level, target level, and bootclasspath together; when present, `source`/`target` are ignored                                        |
 | `source`        | integer          | —                        | `--source N` — only when `release` is unset                                                                                                                     |
 | `target`        | integer          | —                        | `--target N` — only when `release` is unset                                                                                                                     |
-| `classpath`     | array of strings | `[]`                     | `-classpath` (joined with the platform separator); omitted entirely when empty                                                                                  |
+| `classpath`     | array of strings | `[]`                     | `-classpath` (joined with the platform separator); omitted entirely when empty. Entries may be globs (`libs/*.jar`, `libs/**/*.jar`), and a directory containing jars expands to them in sorted order |
 | `module-path`   | array of strings | `[]`                     | `--module-path` entries. A literal path resolves against the project root; `${dependency.<name>}` names a resolved dependency jar, because a fetched jar has no manifest-relative spelling |
 | `modular`       | string           | `"classpath"`            | `"classpath"` keeps everything on the classpath; `"auto"` switches to the module path when a compiled `module-info.java` is present; `"module-path"` always does |
 | `javac-flags`   | array of strings | `[]`                     | appended **verbatim** after the generated flags, before the source files — an escape hatch for anything the manifest does not model yet. `javac` runs with the project root as its working directory, so a relative path written here resolves against that root |
