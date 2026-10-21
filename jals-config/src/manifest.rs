@@ -2196,7 +2196,7 @@ impl SourceFilter {
     }
 
     /// Whether this filter selects every path.
-    pub fn is_unfiltered(&self) -> bool {
+    pub const fn is_unfiltered(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
     }
 }
@@ -3972,10 +3972,13 @@ impl fmt::Display for ValidationError {
 }
 
 impl Error for ValidationError {
+    #[allow(clippy::match_same_arms)]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Dependency(err) => Some(err),
             Self::Mapping(err) => Some(err),
+            // Same body, different error types; combining the patterns would ask one binding to
+            // have two types.
             Self::InvalidFeatureRef { reason, .. } => Some(reason),
             Self::InvalidSourcePattern { reason, .. } => Some(reason),
             Self::InvalidWorkspacePattern {
