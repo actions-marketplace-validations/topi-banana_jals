@@ -725,6 +725,64 @@ impl ReqwestFetcher {
     }
 }
 
+/// The packages a jar carries, for JPMS split-package diagnostics.
+///
+/// A jar's module name is not read here: an automatic module derives it from the file name, and
+/// the question this answers is only "do two entries on the module path declare the same package".
+/// `META-INF/` is skipped on purpose — a multi-release jar repeats the same package under
+/// `META-INF/versions/<n>/`, which is one module, not a split.
+///
+/// # Errors
+/// The jar cannot be read or is not a well-formed zip archive.
+pub fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "module-path jar `{}` cannot be read: {error}",
+            path.display()
+        )
+    })?;
+    let mut cursor = jals_storage::io::Cursor::new(bytes);
+    let directory = jals_exec::block_on_inline(crate::zip::CentralDirectory::parse(&mut cursor))?;
+    let mut packages: Vec<String> = directory
+        .members
+        .iter()
+        .filter_map(|member| {
+            if member.is_dir
+                || member.name.starts_with("META-INF/")
+                || !member.name.ends_with(".class")
+            {
+                return None;
+            }
+            let (package, _) = member.name.rsplit_once('/')?;
+            // `module-info.class` has no `/` and is answered by `rsplit_once` above; a class in
+            // the unnamed package is not a package a module can export either.
+            (!package.is_empty()).then(|| package.replace('/', "."))
+        })
+        .collect();
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
+}
+
+/// Packages declared by more than one jar, each with the jars that declare it.
+///
+/// JPMS refuses a module path where two modules export the same package. The list is sorted by
+/// package name and each jar list keeps the input order, so a diagnostic built from it is stable.
+pub fn split_packages(jars: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for jar in jars {
+        let Ok(packages) = jar_packages(jar) else {
+            continue;
+        };
+        let name = jar.display().to_string();
+        for package in packages {
+            owners.entry(package).or_default().push(name.clone());
+        }
+    }
+    owners.retain(|_, jars| jars.len() > 1);
+    owners
+}
+
 /// Native lowering of a manifest into the portable classpath plan. Host paths stop here.
 #[derive(Debug)]
 pub struct NativeProjectPlan {

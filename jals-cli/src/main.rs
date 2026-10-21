@@ -3325,6 +3325,33 @@ impl App {
                 .extend(inputs.extra_classpath.iter().cloned());
         }
         inputs.deduplicate(manifest, root, &sources);
+        if uses_module_path {
+            // JPMS refuses two modules that export one package. Reading the jars here is the only
+            // point where the module path is already materialized; javac would otherwise be the
+            // first to say so, in a message that names the package but not the two jars.
+            let jars: Vec<PathBuf> = inputs
+                .extra_module_path
+                .iter()
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+                })
+                .cloned()
+                .collect();
+            let split = jals_exec::tokio_rt::on_blocking_pool(move || {
+                jals_classpath::split_packages(&jars)
+            })
+            .await;
+            for (package, jars) in split {
+                session.shell().warn(format_args!(
+                    "split package `{package}` is declared by more than one module-path jar: {}",
+                    jars.join(", ")
+                ));
+            }
+        }
         // Deduplication compares against the *authored* paths, so it must happen before lowering
         // replaces them with staged ones.
         // A build script may register a file that is *also* an authored source (`add_source` on
