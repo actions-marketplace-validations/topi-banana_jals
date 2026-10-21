@@ -747,10 +747,11 @@ pub fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
         .members
         .iter()
         .filter_map(|member| {
-            if member.is_dir
-                || member.name.starts_with("META-INF/")
-                || !member.name.ends_with(".class")
-            {
+            if member.is_dir || member.name.starts_with("META-INF/") {
+                return None;
+            }
+            let extension = Path::new(&member.name).extension()?;
+            if !extension.eq_ignore_ascii_case("class") {
                 return None;
             }
             let (package, _) = member.name.rsplit_once('/')?;
