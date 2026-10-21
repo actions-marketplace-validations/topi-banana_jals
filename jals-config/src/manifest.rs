@@ -376,6 +376,16 @@ impl Workspace {
     /// exist. A member's own value always wins, except for list-valued options, where the
     /// workspace entries are prepended and the member's keep their order after them.
     fn inherit_into(&self, manifest: &mut Manifest) {
+        fn prepend(values: &mut Vec<String>, defaults: &[String]) {
+            let mut merged: Vec<String> = defaults
+                .iter()
+                .filter(|entry| !values.contains(entry))
+                .cloned()
+                .collect();
+            merged.append(values);
+            *values = merged;
+        }
+
         if manifest.package.version.is_none() {
             manifest.package.version.clone_from(&self.package.version);
         }
@@ -454,17 +464,6 @@ impl Workspace {
         }
         Ok(())
     }
-}
-
-/// Prepend `defaults` to `values`, skipping ones already present.
-fn prepend(values: &mut Vec<String>, defaults: &[String]) {
-    let mut merged: Vec<String> = defaults
-        .iter()
-        .filter(|entry| !values.contains(entry))
-        .cloned()
-        .collect();
-    merged.append(values);
-    *values = merged;
 }
 
 /// The `jar` form of a [`Dependency`]: a compiled `.jar` and its optional companion `sources` jar.
