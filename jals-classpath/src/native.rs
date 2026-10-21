@@ -734,7 +734,7 @@ impl ReqwestFetcher {
 ///
 /// # Errors
 /// The jar cannot be read or is not a well-formed zip archive.
-pub(crate) fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
+fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
     let bytes = std::fs::read(path).map_err(|error| {
         format!(
             "module-path jar `{}` cannot be read: {error}",

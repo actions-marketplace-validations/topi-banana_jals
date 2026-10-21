@@ -2312,7 +2312,7 @@ const MODULE_PATH_DEPENDENCY_SUFFIX: char = '}';
 ///
 /// `Some("guava")` for `${dependency.guava}`, `None` for a literal path. A malformed reference
 /// (anything else that opens with `${`) is reported by [`Build::module_path_entries`].
-pub fn module_path_dependency(entry: &str) -> Option<&str> {
+fn module_path_dependency(entry: &str) -> Option<&str> {
     entry
         .strip_prefix(MODULE_PATH_DEPENDENCY_PREFIX)?
         .strip_suffix(MODULE_PATH_DEPENDENCY_SUFFIX)

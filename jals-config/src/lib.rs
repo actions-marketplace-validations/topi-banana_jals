@@ -47,7 +47,7 @@ pub use manifest::{
     MappingSource, ModularMode, ModulePathEntry, ModulePathError, Package, PathDependency,
     Registry, RegistryDependency, RemapSite, ResolvedBuildFeatures, ResourcePattern,
     ResourcePatternError, Run, SourceFilter, SourceFilterError, UrlMappings, ValidationError,
-    Workspace, module_path_dependency,
+    Workspace,
 };
 pub use resolution::ResolveLowerError;
 pub use toolchain::{Compiler, Distribution, MANAGED_TOOLCHAIN_ROOT, Runtime, ToolSpec, Toolchain};
