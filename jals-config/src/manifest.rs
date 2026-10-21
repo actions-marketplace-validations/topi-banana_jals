@@ -325,25 +325,25 @@ pub struct Workspace {
     pub default_members: Vec<String>,
     /// Values inherited by members that omit them (`[workspace.package]`).
     #[serde(default)]
-    pub(crate) package: WorkspacePackage,
+    package: WorkspacePackage,
     /// Dependency defaults by name (`[workspace.dependencies]`). A member's own entry of the same
     /// name wins; the rest are added verbatim.
     #[serde(default)]
-    pub(crate) dependencies: BTreeMap<String, Dependency>,
+    dependencies: BTreeMap<String, Dependency>,
     /// The same defaults for `[dev-dependencies]`.
     #[serde(default)]
-    pub(crate) dev_dependencies: BTreeMap<String, Dependency>,
+    dev_dependencies: BTreeMap<String, Dependency>,
     /// Build defaults members inherit (`[workspace.build]`).
     #[serde(default)]
-    pub(crate) build: WorkspaceBuild,
+    build: WorkspaceBuild,
 }
 
 /// `[workspace.package]`: the package values a member may omit.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) struct WorkspacePackage {
+struct WorkspacePackage {
     /// The version a member inherits when it declares none.
-    pub(crate) version: Option<String>,
+    version: Option<String>,
 }
 
 /// `[workspace.build]`: build defaults a member inherits.
@@ -353,19 +353,19 @@ pub(crate) struct WorkspacePackage {
 /// rewrite every member that never mentioned the key.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) struct WorkspaceBuild {
+struct WorkspaceBuild {
     /// `javac --release N` for members that declare none.
-    pub(crate) release: Option<u32>,
+    release: Option<u32>,
     /// `javac --source N` for members that declare neither `release` nor `source`.
-    pub(crate) source: Option<u32>,
+    source: Option<u32>,
     /// `javac --target N` for members that declare neither `release` nor `target`.
-    pub(crate) target: Option<u32>,
+    target: Option<u32>,
     /// Classpath entries prepended to every member's own list.
-    pub(crate) classpath: Vec<String>,
+    classpath: Vec<String>,
     /// Module-path entries prepended to every member's own list.
-    pub(crate) module_path: Vec<String>,
+    module_path: Vec<String>,
     /// `javac` flags prepended to every member's own list.
-    pub(crate) javac_flags: Vec<String>,
+    javac_flags: Vec<String>,
 }
 
 impl Workspace {
@@ -375,7 +375,7 @@ impl Workspace {
     /// `[features]` or `module-path`, and validating first would reject a name that is about to
     /// exist. A member's own value always wins, except for list-valued options, where the
     /// workspace entries are prepended and the member's keep their order after them.
-    pub(crate) fn inherit_into(&self, manifest: &mut Manifest) {
+    fn inherit_into(&self, manifest: &mut Manifest) {
         if manifest.package.version.is_none() {
             manifest.package.version.clone_from(&self.package.version);
         }
