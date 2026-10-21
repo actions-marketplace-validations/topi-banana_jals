@@ -1831,14 +1831,14 @@ pub struct Build {
     ///
     /// The filter is applied where sources are gathered, before the frontend lowering key is
     /// computed, so an excluded file is neither compiled nor able to affect the cache identity.
-    pub include: Vec<String>,
+    include: Vec<String>,
     /// Glob patterns selecting which `.java` files under the build source roots are skipped.
     ///
     /// Same grammar and address as [`include`](Build::include). Unlike
     /// [`[build.resources] template`](BuildResources::template), a pattern that matches nothing is
     /// not an error: the sources a project holds change, and a stale exclusion should not stop a
     /// build.
-    pub exclude: Vec<String>,
+    exclude: Vec<String>,
     /// Output directory for `.class` files (`javac -d`), relative to the manifest directory.
     /// Defaults to `"target/classes"`.
     pub classes_dir: String,
@@ -1922,12 +1922,12 @@ pub struct Test {
     ///
     /// The build roots keep [`Build::include`]'s selection under a test run; these patterns apply
     /// only to the roots [`source_dirs`](Test::source_dirs) adds. Empty means every test source.
-    pub(crate) include: Vec<String>,
+    include: Vec<String>,
     /// Glob patterns selecting which `.java` files under the test source roots are skipped.
     ///
     /// Same grammar and address as [`include`](Test::include), with exclude winning. A test file
     /// in a build root is governed by [`Build::exclude`], not this list.
-    pub(crate) exclude: Vec<String>,
+    exclude: Vec<String>,
     /// Output directory for a test run's `.class` files. Defaults to `"target/test-classes"`.
     pub classes_dir: String,
 }
@@ -2218,11 +2218,11 @@ impl fmt::Display for SourceFilterSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFilterError {
     /// Which list the pattern came from.
-    pub(crate) side: SourceFilterSide,
+    side: SourceFilterSide,
     /// The offending pattern, as written.
-    pub(crate) pattern: String,
+    pattern: String,
     /// Why the glob grammar rejected it.
-    pub(crate) reason: ResourcePatternError,
+    reason: ResourcePatternError,
 }
 
 impl fmt::Display for SourceFilterError {
