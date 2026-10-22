@@ -273,6 +273,12 @@ impl<H: GraphHost> GraphWalk<'_, H> {
                             .await;
                         continue;
                     }
+                    Dependency::Path(path) if path.is_classpath() => {
+                        // Consumed as compiled classes. The root plan lowers it directly into
+                        // the classpath; a dependency's own plan appends it in
+                        // `capture_manifest_classpath`. There is no project graph below it.
+                        continue;
+                    }
                     Dependency::Path(path) => self.host.acquire_path(declaring, path).await,
                     Dependency::Git(git) => self.host.acquire_git(declaring, name, git).await,
                     // A precompiled module is a leaf like a jar: it has no project of its own to
@@ -712,8 +718,17 @@ impl<H: GraphHost> GraphWalk<'_, H> {
         location: &str,
         manifest: &Manifest,
     ) -> Vec<CapturedClasspathEntry> {
+        let mut declared_entries = manifest.build.classpath.clone();
+        // Classpath-only `path` dependencies are classpath entries with a different spelling.
+        // Their root plan never becomes a node, so this is where a dependency's own consumers
+        // learn about them.
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                declared_entries.push(path.classpath_path());
+            }
+        }
         let mut entries = Vec::new();
-        for (index, entry) in manifest.build.classpath.iter().enumerate() {
+        for (index, entry) in declared_entries.iter().enumerate() {
             let mut notes = Vec::new();
             let resolved = self
                 .host

@@ -879,6 +879,8 @@ app   = { jar = "libs/app-all.jar", recursive = true }
 # Source directly from a git repo (pin with branch/tag/rev), or a local checkout:
 mylib = { git = "https://github.com/owner/mylib", tag = "v1.2" }
 local = { path = "../sibling-lib" }
+# Consume already-compiled classes (a provided/binary stub) instead of its sources:
+stub  = { path = "../varhandle-stub", dir = "target/classes", mode = "classpath" }
 # A monorepo dependency selects the project root whose exact jals.toml should be probed:
 core  = { git = "https://github.com/owner/mono", rev = "abc123", dir = "core" }
 # Enable build features in the dependency itself, and skip its own `default` list:
@@ -917,7 +919,10 @@ reflected in the artifact file name; a non-jar artifact is fetched and locked bu
 classpath.
 
 A **`git`** / **`path`** dependency selects a source-project root: the declared path or Git checkout,
-followed by `dir` when present. `jals-project` probes only `<selected-root>/jals.toml`; it never
+followed by `dir` when present. Set `mode = "classpath"` to consume the dependency's compiled
+output instead: `dir` then names the classes directory or jar (relative to `path`) and the sources
+are never read, which is what a `provided`/binary stub needs when its classes must not shadow the
+real module. A `path` dependency's default is `mode = "source"`. `jals-project` probes only `<selected-root>/jals.toml`; it never
 searches upward. An exact manifest makes the node a JALS project, so its own dependencies are
 discovered transitively and its `[build] source-dirs`, `[build] classpath`, JAR locators, and child
 path/Git locators resolve relative to that selected root. A missing manifest keeps the legacy source

@@ -2853,6 +2853,20 @@ impl App {
     ) -> Result<HostProjectInputs> {
         let shell = session.shell();
         let mut result = HostProjectInputs::from(script.host);
+        // Classpath-only `path` dependencies are host paths the compiler needs. The plans lower
+        // them for analysis (a project key or a published artifact), but a compile consumes the
+        // directory/jar itself, exactly as it does an authored `[build] classpath` entry.
+        for (_, dependency) in manifest.active_dependencies(scope, scripts.features) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                let entry = Path::new(&entry);
+                result.extra_classpath.push(if entry.is_absolute() {
+                    entry.to_path_buf()
+                } else {
+                    root.join(entry)
+                });
+            }
+        }
         let exec = storage.exec().clone();
         // The graph's own work is attributed per node, inside the graph: a dependency's script and
         // task plan belong to that dependency, not to whoever is building it.

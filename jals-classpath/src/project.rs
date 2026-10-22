@@ -502,12 +502,12 @@ impl MemoryProjectPlan {
 
     /// Lower `manifest`'s source roots and `[build] classpath` against one immutable view.
     ///
-    /// `[dependencies]` are deliberately *not* lowered, and this is the only place that decides so:
-    /// a caller assembling a dependency graph projects each declared dependency as a graph node, so
-    /// lowering them here as well would resolve every jar twice and double-count it on the classpath.
-    /// Anything added here that reads `manifest.dependencies` breaks callers that hand over the
-    /// manifest whole, which is all of them — `declared_dependencies_are_left_to_the_graph` is what
-    /// holds the line.
+    /// Non-classpath `[dependencies]` are deliberately *not* lowered, and this is the only place
+    /// that decides so: a caller assembling a dependency graph projects each declared dependency as
+    /// a graph node, so lowering them here as well would resolve every jar twice and double-count it
+    /// on the classpath. Classpath-only `path` entries are the exception: the walk skips them (they
+    /// have no project to lower), so this lowering is their only route to the plan.
+    /// `declared_dependencies_are_left_to_the_graph` holds the line for the rest.
     fn from_manifest(manifest: &Manifest, view: &ProjectView) -> Self {
         let mut result = Self {
             plan: ProjectInputPlan {
@@ -541,7 +541,16 @@ impl MemoryProjectPlan {
                 Err(message) => result.warn_path(source, message),
             }
         }
-        for classpath in &manifest.build.classpath {
+        let mut classpath_entries = manifest.build.classpath.clone();
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                if !classpath_entries.contains(&entry) {
+                    classpath_entries.push(entry);
+                }
+            }
+        }
+        for classpath in &classpath_entries {
             let path = match Self::project_relative(classpath) {
                 Ok(path) => path,
                 Err(message) => {
@@ -570,7 +579,6 @@ impl MemoryProjectPlan {
                 ),
             }
         }
-
         // Registry entries need a network-capable host: the in-memory assembly has one address
         // space and no fetcher, so it can report the entry but cannot resolve it. Saying so is
         // what keeps the browser playground's classpath honest rather than silently short. Only
@@ -763,9 +771,16 @@ mod tests {
     /// its root manifest over with `[dependencies]` still in place, on the strength of this.
     #[test]
     fn declared_dependencies_are_left_to_the_graph() {
-        let storage = MemoryStorage::memory(CodeTree::default());
+        let storage = MemoryStorage::memory(
+            CodeTree::new([Entry::File(
+                FileKey::parse("deps/stub/classes/Stub.class").expect("portable key"),
+                class_bytes().to_vec(),
+            )])
+            .expect("tree is valid"),
+        );
         let manifest: Manifest = "[dependencies]\nlib = { jar = \"vendor/lib.jar\" }\n\
-             child = { path = \"deps/child\" }\n"
+             child = { path = \"deps/child\" }\n\
+             stub = { path = \"deps/stub\", dir = \"classes\", mode = \"classpath\" }\n"
             .parse()
             .expect("manifest parses");
 
@@ -775,6 +790,14 @@ mod tests {
             lowered.plan.dependencies.is_empty(),
             "{:?}",
             lowered.plan.dependencies
+        );
+        // A classpath-only path entry is the one dependency form lowered here: the graph walk
+        // deliberately creates no node for it, so nothing else would put it on the classpath.
+        assert_eq!(
+            lowered.plan.classpath,
+            [crate::ClasspathEntry::ProjectDirectory(
+                jals_storage::DirKey::parse("deps/stub/classes").unwrap()
+            )]
         );
         assert!(
             lowered.plan.source_archives.is_empty(),

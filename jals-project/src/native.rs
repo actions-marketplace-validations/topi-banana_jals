@@ -260,18 +260,26 @@ impl ProjectScript {
     /// **Registry entries are kept.** They are deliberately not graph nodes — a Maven package has
     /// no `.java` and no build script — so `assemble_native` is the one place they resolve, and
     /// dropping them here would silently remove every registry dependency from the classpath.
+    /// **Classpath-only `path` entries are kept too.** The walk skips them because they have no
+    /// project to lower; this lowering is the only place their compiled output reaches the plan.
     ///
     /// `[dev-dependencies]` is cleared for the same reason as the build table: an entry the walk
     /// did not visit contributes no node. Its registry entries are kept under the caller's scope,
     /// because a test run's plan is the only place they would be lowered.
     fn root_only(manifest: &Manifest) -> Manifest {
         let mut root_only = manifest.clone();
+        // A classpath-only `path` dependency is *not* a graph node: it has no sources to lower and
+        // is lowered straight into the plan's classpath. Keeping it here is what lets
+        // `assemble_native` see it; every other non-registry entry is the graph's.
+        let keep = |dependency: &jals_config::Dependency| {
+            dependency.registry_version().is_some() || dependency.classpath_only_path().is_some()
+        };
         root_only
             .dependencies
-            .retain(|_, dependency| dependency.registry_version().is_some());
+            .retain(|_, dependency| keep(dependency));
         root_only
             .dev_dependencies
-            .retain(|_, dependency| dependency.registry_version().is_some());
+            .retain(|_, dependency| keep(dependency));
         root_only
     }
 

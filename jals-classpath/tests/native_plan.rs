@@ -11,7 +11,7 @@ use jals_classpath::{
     ClasspathEntry, Fetcher, NativeProjectPlan, ProjectInputOptions, ProjectInputs, SourceFile,
 };
 use jals_config::{DependencyScope, Manifest};
-use jals_storage::{CacheNamespace, DirKey, NativeStorage};
+use jals_storage::{CacheNamespace, DirKey, NativeScope, NativeStorage, RelativePath};
 
 /// The build features a test project resolves with nothing selected — its own `[features] default`
 /// closure. Every one of these fixtures declares no features, so this is the empty set; it exists so
@@ -226,6 +226,65 @@ fn split_packages_lists_every_jar_that_declares_one_package() {
     assert_eq!(jars.len(), 2);
     assert!(jars[0].ends_with("a.jar"));
     assert!(jars[1].ends_with("b.jar"));
+}
+
+#[test]
+fn classpath_only_path_dependency_lowers_to_a_classpath_entry_not_sources() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("lib/classes/pkg")).unwrap();
+    fs::write(
+        project.path().join("lib/classes/pkg/Stub.class"),
+        b"\xca\xfe\xba\xbe",
+    )
+    .unwrap();
+    fs::create_dir_all(project.path().join("lib/src/main/java")).unwrap();
+    fs::write(
+        project.path().join("lib/src/main/java/Broken.java"),
+        b"class Broken {",
+    )
+    .unwrap();
+    let manifest = manifest(
+        "[dependencies]\nlib = { path = \"./lib\", dir = \"classes\", mode = \"classpath\" }\n",
+    );
+
+    let root = project.path().to_path_buf();
+    let closure_root = root.clone();
+    let closure_manifest = manifest.clone();
+    let plan = jals_exec::tokio_rt::run(|exec| async move {
+        let storage =
+            NativeStorage::native(&closure_root, closure_root.join("target/jals/cache"), exec)
+                .await
+                .unwrap();
+        NativeProjectPlan::from_manifest(
+            &closure_manifest,
+            DependencyScope::Build,
+            &features(&closure_manifest),
+            &closure_root,
+            &storage.view(),
+        )
+    })
+    .expect("test runtime bootstraps");
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(plan.plan.source_dependency_roots.len(), 0);
+    assert_eq!(
+        plan.plan.classpath,
+        [ClasspathEntry::ProjectDirectory(
+            DirKey::parse("lib/classes").unwrap()
+        )]
+    );
+    let scopes = NativeProjectPlan::snapshot_scopes(&manifest, &root);
+    assert!(
+        scopes.contains(&NativeScope::extension(
+            RelativePath::parse("lib/classes").unwrap(),
+            "class"
+        )),
+        "{scopes:?}"
+    );
+    assert!(
+        !scopes.iter().any(|scope| scope
+            == &NativeScope::extension(RelativePath::parse("lib/src/main/java").unwrap(), "java")),
+        "{scopes:?}"
+    );
 }
 
 #[test]

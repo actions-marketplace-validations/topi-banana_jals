@@ -513,6 +513,69 @@ fn module_info_with_classpath_mode_points_at_the_module_path_setting() {
 }
 
 #[test]
+fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"consumer\"\n\
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
+    )
+    .unwrap();
+    let src = dir.path().join("src/main/java/com/example");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Main.java"),
+        "package com.example;\nclass Main { }\n",
+    )
+    .unwrap();
+    let stub = dir.path().join("stub");
+    std::fs::create_dir_all(stub.join("classes")).unwrap();
+    std::fs::create_dir_all(stub.join("src/main/java")).unwrap();
+    std::fs::write(
+        stub.join("src/main/java/Broken.java"),
+        "class Broken { void m( {\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let stub_classes = dir
+        .path()
+        .join("stub")
+        .join("classes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(
+        stdout.replace('\\', "/").contains(&stub_classes),
+        "the stub's classes directory must be on the classpath: {stdout}"
+    );
+    assert!(!stdout.contains("Broken.java"), "got: {stdout}");
+
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"consumer\"\n\
+         [build]\nbackend = { type = \"jals\" }\n\
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(dir.path().join("jals.toml"))
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "a classpath-only dependency's sources must not be compiled"
+    );
+}
+
+#[test]
 fn build_excludes_matching_sources_before_javac() {
     let dir = project(
         "[package]\nname = \"excluded\"\n\

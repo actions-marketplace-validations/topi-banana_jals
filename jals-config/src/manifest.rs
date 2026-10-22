@@ -424,16 +424,22 @@ pub struct GitDependency {
     optional: Option<bool>,
 }
 
-/// The `path` form of a [`Dependency`]: a local directory tree of `.java` source.
+/// The `path` form of a [`Dependency`]: a local directory tree, consumed either as Java sources or
+/// as already-compiled classes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PathDependency {
-    /// A local directory tree of `.java` source, relative to the manifest directory. The sources are an
-    /// analysis + editor-navigation input only — never compiled.
+    /// A local directory tree, relative to the manifest directory. What is read out of it is
+    /// selected by [`mode`](PathDependency::mode).
     pub path: String,
-    /// The source root *within* the directory (e.g. `core/src/main/java`), for a non-standard layout;
-    /// omit to let the host auto-detect it (`src/main/java` → `src` → the root itself).
+    /// The root *within* the directory. In [`PathMode::Source`] this is the source root (e.g.
+    /// `core/src/main/java`); omit to let the host auto-detect it (`src/main/java` → `src` → the
+    /// root itself). In [`PathMode::Classpath`] it is the compiled-output directory or jar path
+    /// (e.g. `target/classes`); omit to use the dependency directory itself.
     pub dir: Option<String>,
+    /// How this dependency is consumed.
+    #[serde(default)]
+    mode: PathMode,
     /// The **build features** to enable in this dependency (Cargo's per-dependency `features`). See
     /// [`Dependency::features`] for the semantics, which are the same for both source forms.
     #[serde(default)]
@@ -445,6 +451,50 @@ pub struct PathDependency {
     /// Whether this entry is only present when a build feature activates it (Cargo's `optional`).
     /// See [`Dependency::is_optional`].
     optional: Option<bool>,
+}
+
+/// What a [`PathDependency`] contributes to its consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PathMode {
+    /// Build the dependency from its `.java` sources and lower them into the consumer's compile —
+    /// the historical behavior, and the default.
+    #[default]
+    Source,
+    /// Do **not** read its sources. Put its already-compiled classes (a directory or a jar) on the
+    /// consumer's classpath, like a binary/provided dependency. This is what a stub library that
+    /// must not shadow the real implementation uses.
+    Classpath,
+}
+
+impl PathDependency {
+    /// Whether this dependency is consumed as compiled classes rather than sources.
+    pub const fn is_classpath(&self) -> bool {
+        matches!(self.mode, PathMode::Classpath)
+    }
+
+    /// The path this dependency contributes in [`PathMode::Classpath`], relative to the manifest.
+    ///
+    /// `dir` is joined with `/` when present; without one the dependency directory itself is the
+    /// classpath entry. Source mode never calls this: its address is resolved by a host's source
+    /// root detection instead.
+    ///
+    /// Callers must have run [`Manifest::validate`] (or [`Dependency::validate`]); this accessor
+    /// joins the two fields verbatim and does not re-check that `dir` is relative and non-escaping.
+    pub fn classpath_path(&self) -> String {
+        let path = self.path.replace('\\', "/");
+        match &self.dir {
+            Some(dir) if !dir.is_empty() => {
+                let dir = dir.replace('\\', "/");
+                if path.ends_with('/') {
+                    alloc::format!("{path}{dir}")
+                } else {
+                    alloc::format!("{path}/{dir}")
+                }
+            }
+            _ => path,
+        }
+    }
 }
 
 /// Which commit of a git dependency to check out: the default branch, or a named branch / tag / commit.
@@ -546,6 +596,21 @@ pub enum DependencyError {
         /// The dependency's name.
         name: String,
     },
+    /// A classpath-only `path` dependency declares build features or `default-features`, but it
+    /// runs no build script and has no source form to route a feature into.
+    ClasspathPathWithFeatures {
+        /// The dependency's name.
+        name: String,
+        /// Which field carried the meaningless value.
+        field: &'static str,
+    },
+    /// A classpath-only `path` dependency's `dir` is absolute or escapes the dependency root.
+    ClasspathDir {
+        /// The dependency's name.
+        name: String,
+        /// The offending value.
+        value: String,
+    },
     /// A registry entry's `version` is not a version requirement.
     RegistryRequirement {
         /// The dependency's name.
@@ -604,6 +669,16 @@ impl fmt::Display for DependencyError {
                 "dependency `{name}` sets both `remap` and `sources`, but only the classes are \
                  remapped: go-to-definition would land on obfuscated names for types the classpath \
                  now spells out (drop one)"
+            ),
+            Self::ClasspathPathWithFeatures { name, field } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but sets `{field}`; a classpath-only \
+                 path dependency runs no build script and has no source form to route it into"
+            ),
+            Self::ClasspathDir { name, value } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but its `dir` `{value}` is absolute \
+                 or escapes the dependency root"
             ),
             Self::RegistryRequirement { name, value } => write!(
                 f,
@@ -2568,6 +2643,14 @@ impl Default for Build {
 }
 
 impl Dependency {
+    /// The path form, when this entry consumes compiled classes instead of sources.
+    pub const fn classpath_only_path(&self) -> Option<&PathDependency> {
+        match self {
+            Self::Path(path) if path.is_classpath() => Some(path),
+            _ => None,
+        }
+    }
+
     /// Validate a jar-location string without building any path.
     ///
     /// The string is a `jar` or `sources` value: non-empty and, if it carries a URL scheme, a known
@@ -2665,6 +2748,38 @@ impl Dependency {
                         name: name.to_owned(),
                         field: "path",
                     });
+                }
+                if path.is_classpath() {
+                    if !path.features.is_empty() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "features",
+                        });
+                    }
+                    if path.default_features.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "default-features",
+                        });
+                    }
+                    if path.optional.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "optional",
+                        });
+                    }
+                    if let Some(dir) = &path.dir {
+                        let absolute = dir.starts_with('/')
+                            || dir.starts_with('\\')
+                            || dir.as_bytes().get(1) == Some(&b':');
+                        let escapes = dir.split(['/', '\\']).any(|part| part == "..");
+                        if dir.is_empty() || absolute || escapes {
+                            return Err(DependencyError::ClasspathDir {
+                                name: name.to_owned(),
+                                value: dir.clone(),
+                            });
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -2774,6 +2889,7 @@ impl Dependency {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => &[],
             Self::Git(git) => &git.features,
+            Self::Path(path) if path.is_classpath() => &[],
             Self::Path(path) => &path.features,
         }
     }
@@ -2789,6 +2905,7 @@ impl Dependency {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => true,
             Self::Git(git) => git.default_features.unwrap_or(true),
+            Self::Path(path) if path.is_classpath() => true,
             Self::Path(path) => path.default_features.unwrap_or(true),
         }
     }
@@ -2843,6 +2960,7 @@ impl Dependency {
     const fn accepts_features(&self) -> bool {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => false,
+            Self::Path(path) if path.is_classpath() => false,
             Self::Git(_) | Self::Path(_) => true,
         }
     }
@@ -5421,6 +5539,7 @@ mod tests {
             Some(&Dependency::Path(PathDependency {
                 path: "../sibling".to_owned(),
                 dir: None,
+                mode: PathMode::Source,
                 features: Vec::new(),
                 default_features: None,
                 optional: None,
@@ -5608,6 +5727,7 @@ mod tests {
                     Dependency::Path(PathDependency {
                         path: "../sibling".to_owned(),
                         dir: None,
+                        mode: PathMode::Source,
                         features: Vec::new(),
                         default_features: None,
                         optional: None,
@@ -6718,6 +6838,54 @@ mod tests {
                 pattern: "**bad".to_owned(),
                 reason: ResourcePatternError::MalformedAnyDepth,
             })
+        );
+    }
+
+    #[test]
+    fn path_dependency_mode_selects_classpath_consumption() {
+        let manifest: Manifest = toml::from_str(
+            "[dependencies]\nstub = { path = \"../stub\", dir = \"target/classes\", mode = \"classpath\" }\n\
+             source = { path = \"../source\" }\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+        let stub = manifest.dependencies.get("stub").unwrap();
+        let path = stub.classpath_only_path().unwrap();
+        assert_eq!(path.classpath_path(), "../stub/target/classes");
+
+        let windows: Manifest = toml::from_str(
+            "[dependencies]\nstub = { path = \"..\\\\stub\\\\\", dir = \"target\\\\classes\", mode = \"classpath\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .dependencies
+                .get("stub")
+                .unwrap()
+                .classpath_only_path()
+                .unwrap()
+                .classpath_path(),
+            "../stub/target/classes"
+        );
+
+        for entry in [
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", features = [\"x\"] }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", default-features = false }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", optional = true }",
+            "{ path = \"stub\", dir = \"/abs\", mode = \"classpath\" }",
+            "{ path = \"stub\", dir = \"../elsewhere\", mode = \"classpath\" }",
+        ] {
+            let invalid: Manifest =
+                toml::from_str(&format!("[dependencies]\nstub = {entry}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{entry} should be rejected");
+        }
+        assert!(
+            manifest
+                .dependencies
+                .get("source")
+                .unwrap()
+                .classpath_only_path()
+                .is_none()
         );
     }
 
