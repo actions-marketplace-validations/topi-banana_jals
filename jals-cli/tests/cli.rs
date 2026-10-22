@@ -442,6 +442,11 @@ fn build_excludes_matching_sources_before_javac() {
     )
     .unwrap();
     std::fs::write(src.join("Broken.java"), "class Broken { void m( {\n").unwrap();
+    std::fs::write(
+        src.join("Kept.java"),
+        "package com.example; class Kept {}\n",
+    )
+    .unwrap();
 
     let (stdout, code) = run(&[
         "build",
@@ -451,6 +456,7 @@ fn build_excludes_matching_sources_before_javac() {
     ]);
     assert_eq!(code, 0, "got: {stdout}");
     assert!(stdout.contains("Main.java"), "got: {stdout}");
+    assert!(stdout.contains("Kept.java"), "got: {stdout}");
     assert!(!stdout.contains("module-info.java"), "got: {stdout}");
     assert!(!stdout.contains("Broken.java"), "got: {stdout}");
 
@@ -470,6 +476,24 @@ fn build_excludes_matching_sources_before_javac() {
         .status()
         .unwrap();
     assert!(status.success(), "an excluded source must not be compiled");
+
+    // Negative control: without the exclusions the same tree must fail, so the success above is
+    // attributable to the filter rather than to a backend that tolerates the broken files.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"excluded\"\n[build]\nbackend = { type = \"jals\" }\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "an unexcluded broken source must fail the build"
+    );
 }
 
 #[test]

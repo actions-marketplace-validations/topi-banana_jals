@@ -3462,17 +3462,17 @@ impl App {
         let build_filter = manifest
             .build
             .source_filter()
-            .expect("Manifest::validate rejected an invalid source filter");
-        let test_filter = manifest
-            .test
-            .source_filter()
-            .expect("Manifest::validate rejected an invalid source filter");
+            .map_err(|error| anyhow!("invalid `[build]` source filter: {error}"))?;
         let mut source_roots: Vec<(PathBuf, SourceFilter)> = manifest
             .source_roots(root)
             .into_iter()
             .map(|path| (path, build_filter.clone()))
             .collect();
         if matches!(lowering, Lowering::Test | Lowering::TestOnWasm) {
+            let test_filter = manifest
+                .test
+                .source_filter()
+                .map_err(|error| anyhow!("invalid `[test]` source filter: {error}"))?;
             for dir in &manifest.test.source_dirs {
                 let path = root.join(dir);
                 if !source_roots.iter().any(|(declared, _)| declared == &path) {
@@ -3552,6 +3552,11 @@ impl App {
             walk(root, root, filter, &mut out)
                 .with_context(|| format!("scanning directory {}", root.display()))?;
         }
+        // A test root nested under a build root is reached twice — once per pair — and the two
+        // passes can select or exclude different files. One path in the result is what downstream
+        // deduplication assumes, so collapse the duplicate here, at the one place that walked it.
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 

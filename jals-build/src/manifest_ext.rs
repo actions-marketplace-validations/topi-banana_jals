@@ -173,14 +173,12 @@ impl ManifestExt for Manifest {
     }
 
     fn source_filters(&self) -> BTreeMap<DirKey, SourceFilter> {
-        let build = self
-            .build
-            .source_filter()
-            .expect("Manifest::validate rejected an invalid source filter");
-        let test = self
-            .test
-            .source_filter()
-            .expect("Manifest::validate rejected an invalid source filter");
+        // This trait is implemented for any `Manifest`, not only one loaded through
+        // `Manifest::from_file`. A malformed filter therefore means "select every file", the same
+        // fallback a root that cannot be addressed gets, rather than a panic on a host path.
+        let (Ok(build), Ok(test)) = (self.build.source_filter(), self.test.source_filter()) else {
+            return BTreeMap::new();
+        };
         let mut filters = BTreeMap::new();
         for dir in &self.build.source_dirs {
             if let Ok(path) = RelativePath::resolve(&RelativePath::ROOT, dir) {
@@ -230,6 +228,33 @@ mod tests {
             plain.test_source_roots(Path::new("/p")),
             plain.source_roots(Path::new("/p"))
         );
+    }
+
+    #[test]
+    fn source_filters_follow_the_root_they_belong_to() {
+        let m: Manifest = toml::from_str(
+            "[build]\nsource-dirs = [\".\", \"src\"]\nexclude = [\"module-info.java\"]\n\
+             [test]\nsource-dirs = [\"src/test/java\", \"src\"]\nexclude = [\"**/*IT.java\"]\n",
+        )
+        .unwrap();
+        let filters = m.source_filters();
+        let root = DirKey::ROOT;
+        let build = filters.get(&root).expect("a rootless source dir is a root");
+        assert!(!build.accepts(&RelativePath::parse("module-info.java").unwrap()));
+        assert!(build.accepts(&RelativePath::parse("Main.java").unwrap()));
+
+        let src = DirKey::parse("src").unwrap();
+        let shared = filters
+            .get(&src)
+            .expect("the build filter wins for a shared root");
+        assert!(!shared.accepts(&RelativePath::parse("module-info.java").unwrap()));
+
+        let test = DirKey::parse("src/test/java").unwrap();
+        let test_filter = filters
+            .get(&test)
+            .expect("a test-only root uses the test filter");
+        assert!(!test_filter.accepts(&RelativePath::parse("MainIT.java").unwrap()));
+        assert!(test_filter.accepts(&RelativePath::parse("Main.java").unwrap()));
     }
 
     #[test]

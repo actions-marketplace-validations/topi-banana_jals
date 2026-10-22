@@ -239,7 +239,9 @@ pub struct ProjectLayout {
     ///
     /// A root absent from this map selects every `.java`, which is what every host that has no
     /// manifest filter gets. A present filter sees the file's path *below* that root, so
-    /// `exclude = ["module-info.java"]` drops the module declaration at any root.
+    /// `exclude = ["module-info.java"]` drops the module declaration at any root. An excluded path
+    /// is not owned by this workspace — a host that has it open answers it through its detached
+    /// single-file path, the same way it answers a file outside every root.
     pub source_filters: BTreeMap<DirKey, SourceFilter>,
     /// Exact project source files outside (or alongside) the source-root walk. Hosts use this for
     /// generated sources explicitly selected by identity; siblings are not implicitly included.
