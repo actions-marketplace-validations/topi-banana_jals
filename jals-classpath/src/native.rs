@@ -1242,8 +1242,12 @@ impl NativeProjectPlan {
                 Ok(paths) if !paths.is_empty() => classpath_entries.extend(paths),
                 Ok(_) => {
                     result.warn_path(spelling, "classpath glob matched no files".to_owned());
+                    classpath_entries.push(spelling.clone());
                 }
-                Err(message) => result.warn_path(spelling, message),
+                Err(message) => {
+                    result.warn_path(spelling, message);
+                    classpath_entries.push(spelling.clone());
+                }
             }
         }
         let mut classpath_only = Vec::new();

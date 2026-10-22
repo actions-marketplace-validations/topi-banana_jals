@@ -340,6 +340,7 @@ fn classpath_globs_and_jar_directories_expand_deterministically() {
     fs::create_dir_all(project.path().join("libs/nested")).unwrap();
     fs::write(project.path().join("libs/nested/c.jar"), b"c").unwrap();
     let recursive = plan_for("libs/**/*.jar");
+    assert!(recursive.warnings.is_empty(), "{:?}", recursive.warnings);
     assert_eq!(
         recursive.plan.classpath,
         [
