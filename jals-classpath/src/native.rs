@@ -754,6 +754,62 @@ pub struct NativeProjectPlan {
 }
 
 impl NativeProjectPlan {
+    /// Packages declared by more than one jar, each with the jars that declare it.
+    ///
+    /// JPMS refuses a module path where two modules export the same package. The list is sorted
+    /// by package name and each jar list keeps the input order, so a diagnostic built from it is
+    /// stable.
+    pub fn split_packages(jars: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
+        /// The packages one jar carries.
+        ///
+        /// A jar's module name is not read: an automatic module derives it from the file name, and
+        /// the question this answers is only "do two entries declare the same package".
+        /// `META-INF/` is skipped — a multi-release jar repeats a package under
+        /// `META-INF/versions/<n>/`, which is one module, not a split.
+        fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
+            let bytes = std::fs::read(path).map_err(|error| {
+                format!(
+                    "module-path jar `{}` cannot be read: {error}",
+                    path.display()
+                )
+            })?;
+            let mut cursor = jals_storage::io::Cursor::new(bytes);
+            let directory =
+                jals_exec::block_on_inline(crate::zip::CentralDirectory::parse(&mut cursor))?;
+            let mut packages: Vec<String> = directory
+                .members
+                .iter()
+                .filter_map(|member| {
+                    if member.is_dir || member.name.starts_with("META-INF/") {
+                        return None;
+                    }
+                    let extension = Path::new(&member.name).extension()?;
+                    if !extension.eq_ignore_ascii_case("class") {
+                        return None;
+                    }
+                    let (package, _) = member.name.rsplit_once('/')?;
+                    (!package.is_empty()).then(|| package.replace('/', "."))
+                })
+                .collect();
+            packages.sort();
+            packages.dedup();
+            Ok(packages)
+        }
+
+        let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for jar in jars {
+            let Ok(packages) = jar_packages(jar) else {
+                continue;
+            };
+            let name = jar.display().to_string();
+            for package in packages {
+                owners.entry(package).or_default().push(name.clone());
+            }
+        }
+        owners.retain(|_, jars| jars.len() > 1);
+        owners
+    }
+
     /// Lower `manifest` and execute the whole native input assembly against one aggregate:
     /// materialize Git sources, fetch and resolve dependencies over async HTTP, and merge the
     /// lowering warnings into the result's. Fan-out and blocking host work run on the storage's

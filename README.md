@@ -415,6 +415,8 @@ release = 21                        # javac --release N
 # exclude     = ["module-info.java"] # globs skipped under every source root
 # classes-dir = "target/classes"    # javac -d
 # classpath   = ["libs/guava.jar"]  # -classpath entries
+# module-path = ["libs/modules"]    # --module-path entries
+# modular     = "auto"              # put resolved dependencies on --module-path when module-info.java exists
 # script = { type = "java", file = "build.java" }
 
 [run]

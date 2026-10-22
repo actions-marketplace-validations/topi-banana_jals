@@ -175,6 +175,7 @@ impl Invocation {
             sources,
             extra_sources,
             extra_classpath,
+            module_path,
             extra_javac_args,
             compile_env,
         } = req;
@@ -211,6 +212,15 @@ impl Invocation {
         if !classpath.is_empty() {
             args.push("-classpath".to_owned());
             args.push(Self::join_with(&classpath, path_sep));
+        }
+
+        // Module path: only the host-resolved entries. The manifest's module-path list is resolved
+        // by the host too, because a `${dependency.<name>}` entry names a fetched jar that has no
+        // manifest-relative spelling. Emitted only when non-empty; an empty option is noise.
+        if !module_path.is_empty() {
+            let entries: Vec<String> = module_path.iter().map(|p| Self::path_string(p)).collect();
+            args.push("--module-path".to_owned());
+            args.push(Self::join_with(&entries, path_sep));
         }
 
         // Source path: where `javac` looks for referenced-but-unlisted sources.
@@ -260,6 +270,7 @@ impl Invocation {
             main_class,
             program_args,
             extra_classpath,
+            module_path,
             run_env,
         } = req;
         let build = &manifest.build;
@@ -273,7 +284,15 @@ impl Invocation {
         );
         classpath.extend(extra_classpath.iter().map(|p| Self::path_string(p)));
 
-        let mut args = jvm_args.to_vec();
+        let mut args = Vec::new();
+        if !module_path.is_empty() {
+            let entries: Vec<String> = module_path.iter().map(|p| Self::path_string(p)).collect();
+            args.push("--module-path".to_owned());
+            args.push(Self::join_with(&entries, path_sep));
+        }
+        // User arguments follow the generated path options, so a deliberate override in
+        // `jvm_args` is the last one `java` sees (the JDK's last-wins rule for path options).
+        args.extend(jvm_args.iter().cloned());
         args.extend([
             "-cp".to_owned(),
             Self::join_with(&classpath, path_sep),
@@ -340,6 +359,7 @@ mod tests {
                 sources,
                 extra_sources,
                 extra_classpath,
+                module_path: &[],
                 extra_javac_args: &[],
                 compile_env: &BTreeMap::new(),
             },
@@ -361,6 +381,7 @@ mod tests {
                 main_class,
                 program_args,
                 extra_classpath,
+                module_path: &[],
                 run_env: &BTreeMap::new(),
             },
             ':',
@@ -463,6 +484,7 @@ mod tests {
                 sources: &sources,
                 extra_sources: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 extra_javac_args: &extra_javac_args,
                 compile_env: &BTreeMap::new(),
             },
@@ -526,6 +548,36 @@ mod tests {
     }
 
     #[test]
+    fn module_path_is_emitted_before_sourcepath() {
+        let manifest = Manifest::default();
+        let invocation = Invocation::build(
+            &CompileRequest {
+                manifest: &manifest,
+                project_root: Path::new(ROOT),
+                sources: &[],
+                extra_sources: &[],
+                extra_classpath: &[],
+                module_path: &[PathBuf::from("libs/guava.jar")],
+                extra_javac_args: &[],
+                compile_env: &BTreeMap::new(),
+            },
+            ':',
+        );
+
+        let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+        let module = args
+            .iter()
+            .position(|arg| *arg == "--module-path")
+            .expect("module path flag");
+        let source = args
+            .iter()
+            .position(|arg| *arg == "-sourcepath")
+            .expect("source path flag");
+        assert!(module < source, "module path must precede sourcepath");
+        assert_eq!(args[module + 1], "libs/guava.jar");
+    }
+
+    #[test]
     fn jvm_args_precede_classpath_and_keep_their_order() {
         let manifest = Manifest::default();
         let jvm_args = vec!["-ea".to_owned(), "-Dmode=test".to_owned()];
@@ -537,6 +589,7 @@ mod tests {
                 main_class: "com.example.Main",
                 program_args: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 run_env: &BTreeMap::new(),
             },
             ':',
@@ -570,6 +623,7 @@ mod tests {
                 sources: &[],
                 extra_sources: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 extra_javac_args: &[],
                 compile_env: &compile_env,
             },
@@ -583,6 +637,7 @@ mod tests {
                 main_class: "Main",
                 program_args: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 run_env: &run_env,
             },
             ':',
@@ -641,6 +696,7 @@ mod tests {
                 sources: std::slice::from_ref(&source),
                 extra_sources: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 extra_javac_args: &[],
                 compile_env: &BTreeMap::new(),
             },
@@ -664,6 +720,7 @@ mod tests {
                 main_class: "Main",
                 program_args: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 run_env: &BTreeMap::new(),
             },
             ':',

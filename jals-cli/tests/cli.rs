@@ -429,6 +429,90 @@ fn build_dry_run_prints_javac_command() {
 }
 
 #[test]
+fn modular_auto_puts_classpath_on_the_module_path_when_module_info_is_present() {
+    let dir = project(
+        "[package]\nname = \"modular\"\n\
+         [build]\nmodular = \"auto\"\nclasspath = [\"libs/modules\"]\n",
+    );
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("--module-path"), "got: {stdout}");
+    assert!(stdout.contains("libs/modules"), "got: {stdout}");
+    assert!(
+        !stderr.contains("module-info.java` is compiled"),
+        "got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn modular_auto_warns_about_a_split_package_on_the_module_path() {
+    let dir = project(
+        "[package]\nname = \"split\"\n\
+         [build]\nmodular = \"auto\"\nclasspath = [\"libs/a.jar\", \"libs/b.jar\"]\n",
+    );
+    std::fs::create_dir_all(dir.path().join("libs")).unwrap();
+    write_source_jar(
+        &dir.path().join("libs/a.jar"),
+        &[("com/example/A.class", b"\xca\xfe\xba\xbe")],
+    );
+    write_source_jar(
+        &dir.path().join("libs/b.jar"),
+        &[("com/example/B.class", b"\xca\xfe\xba\xbe")],
+    );
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("split package `com.example`"),
+        "got: {stderr}"
+    );
+    assert!(stderr.contains("a.jar"), "got: {stderr}");
+    assert!(stderr.contains("b.jar"), "got: {stderr}");
+}
+
+#[test]
+fn module_info_with_classpath_mode_points_at_the_module_path_setting() {
+    let dir = project("[package]\nname = \"modular-hint\"\n");
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stdout.contains("--module-path"), "got: {stdout}");
+    assert!(stderr.contains("modular = \"auto\""), "got: {stderr}");
+}
+
+#[test]
 fn build_excludes_matching_sources_before_javac() {
     let dir = project(
         "[package]\nname = \"excluded\"\n\

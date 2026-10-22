@@ -742,6 +742,14 @@ impl Api {
             let api = self.clone();
             package.bind(
                 "jals/build/Build",
+                "addModulePath0([C)V",
+                move |host: &mut dyn NativeHost, args: Args<'_>, _results: Results<'_>| {
+                    api.add_module_path(&text(host, &args, 0)?)
+                },
+            );
+            let api = self.clone();
+            package.bind(
+                "jals/build/Build",
                 "addJavacArg0([C)V",
                 move |host: &mut dyn NativeHost, args: Args<'_>, _results: Results<'_>| {
                     api.add_javac_arg(&text(host, &args, 0)?)
@@ -1561,6 +1569,22 @@ impl Api {
         )
     }
 
+    /// Add a project file or a generated file's key to the later module path.
+    fn add_module_path(&self, path: &str) -> Result<(), NativeError> {
+        let key = Self::project_file(&self.view, path, "build.add_module_path", &self.limits)?;
+        let mut pending = self
+            .pending
+            .try_borrow_mut()
+            .map_err(|_| Self::refused("reentrant build.add_module_path call"))?;
+        let limit = pending.limits.max_array_size;
+        Self::insert_host_file(
+            &mut pending.additional_module_path,
+            key,
+            limit,
+            "build.add_module_path",
+        )
+    }
+
     /// Append one compiler argument.
     fn add_javac_arg(&self, arg: &str) -> Result<(), NativeError> {
         let mut pending = self
@@ -2126,6 +2150,7 @@ class build {
         Build.warning("a warning");
         Build.addSource("source.java");
         Build.addClasspath("gen/classes.jar");
+        Build.addModulePath("gen/modules");
         Build.addJavacArg("-Xlint");
         Build.addJvmArg("-Xmx1g");
         Build.setCompileEnv("LANG", "C");
@@ -2189,6 +2214,11 @@ class build {
                 emitted
                     .additional_classpath
                     .contains(&FileKey::parse("gen/classes.jar").unwrap())
+            );
+            assert!(
+                emitted
+                    .additional_module_path
+                    .contains(&FileKey::parse("gen/modules").unwrap())
             );
             assert!(
                 emitted

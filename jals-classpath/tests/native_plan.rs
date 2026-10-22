@@ -198,6 +198,37 @@ fn in_project_path_dependency_auto_detects_conventional_source_root() {
 }
 
 #[test]
+fn split_packages_lists_every_jar_that_declares_one_package() {
+    use jals_classpath::JarPackage;
+    use jals_storage::RelativePath;
+
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, entries: &[&str]| {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|path| (RelativePath::parse(path).unwrap(), vec![0u8]))
+            .collect();
+        fs::write(
+            dir.path().join(name),
+            JarPackage::write(&entries, None).unwrap(),
+        )
+        .unwrap();
+    };
+    write("a.jar", &["com/example/A.class", "com/example/B.class"]);
+    write("b.jar", &["com/example/C.class", "org/other/D.class"]);
+
+    let split = jals_classpath::NativeProjectPlan::split_packages(&[
+        dir.path().join("a.jar"),
+        dir.path().join("b.jar"),
+    ]);
+    assert_eq!(split.len(), 1);
+    let jars = split.get("com.example").expect("the shared package");
+    assert_eq!(jars.len(), 2);
+    assert!(jars[0].ends_with("a.jar"));
+    assert!(jars[1].ends_with("b.jar"));
+}
+
+#[test]
 fn sibling_path_dependency_is_scanned_and_published() {
     let base = tempfile::tempdir().unwrap();
     let project = base.path().join("project");

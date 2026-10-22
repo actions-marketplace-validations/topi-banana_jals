@@ -40,6 +40,8 @@ pub struct HostCompileInputs<'a> {
     pub extra_sources: &'a [PathBuf],
     /// Already-resolved dependency jars, appended after the manifest's `[build] classpath`.
     pub extra_classpath: &'a [PathBuf],
+    /// Already-resolved module-path entries, emitted as `--module-path`.
+    pub module_path: &'a [PathBuf],
     /// Extra `javac` arguments a build script contributed, appended after `[build] javac-flags`.
     pub extra_javac_args: &'a [String],
     /// Explicit environment entries for the compiler subprocess.
@@ -63,6 +65,7 @@ pub struct JavacBackend {
     staging_root: PathBuf,
     extra_sources: Vec<PathBuf>,
     extra_classpath: Vec<PathBuf>,
+    module_path: Vec<PathBuf>,
     extra_javac_args: Vec<String>,
     compile_env: BTreeMap<String, String>,
 }
@@ -87,6 +90,7 @@ impl JavacBackend {
             staging_root: staged.root().to_path_buf(),
             extra_sources: inputs.extra_sources.to_vec(),
             extra_classpath: inputs.extra_classpath.to_vec(),
+            module_path: inputs.module_path.to_vec(),
             extra_javac_args: inputs.extra_javac_args.to_vec(),
             compile_env: inputs.compile_env.clone(),
         }
@@ -112,6 +116,7 @@ impl JavacBackend {
             sources,
             extra_sources: &self.extra_sources,
             extra_classpath: &self.extra_classpath,
+            module_path: &self.module_path,
             extra_javac_args: &self.extra_javac_args,
             compile_env: &self.compile_env,
         }
@@ -155,16 +160,47 @@ impl Backend for JavacBackend {
         // host replaces `source-dirs` with the staging root, absolute when it cannot be made
         // relative, so the same project would digest differently from a different directory.
         let build = &self.manifest.build;
-        for entry in build.classpath.iter().chain(&build.javac_flags) {
-            fold.bytes(entry.as_bytes());
+        for (namespace, entry) in build
+            .classpath
+            .iter()
+            .map(|entry| (b"classpath".as_slice(), entry))
+            .chain(
+                build
+                    .module_path
+                    .iter()
+                    .map(|entry| (b"module-path".as_slice(), entry)),
+            )
+            .chain(
+                build
+                    .javac_flags
+                    .iter()
+                    .map(|entry| (b"javac-flag".as_slice(), entry)),
+            )
+        {
+            fold.bytes(namespace).bytes(entry.as_bytes());
         }
         // TODO(backend-tier): `classes-dir` is folded because memoizing this backend means *skipping*
         // a compile, which is only valid if the output is already where this compile would put it —
         // but `--out-dir` can make it an absolute host path, so it has to be normalized against the
         // project root before `CacheNamespace::BackendOutput` is switched on.
         fold.bytes(build.classes_dir.as_bytes());
-        for path in self.extra_classpath.iter().chain(&self.extra_sources) {
-            fold.bytes(path.as_os_str().as_encoded_bytes());
+        for (namespace, path) in self
+            .extra_classpath
+            .iter()
+            .map(|path| (b"classpath".as_slice(), path))
+            .chain(
+                self.module_path
+                    .iter()
+                    .map(|path| (b"module-path".as_slice(), path)),
+            )
+            .chain(
+                self.extra_sources
+                    .iter()
+                    .map(|path| (b"source".as_slice(), path)),
+            )
+        {
+            fold.bytes(namespace)
+                .bytes(path.as_os_str().as_encoded_bytes());
         }
         for arg in &self.extra_javac_args {
             fold.bytes(arg.as_bytes());
@@ -278,6 +314,7 @@ mod tests {
             &HostCompileInputs {
                 extra_sources: &[],
                 extra_classpath: &[],
+                module_path: &[],
                 extra_javac_args: &[],
                 compile_env: &BTreeMap::new(),
             },
@@ -442,6 +479,7 @@ mod tests {
         let inputs = HostCompileInputs {
             extra_sources: &[],
             extra_classpath: &[],
+            module_path: &[],
             extra_javac_args: &[],
             compile_env: &BTreeMap::new(),
         };

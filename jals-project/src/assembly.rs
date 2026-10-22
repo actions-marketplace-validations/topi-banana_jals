@@ -275,6 +275,9 @@ impl ProjectScript {
         let mut inputs = root_inputs;
         inputs.dependency_jars.extend(graph_inputs.dependency_jars);
         inputs
+            .named_dependency_jars
+            .extend(graph_inputs.named_dependency_jars);
+        inputs
             .classpath_classes
             .extend(graph_inputs.classpath_classes);
         inputs.library_sources.extend(graph_inputs.library_sources);
