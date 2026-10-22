@@ -188,7 +188,9 @@ pub struct ProjectInputs {
     /// `dependency_jars` is the ordered list the compiler consumes and has lost the names by the
     /// time it is built; a host that has to address one dependency *by name* (a
     /// `${dependency.<name>}` module-path entry) reads it here. Recursive members are absent: they
-    /// are addressed by the jar that carries them, not by a manifest key.
+    /// are addressed by the jar that carries them, not by a manifest key. A `git`/`path` dependency
+    /// has no jar here either; a module-path reference to one is reported by the host rather than
+    /// silently omitted.
     pub named_dependency_jars: BTreeMap<Name, CacheKey>,
     /// Artifacts that were acquired into the verified cache but are not classpath entries — a
     /// registry package whose POM declared a non-jar `<type>`. Kept so a host can say what was
@@ -329,10 +331,15 @@ impl ProjectInputs {
 
         // Keep top-level dependencies in request order; recursive members are additions appended in
         // the same second-pass order.
-        let named_dependency_jars: BTreeMap<Name, CacheKey> = resolved_jars
-            .iter()
-            .map(|jar| (jar.name.clone(), jar.key.clone()))
-            .collect();
+        // First wins: two requests can legitimately share a name (a registry coordinate can
+        // collide with another label), and the first one in request order is the classpath jar
+        // the manifest asked for. Last-wins would let a later duplicate silently replace it.
+        let mut named_dependency_jars: BTreeMap<Name, CacheKey> = BTreeMap::new();
+        for jar in &resolved_jars {
+            named_dependency_jars
+                .entry(jar.name.clone())
+                .or_insert_with(|| jar.key.clone());
+        }
         let mut dependency_jars: Vec<_> = resolved_jars.iter().map(|jar| jar.key.clone()).collect();
         for jar in resolved_jars.iter().filter(|jar| jar.recursive) {
             let nested = JarExtraction::nested(&exec, storage.artifacts_mut(), &jar.key).await;

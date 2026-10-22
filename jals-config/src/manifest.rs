@@ -2314,7 +2314,10 @@ impl Build {
         const PREFIX: &str = "${dependency.";
         const SUFFIX: char = '}';
         fn dependency_name(entry: &str) -> Option<&str> {
-            entry.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)
+            entry
+                .strip_prefix(PREFIX)?
+                .strip_suffix(SUFFIX)
+                .filter(|name| !name.is_empty())
         }
         self.module_path
             .iter()
@@ -2323,7 +2326,11 @@ impl Build {
                     return Err(ModulePathError::Empty);
                 }
                 if let Some(name) = dependency_name(entry) {
-                    if name.is_empty() || name.contains('.') || name.contains('/') {
+                    if name.is_empty()
+                        || name.contains('.')
+                        || name.contains('/')
+                        || jals_storage::Name::new(name).is_err()
+                    {
                         return Err(ModulePathError::Malformed(entry.clone()));
                     }
                     return Ok(ModulePathEntry::Dependency(name));
@@ -3010,12 +3017,6 @@ impl Manifest {
 
         // `module-path` entries are paths or named dependency references. A reference is
         // validated against both tables because a test compile sees `[dev-dependencies]` too.
-        let declared: Vec<String> = self
-            .dependencies
-            .keys()
-            .chain(self.dev_dependencies.keys())
-            .cloned()
-            .collect();
         for entry in match self.build.module_path_entries() {
             Ok(entries) => entries,
             Err(ModulePathError::Empty) => {
@@ -3033,7 +3034,12 @@ impl Manifest {
             {
                 return Err(ValidationError::UnknownModulePathDependency {
                     dependency: name.to_owned(),
-                    declared,
+                    declared: self
+                        .dependencies
+                        .keys()
+                        .chain(self.dev_dependencies.keys())
+                        .cloned()
+                        .collect(),
                 });
             }
         }

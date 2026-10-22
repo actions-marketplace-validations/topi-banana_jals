@@ -48,6 +48,9 @@ use crate::task::{TaskPlan, TaskPlanLimits};
 //
 // And before that for publication intent: `Tasks.publishTree` gained a required intent argument
 // (API), and `TaskTerminal::PublishTree` gained a required `intent` field (state).
+// Both bumped for the module path: `build.java` scripts gained `Build.addModulePath` (API), and
+// `BuildScriptStateWire` gained a required `additional_module_path` field (state), which a
+// `deny_unknown_fields` decode of a pre-module-path record cannot satisfy.
 const BUILD_SCRIPT_API_VERSION: u32 = 11;
 const BUILD_SCRIPT_STATE_VERSION: u32 = 9;
 const BUILD_ARTIFACT_ROOT: &str = "target/jals/build";

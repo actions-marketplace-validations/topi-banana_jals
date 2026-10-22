@@ -160,26 +160,47 @@ impl Backend for JavacBackend {
         // host replaces `source-dirs` with the staging root, absolute when it cannot be made
         // relative, so the same project would digest differently from a different directory.
         let build = &self.manifest.build;
-        for entry in build
+        for (namespace, entry) in build
             .classpath
             .iter()
-            .chain(&build.module_path)
-            .chain(&build.javac_flags)
+            .map(|entry| (b"classpath".as_slice(), entry))
+            .chain(
+                build
+                    .module_path
+                    .iter()
+                    .map(|entry| (b"module-path".as_slice(), entry)),
+            )
+            .chain(
+                build
+                    .javac_flags
+                    .iter()
+                    .map(|entry| (b"javac-flag".as_slice(), entry)),
+            )
         {
-            fold.bytes(entry.as_bytes());
+            fold.bytes(namespace).bytes(entry.as_bytes());
         }
         // TODO(backend-tier): `classes-dir` is folded because memoizing this backend means *skipping*
         // a compile, which is only valid if the output is already where this compile would put it —
         // but `--out-dir` can make it an absolute host path, so it has to be normalized against the
         // project root before `CacheNamespace::BackendOutput` is switched on.
         fold.bytes(build.classes_dir.as_bytes());
-        for path in self
+        for (namespace, path) in self
             .extra_classpath
             .iter()
-            .chain(&self.module_path)
-            .chain(&self.extra_sources)
+            .map(|path| (b"classpath".as_slice(), path))
+            .chain(
+                self.module_path
+                    .iter()
+                    .map(|path| (b"module-path".as_slice(), path)),
+            )
+            .chain(
+                self.extra_sources
+                    .iter()
+                    .map(|path| (b"source".as_slice(), path)),
+            )
         {
-            fold.bytes(path.as_os_str().as_encoded_bytes());
+            fold.bytes(namespace)
+                .bytes(path.as_os_str().as_encoded_bytes());
         }
         for arg in &self.extra_javac_args {
             fold.bytes(arg.as_bytes());

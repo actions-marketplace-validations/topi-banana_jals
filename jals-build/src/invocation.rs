@@ -216,7 +216,7 @@ impl Invocation {
 
         // Module path: only the host-resolved entries. The manifest's module-path list is resolved
         // by the host too, because a `${dependency.<name>}` entry names a fetched jar that has no
-        // manifest-relative spelling. Emitted even when empty? No: an empty option is noise.
+        // manifest-relative spelling. Emitted only when non-empty; an empty option is noise.
         if !module_path.is_empty() {
             let entries: Vec<String> = module_path.iter().map(|p| Self::path_string(p)).collect();
             args.push("--module-path".to_owned());
@@ -284,12 +284,15 @@ impl Invocation {
         );
         classpath.extend(extra_classpath.iter().map(|p| Self::path_string(p)));
 
-        let mut args = jvm_args.to_vec();
+        let mut args = Vec::new();
         if !module_path.is_empty() {
             let entries: Vec<String> = module_path.iter().map(|p| Self::path_string(p)).collect();
             args.push("--module-path".to_owned());
             args.push(Self::join_with(&entries, path_sep));
         }
+        // User arguments follow the generated path options, so a deliberate override in
+        // `jvm_args` is the last one `java` sees (the JDK's last-wins rule for path options).
+        args.extend(jvm_args.iter().cloned());
         args.extend([
             "-cp".to_owned(),
             Self::join_with(&classpath, path_sep),
