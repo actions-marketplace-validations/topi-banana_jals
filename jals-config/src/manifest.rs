@@ -307,7 +307,9 @@ pub struct Registry {
 ///
 /// Inheritance is Maven-parent shaped rather than Cargo-marker shaped: a member that omits a value
 /// receives the workspace one, and a member that writes its own keeps it. `[workspace.dependencies]`
-/// are defaults by name, so a member can override one without restating the rest.
+/// are defaults by name, so a member can override one without restating the rest. `[mappings]` and
+/// `[registries]` stay member-local: an inherited dependency that names one must have it in the
+/// member, exactly as if the dependency were written there.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Workspace {
@@ -405,14 +407,14 @@ impl Workspace {
         let build = &mut manifest.build;
         if build.release.is_none() {
             build.release = self.build.release;
-            if build.release.is_some() {
-                // `--release` wins over the pair, so inheriting it must not leave a member's
-                // `source`/`target` looking effective when `javac` will ignore them.
-                build.source = None;
-                build.target = None;
-            }
         }
-        if build.release.is_none() {
+        if build.release.is_some() {
+            // `--release` wins over the pair, so a member's `source`/`target` would look
+            // effective while `javac` ignores them. Clear them whether `release` was the
+            // member's own or inherited, so the two spellings produce one manifest shape.
+            build.source = None;
+            build.target = None;
+        } else {
             if build.source.is_none() {
                 build.source = self.build.source;
             }
@@ -3833,7 +3835,9 @@ impl Manifest {
                 path: Self::IN_MEMORY_NAME.to_owned(),
                 source,
             })?;
-        if let Some(workspace) = workspace {
+        if let Some(workspace) = workspace
+            && manifest.workspace.is_none()
+        {
             workspace.inherit_into(&mut manifest);
         }
         manifest
@@ -7104,6 +7108,49 @@ mod tests {
             Some(Dependency::Jar(jar)) if jar.jar == "libs/other.jar"
         ));
         assert_eq!(overriding.build.release, Some(17));
+    }
+
+    #[test]
+    fn workspace_build_source_and_target_do_not_survive_an_inherited_release() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+             [workspace.build]\nsource = 11\ntarget = 11\n\
+             [workspace.dev-dependencies]\ntestkit = { jar = \"libs/testkit.jar\" }\n",
+        )
+        .unwrap();
+        let workspace = root.workspace.as_ref().unwrap();
+
+        let mut member: Manifest =
+            toml::from_str("[package]\nname = \"app\"\nsource = 17\ntarget = 17\n").unwrap();
+        workspace.inherit_into(&mut member);
+        assert_eq!(member.build.release, None);
+        assert_eq!(member.build.source, Some(11));
+        assert_eq!(member.build.target, Some(11));
+        assert!(member.dev_dependencies.contains_key("testkit"));
+
+        let mut released: Manifest = toml::from_str(
+            "[package]\nname = \"lib\"\n[build]\nrelease = 21\nsource = 17\ntarget = 17\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut released);
+        assert_eq!(released.build.release, Some(21));
+        assert_eq!(released.build.source, None);
+        assert_eq!(released.build.target, None);
+    }
+
+    #[test]
+    fn a_workspace_root_is_not_its_own_parent() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\"]\n\
+             [workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        let manifest = Manifest::from_str_inheriting(
+            "[workspace]\nmembers = [\"app\"]\n[package]\nname = \"root\"\n",
+            root.workspace.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(manifest.package.version, None);
     }
 
     #[test]

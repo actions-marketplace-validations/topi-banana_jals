@@ -131,7 +131,8 @@ fn package_selects_a_workspace_member_for_build_and_run() {
     std::fs::write(
         dir.path().join("jals.toml"),
         "[workspace]\nmembers = [\"app\", \"lib\"]\n\
-         [workspace.package]\nversion = \"1.2.3\"\n",
+         [workspace.package]\nversion = \"1.2.3\"\n\
+         [workspace.build]\njavac-flags = [\"-Xlint:none\"]\n",
     )
     .unwrap();
     for (name, class) in [("app", "Main"), ("lib", "Lib")] {
@@ -164,6 +165,10 @@ fn package_selects_a_workspace_member_for_build_and_run() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Main.java"), "got: {stdout}");
     assert!(!stdout.contains("Lib.java"), "got: {stdout}");
+    assert!(
+        stdout.contains("-Xlint:none"),
+        "the selected member must receive inherited workspace build defaults: {stdout}"
+    );
 
     let missing = jals()
         .args(["build", "-p", "missing", "--dry-run"])

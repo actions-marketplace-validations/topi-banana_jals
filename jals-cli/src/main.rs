@@ -3608,19 +3608,23 @@ impl App {
                 )
             })?;
         let members = workspace.manifests().await?;
+        debug_assert_eq!(workspace.members().len(), members.len());
         let mut available = Vec::with_capacity(members.len());
         for (path, manifest) in workspace.members().iter().zip(members) {
-            match manifest.package.name.as_deref() {
-                Some(name) if name == package => {
-                    let root = path.parent().unwrap_or_else(|| Path::new("."));
-                    return Self::resolve_manifest(Some(root.join("jals.toml").as_path())).await;
-                }
-                Some(name) => available.push(name.to_owned()),
-                None => {}
+            if manifest.package.name.as_deref() == Some(package) {
+                // Return the manifest inheritance already produced. Re-reading the file through
+                // `resolve_manifest` would use `Manifest::from_file`, whose parse has no workspace
+                // attached and would silently drop every inherited value for the selected member.
+                let root = path.parent().unwrap_or_else(|| Path::new("."));
+                return Ok((manifest, root.to_path_buf()));
+            }
+            if let Some(name) = manifest.package.name {
+                available.push(name);
             }
         }
         bail!(
-            "workspace member `{package}` was not found (available: {})",
+            "workspace member `{package}` was not found in {} (available: {})",
+            workspace.root().display(),
             available.join(", ")
         )
     }
