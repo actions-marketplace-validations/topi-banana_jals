@@ -609,7 +609,7 @@ fn build_classpath_globs_expand_into_deterministic_javac_arguments() {
     assert!(normalized.contains("libs/a.jar"), "got: {stdout}");
     assert!(normalized.contains("libs/b.jar"), "got: {stdout}");
     assert!(
-        normalized.contains("libs:"),
+        normalized.contains("libs:") || normalized.contains("libs;"),
         "the directory entry itself must survive: {stdout}"
     );
 }
