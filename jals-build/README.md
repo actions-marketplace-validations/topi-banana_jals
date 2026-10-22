@@ -1133,7 +1133,7 @@ Making a `features` release preset also imply a default `javac --release` is sti
 | `lint` / `warnings`            | `-Xlint:all`, `-Werror`                  | typed `-Xlint` config instead of raw `javac-flags`                                                   |
 | `annotation-processors`        | `-processor`, `-processorpath`, `-proc:` | annotation processing                                                                                |
 | resources on the run classpath | (copy step)                              | `resource-dirs` reaches the jar only; copying into `classes-dir` like Maven is what `jals run` needs |
-| `module` / `module-path`       | `--module-path`, `--module-source-path`  | JPMS (modular) builds vs. the classpath — **not implemented yet** (M2). Until then the escape hatch is a literal `javac-flags = ["--module-path", "libs"]` (relative to the project root, where `javac` runs); it is literal text, so the path of a resolver-provided jar cannot be referenced from it |
+| `module-path` / `modular`      | `--module-path`                          | **done** (M2.2) — `[build] module-path` accepts project paths and `${dependency.<name>}` references, and `[build] modular = "classpath"` / `"auto"` / `"module-path"` decides when resolved dependencies move to the module path. `--module-source-path` has no separate key: a multi-module tree is a `[workspace]` of members |
 | `target-dir`                   | `-d` parent                              | override the `target/` location (also a CLI flag, §6)                                                |
 | `incremental`                  | (skip unchanged)                         | recompile only stale sources — needs timestamp/hash tracking in `jals-cli`                           |
 
@@ -1164,9 +1164,10 @@ resolved jars join the verified-cache download path; `jals-cli` reads and writes
 (only when it changed), `--locked`/`--frozen` refuse a lock rewrite, and `jals update` re-resolves
 ignoring the pins. The lock is feature-independent: it is generated from a pass that forces every
 optional and dev registry entry active. `[workspace]` roots share one lock across their members
-(discovery + union resolution; inheritance and `-p` are not implemented yet). `jals fetch`/`tree`,
-the `target/jals/deps` view, and POM exclusions remain. The target architecture and
-migration plan live in [`jals-resolve/DESIGN.md`](../jals-resolve/DESIGN.md).
+(discovery + union resolution), members inherit `[workspace.package]`, `[workspace.dependencies]`,
+and `[workspace.build]` defaults, and `-p <member>` selects one member's `build`/`run`/`test`.
+`jals fetch`/`tree`, the `target/jals/deps` view, and POM exclusions remain. The target architecture
+and migration plan live in [`jals-resolve/DESIGN.md`](../jals-resolve/DESIGN.md).
 
 The plumbing follows the portable/native split the rest of the crate already uses. `jals-resolve`
 owns the pure half — version requirements, package identity, the feature graph, the resolver, and

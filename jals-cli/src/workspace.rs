@@ -3,9 +3,9 @@
 //! A workspace is one `jals.lock` and one `target/` at the root, shared by every member. The
 //! discovery here answers exactly two questions for the CLI: which directory is the workspace
 //! root (so the lock has one home), and which member manifests exist (so a resolution can union
-//! them). It does **not** yet answer "which member does this command build" — commands operate on
-//! the member whose directory they were invoked in, and `default-members` is validated but not
-//! yet a selection.
+//! them). `-p <member>` selects one member's `build`/`run`/`test`; without it a command operates
+//! on the member whose directory it was invoked in, and `default-members` is validated but not yet
+//! a selection.
 //!
 //! Walking upward is what makes a nested `[workspace]` a *nested workspace* rather than an
 //! extension: the nearest root wins, exactly as `jals.toml` discovery itself works for member
