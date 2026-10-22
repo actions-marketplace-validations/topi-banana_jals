@@ -836,6 +836,8 @@ impl NativeProjectPlan {
         fn collect(
             base: &Path,
             dir: &Path,
+            depth: usize,
+            max_depth: Option<usize>,
             pattern: &jals_config::ResourcePattern,
             project_root: &Path,
             matches: &mut Vec<String>,
@@ -846,7 +848,7 @@ impl NativeProjectPlan {
                     dir.display()
                 )
             })?;
-            let mut paths: Vec<PathBuf> = entries
+            let paths: Vec<PathBuf> = entries
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<_, _>>()
                 .map_err(|error| {
@@ -855,10 +857,26 @@ impl NativeProjectPlan {
                         dir.display()
                     )
                 })?;
-            paths.sort();
             for path in paths {
+                let symlink = std::fs::symlink_metadata(&path)
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(false);
                 if path.is_dir() {
-                    collect(base, &path, pattern, project_root, matches)?;
+                    // A symlinked directory can point at an ancestor; following it is how a
+                    // glob walks forever. A bounded pattern also stops descending once no
+                    // remaining segment can match.
+                    if symlink || max_depth.is_some_and(|limit| depth + 1 >= limit) {
+                        continue;
+                    }
+                    collect(
+                        base,
+                        &path,
+                        depth + 1,
+                        max_depth,
+                        pattern,
+                        project_root,
+                        matches,
+                    )?;
                 } else if let Ok(relative) = path.strip_prefix(base)
                     && let Some(relative) = relative_path(relative)
                     && pattern.matches(&relative)
@@ -893,7 +911,12 @@ impl NativeProjectPlan {
                 if !jars.is_empty() {
                     jars.sort();
                     jars.dedup();
-                    return Ok(jars);
+                    // Keep the directory as well: a directory that holds jars may also be a
+                    // classes directory (or carry resources), and replacing it with only its
+                    // jars would silently drop everything else javac used to see.
+                    let mut expanded = vec![raw.to_owned()];
+                    expanded.extend(jars);
+                    return Ok(expanded);
                 }
             }
             return Ok(vec![raw.to_owned()]);
@@ -917,10 +940,23 @@ impl NativeProjectPlan {
         if !wildcard {
             return Ok(vec![raw.to_owned()]);
         }
-        let pattern = jals_config::ResourcePattern::parse(&pattern.join("/"))
+        let pattern_text = pattern.join("/");
+        let pattern = jals_config::ResourcePattern::parse(&pattern_text)
             .map_err(|error| format!("classpath glob `{raw}` is invalid: {error}"))?;
+        let max_depth = (!pattern_text.split('/').any(|segment| segment == "**"))
+            .then(|| pattern_text.split('/').count());
         let mut matches = Vec::new();
-        collect(&base, &base, &pattern, project_root, &mut matches)?;
+        collect(
+            &base,
+            &base,
+            0,
+            max_depth,
+            &pattern,
+            project_root,
+            &mut matches,
+        )?;
+        // Sort the portable spellings, not the host paths visited on the way: on Windows the
+        // latter compare case-insensitively and would disagree with the documented order.
         matches.sort();
         matches.dedup();
         Ok(matches)
@@ -942,23 +978,39 @@ impl NativeProjectPlan {
     /// The CLI calls this before invocation planning so a `javac --dry-run` shows the jars a glob
     /// actually selected. Running it twice is harmless: expanded entries are files or plain
     /// directories and fall through unchanged.
-    pub fn expand_build_classpath(manifest: &mut Manifest, project_root: &Path) {
+    pub fn expand_build_classpath(
+        manifest: &mut Manifest,
+        project_root: &Path,
+    ) -> Vec<(String, String)> {
         let mut expanded = Vec::with_capacity(manifest.build.classpath.len());
+        let mut warnings = Vec::new();
         for entry in core::mem::take(&mut manifest.build.classpath) {
             match Self::expand_classpath_entry(project_root, &entry) {
                 Ok(paths) if !paths.is_empty() => expanded.extend(paths),
-                _ => expanded.push(entry),
+                Ok(_) => {
+                    warnings.push((entry.clone(), "classpath glob matched no files".to_owned()));
+                    expanded.push(entry);
+                }
+                Err(message) => {
+                    warnings.push((entry.clone(), message));
+                    expanded.push(entry);
+                }
             }
         }
         manifest.build.classpath = expanded;
+        warnings
     }
 
     /// The `[build] module-path` entries of `manifest`, with globs and jar directories expanded.
     pub fn expanded_module_path_entries(manifest: &Manifest, project_root: &Path) -> Vec<String> {
         let mut expanded = Vec::with_capacity(manifest.build.module_path.len());
         for entry in &manifest.build.module_path {
-            // A `${dependency.<name>}` entry contains no wildcard and names no host directory, so
-            // it is returned verbatim; only literal paths expand.
+            // A dependency reference is not a path, even if a directory with that literal name
+            // exists; only literal entries expand.
+            if entry.starts_with("${") {
+                expanded.push(entry.clone());
+                continue;
+            }
             match Self::expand_classpath_entry(project_root, entry) {
                 Ok(paths) if !paths.is_empty() => expanded.extend(paths),
                 _ => expanded.push(entry.clone()),
@@ -1175,22 +1227,29 @@ impl NativeProjectPlan {
                     .push(Self::resolve_host_path(project_root, source)),
             }
         }
-        // A classpath-only `path` dependency contributes a classpath entry, not a source root.
-        // Gathering it here keeps both spellings on one lowering path, so a project entry and an
-        // external one are classified exactly like an authored `[build] classpath` entry.
-        let mut classpath_spellings = manifest.build.classpath.clone();
-        for (_, dependency) in manifest.active_dependencies(scope, features) {
-            if let Some(path) = dependency.classpath_only_path() {
-                classpath_spellings.push(path.classpath_path());
-            }
-        }
-        let mut classpath_entries = Vec::with_capacity(classpath_spellings.len());
-        for spelling in &classpath_spellings {
+        // Authored `[build] classpath` entries expand; a classpath-only `path` dependency is
+        // already an explicit output address and is kept verbatim (its `dir` may itself be a
+        // classes directory that happens to contain a jar).
+        let mut classpath_entries = Vec::with_capacity(manifest.build.classpath.len());
+        for spelling in &manifest.build.classpath {
             match Self::expand_classpath_entry(project_root, spelling) {
                 Ok(paths) if !paths.is_empty() => classpath_entries.extend(paths),
-                _ => classpath_entries.push(spelling.clone()),
+                Ok(_) => {
+                    result.warn_path(spelling, "classpath glob matched no files".to_owned());
+                }
+                Err(message) => result.warn_path(spelling, message),
             }
         }
+        let mut classpath_only = Vec::new();
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                if !manifest.build.classpath.contains(&entry) && !classpath_only.contains(&entry) {
+                    classpath_only.push(entry);
+                }
+            }
+        }
+        classpath_entries.extend(classpath_only);
         for classpath in &classpath_entries {
             let Some(path) = Self::project_relative(project_root, classpath) else {
                 result

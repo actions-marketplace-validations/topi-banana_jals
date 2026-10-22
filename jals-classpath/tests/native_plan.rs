@@ -295,10 +295,10 @@ fn classpath_globs_and_jar_directories_expand_deterministically() {
     fs::write(project.path().join("libs/a.jar"), b"a").unwrap();
     fs::write(project.path().join("libs/readme.txt"), b"x").unwrap();
 
-    for spelling in ["libs/*.jar", "libs"] {
+    let plan_for = |spelling: &str| {
         let manifest = manifest(&format!("[build]\nclasspath = [\"{spelling}\"]\n"));
         let root = project.path().to_path_buf();
-        let plan = jals_exec::tokio_rt::run(|exec| async move {
+        jals_exec::tokio_rt::run(|exec| async move {
             let storage = NativeStorage::native(&root, root.join("target/jals/cache"), exec)
                 .await
                 .unwrap();
@@ -310,17 +310,56 @@ fn classpath_globs_and_jar_directories_expand_deterministically() {
                 &storage.view(),
             )
         })
-        .expect("test runtime bootstraps");
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-        assert_eq!(
-            plan.plan.classpath,
-            [
-                ClasspathEntry::ProjectFile(FileKey::parse("libs/a.jar").unwrap()),
-                ClasspathEntry::ProjectFile(FileKey::parse("libs/b.jar").unwrap()),
-            ],
-            "{spelling}"
-        );
-    }
+        .expect("test runtime bootstraps")
+    };
+
+    let glob = plan_for("libs/*.jar");
+    assert!(glob.warnings.is_empty(), "{:?}", glob.warnings);
+    assert_eq!(
+        glob.plan.classpath,
+        [
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/a.jar").unwrap()),
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/b.jar").unwrap()),
+        ]
+    );
+
+    // A directory that holds jars stays a directory entry as well: it may also be a classes
+    // directory, and replacing it with only its jars would drop everything else on the classpath.
+    let directory = plan_for("libs");
+    assert!(directory.warnings.is_empty(), "{:?}", directory.warnings);
+    assert_eq!(
+        directory.plan.classpath,
+        [
+            ClasspathEntry::ProjectDirectory(DirKey::parse("libs").unwrap()),
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/a.jar").unwrap()),
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/b.jar").unwrap()),
+        ]
+    );
+
+    // `**` recurses; the pattern is still bounded by its own segments.
+    fs::create_dir_all(project.path().join("libs/nested")).unwrap();
+    fs::write(project.path().join("libs/nested/c.jar"), b"c").unwrap();
+    let recursive = plan_for("libs/**/*.jar");
+    assert_eq!(
+        recursive.plan.classpath,
+        [
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/a.jar").unwrap()),
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/b.jar").unwrap()),
+            ClasspathEntry::ProjectFile(FileKey::parse("libs/nested/c.jar").unwrap()),
+        ]
+    );
+
+    // An unmatched glob keeps the authored spelling so the diagnostic names what was written.
+    let unmatched = plan_for("libs/*.nomatch");
+    assert!(unmatched.plan.classpath.is_empty());
+    assert!(
+        unmatched
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("matched no files")),
+        "{:?}",
+        unmatched.warnings
+    );
 }
 
 #[test]

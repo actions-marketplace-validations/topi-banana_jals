@@ -590,6 +590,22 @@ fn build_classpath_globs_expand_into_deterministic_javac_arguments() {
     let a = stdout.find("libs/a.jar").unwrap();
     let b = stdout.find("libs/b.jar").unwrap();
     assert!(a < b, "glob expansion must be sorted; got: {stdout}");
+
+    // A plain directory keeps its directory entry and adds the jars it holds.
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"globs\"\n[build]\nclasspath = [\"libs\"]\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("libs/a.jar"), "got: {stdout}");
+    assert!(stdout.contains("libs/b.jar"), "got: {stdout}");
 }
 
 #[test]

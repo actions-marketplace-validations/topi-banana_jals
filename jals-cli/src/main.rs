@@ -3291,7 +3291,13 @@ impl App {
         // A `[build] classpath` glob is a host filesystem question, so it is resolved here, once,
         // before invocation planning. The native plan expands again for hosts that reach it
         // directly (the LSP); expanded entries fall through unchanged.
-        jals_classpath::NativeProjectPlan::expand_build_classpath(manifest, root);
+        for (entry, message) in
+            jals_classpath::NativeProjectPlan::expand_build_classpath(manifest, root)
+        {
+            session
+                .shell()
+                .warn(format_args!("classpath entry `{entry}`: {message}"));
+        }
         let sources = Self::discover_sources(
             manifest,
             root,
