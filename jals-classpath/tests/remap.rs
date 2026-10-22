@@ -69,7 +69,12 @@ c\tBox\tclass_1\tRenamed
 async fn remapped_class_name(cache: &ArtifactCache<MemoryCache>, key: &CacheKey) -> String {
     let bytes = cache.lookup(key).await.expect("lookup").expect("present");
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("remapped jar is a zip");
-    let name = archive.file_names().next().expect("one member").to_owned();
+    let name = archive
+        .file_names()
+        .next()
+        .expect("one member")
+        .expect("member name decodes")
+        .into_owned();
     let mut member = archive.by_name(&name).expect("member");
     let mut class_bytes = Vec::new();
     std::io::copy(&mut member, &mut class_bytes).unwrap();
@@ -227,10 +232,10 @@ fn merge_overlay_wins_on_conflict() {
         let mut names = Vec::new();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            names.push(file.name().to_owned());
+            names.push(file.name().expect("member name decodes").into_owned());
             let mut body = Vec::new();
             std::io::copy(&mut file, &mut body).unwrap();
-            match file.name() {
+            match file.name().expect("member name decodes").as_ref() {
                 "a.txt" => assert_eq!(body, b"base-a"),
                 "shared.txt" => assert_eq!(body, b"overlay-shared"),
                 "b.txt" => assert_eq!(body, b"overlay-b"),
@@ -485,7 +490,7 @@ Renamed -> Box:
         let names: Vec<String> = zip::ZipArchive::new(Cursor::new(bytes.clone()))
             .expect("remapped jar is a zip")
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.expect("member name decodes").into_owned())
             .collect();
         assert!(!names.iter().any(|name| name == "META-INF/SIGNER.SF"));
         assert!(!names.iter().any(|name| name == "META-INF/SIGNER.RSA"));
@@ -545,7 +550,7 @@ fn merge_drops_both_sides_signatures_and_stale_digests() {
         let names: Vec<String> = zip::ZipArchive::new(Cursor::new(bytes.clone()))
             .expect("merged jar is a zip")
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.expect("member name decodes").into_owned())
             .collect();
         assert!(!names.iter().any(|name| name == "META-INF/SIGNER.SF"));
         assert!(!names.iter().any(|name| name == "META-INF/SIGNER.RSA"));
@@ -593,7 +598,7 @@ fn a_merged_jar_carries_one_manifest_and_carries_it_first() {
         let names: Vec<String> = zip::ZipArchive::new(Cursor::new(bytes.clone()))
             .expect("merged jar is a zip")
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.expect("member name decodes").into_owned())
             .collect();
         assert_eq!(
             names.first().map(String::as_str),
@@ -672,7 +677,7 @@ fn a_multi_release_base_re_declares_the_attribute_on_the_surviving_manifest() {
         let names: Vec<String> = zip::ZipArchive::new(Cursor::new(bytes))
             .expect("merged jar is a zip")
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.expect("member name decodes").into_owned())
             .collect();
         assert!(
             names
@@ -721,7 +726,7 @@ fn a_manifest_spelled_differently_on_the_two_sides_is_still_one_conflict() {
         let names: Vec<String> = zip::ZipArchive::new(Cursor::new(bytes.clone()))
             .expect("merged jar is a zip")
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.expect("member name decodes").into_owned())
             .collect();
         assert_eq!(
             names

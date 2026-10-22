@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(oracle.len(), entries.len());
         for (index, (name, bytes)) in entries.iter().enumerate() {
             let mut reader = oracle.by_index(index).expect("oracle reads");
-            assert_eq!(reader.name(), *name);
+            assert_eq!(reader.name().expect("oracle decodes the name"), *name);
             let mut got = Vec::new();
             std::io::copy(&mut reader, &mut got).unwrap();
             assert_eq!(&got, bytes);
@@ -927,7 +927,10 @@ mod tests {
         assert_eq!(directory.members.len(), oracle.len());
         for (index, member) in directory.members.iter().enumerate() {
             let mut expected = oracle.by_index(index).expect("oracle reads");
-            assert_eq!(member.name, expected.name());
+            assert_eq!(
+                member.name,
+                expected.name().expect("oracle decodes the name").as_ref()
+            );
             assert_eq!(member.is_dir, expected.is_dir());
             let mut expected_bytes = Vec::new();
             std::io::copy(&mut expected, &mut expected_bytes).unwrap();
