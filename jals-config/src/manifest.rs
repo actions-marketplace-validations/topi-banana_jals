@@ -591,6 +591,21 @@ pub enum DependencyError {
         /// The dependency's name.
         name: String,
     },
+    /// A classpath-only `path` dependency declares build features or `default-features`, but it
+    /// runs no build script and has no source form to route a feature into.
+    ClasspathPathWithFeatures {
+        /// The dependency's name.
+        name: String,
+        /// Which field carried the meaningless value.
+        field: &'static str,
+    },
+    /// A classpath-only `path` dependency's `dir` is absolute or escapes the dependency root.
+    ClasspathDir {
+        /// The dependency's name.
+        name: String,
+        /// The offending value.
+        value: String,
+    },
     /// A registry entry's `version` is not a version requirement.
     RegistryRequirement {
         /// The dependency's name.
@@ -649,6 +664,16 @@ impl fmt::Display for DependencyError {
                 "dependency `{name}` sets both `remap` and `sources`, but only the classes are \
                  remapped: go-to-definition would land on obfuscated names for types the classpath \
                  now spells out (drop one)"
+            ),
+            Self::ClasspathPathWithFeatures { name, field } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but sets `{field}`; a classpath-only \
+                 path dependency runs no build script and has no source form to route it into"
+            ),
+            Self::ClasspathDir { name, value } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but its `dir` `{value}` is absolute \
+                 or escapes the dependency root"
             ),
             Self::RegistryRequirement { name, value } => write!(
                 f,
@@ -2719,11 +2744,31 @@ impl Dependency {
                         field: "path",
                     });
                 }
-                if path.is_classpath() && path.dir.as_deref() == Some("") {
-                    return Err(DependencyError::Empty {
-                        name: name.to_owned(),
-                        field: "dir",
-                    });
+                if path.is_classpath() {
+                    if !path.features.is_empty() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "features",
+                        });
+                    }
+                    if path.default_features.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "default-features",
+                        });
+                    }
+                    if let Some(dir) = &path.dir {
+                        let absolute = dir.starts_with('/')
+                            || dir.starts_with('\\')
+                            || dir.as_bytes().get(1) == Some(&b':');
+                        let escapes = dir.split(['/', '\\']).any(|part| part == "..");
+                        if dir.is_empty() || absolute || escapes {
+                            return Err(DependencyError::ClasspathDir {
+                                name: name.to_owned(),
+                                value: dir.clone(),
+                            });
+                        }
+                    }
                 }
                 Ok(())
             }

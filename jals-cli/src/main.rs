@@ -2858,9 +2858,13 @@ impl App {
         // directory/jar itself, exactly as it does an authored `[build] classpath` entry.
         for (_, dependency) in manifest.active_dependencies(scope, scripts.features) {
             if let Some(path) = dependency.classpath_only_path() {
-                result
-                    .extra_classpath
-                    .push(root.join(path.classpath_path()));
+                let entry = path.classpath_path();
+                let entry = Path::new(&entry);
+                result.extra_classpath.push(if entry.is_absolute() {
+                    entry.to_path_buf()
+                } else {
+                    root.join(entry)
+                });
             }
         }
         let exec = storage.exec().clone();

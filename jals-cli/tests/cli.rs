@@ -518,7 +518,7 @@ fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
     std::fs::write(
         dir.path().join("jals.toml"),
         "[package]\nname = \"consumer\"\n\
-         [dependencies]\nstub = { path = \"../stub\", dir = \"classes\", mode = \"classpath\" }\n",
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
     )
     .unwrap();
     let src = dir.path().join("src/main/java/com/example");
@@ -528,7 +528,7 @@ fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
         "package com.example;\nclass Main { }\n",
     )
     .unwrap();
-    let stub = dir.path().join("../stub");
+    let stub = dir.path().join("stub");
     std::fs::create_dir_all(stub.join("classes")).unwrap();
     std::fs::create_dir_all(stub.join("src/main/java")).unwrap();
     std::fs::write(
@@ -544,14 +544,18 @@ fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
         dir.path().join("jals.toml").to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("classes"), "got: {stdout}");
+    let stub_classes = dir.path().join("stub").join("classes");
+    assert!(
+        stdout.contains(&stub_classes.display().to_string()),
+        "the stub's classes directory must be on the classpath: {stdout}"
+    );
     assert!(!stdout.contains("Broken.java"), "got: {stdout}");
 
     std::fs::write(
         dir.path().join("jals.toml"),
         "[package]\nname = \"consumer\"\n\
          [build]\nbackend = { type = \"jals\" }\n\
-         [dependencies]\nstub = { path = \"../stub\", dir = \"classes\", mode = \"classpath\" }\n",
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
     )
     .unwrap();
     let status = jals()

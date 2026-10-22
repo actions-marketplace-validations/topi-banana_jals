@@ -260,6 +260,8 @@ impl ProjectScript {
     /// **Registry entries are kept.** They are deliberately not graph nodes — a Maven package has
     /// no `.java` and no build script — so `assemble_native` is the one place they resolve, and
     /// dropping them here would silently remove every registry dependency from the classpath.
+    /// **Classpath-only `path` entries are kept too.** The walk skips them because they have no
+    /// project to lower; this lowering is the only place their compiled output reaches the plan.
     ///
     /// `[dev-dependencies]` is cleared for the same reason as the build table: an entry the walk
     /// did not visit contributes no node. Its registry entries are kept under the caller's scope,
