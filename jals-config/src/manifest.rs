@@ -378,12 +378,11 @@ impl Workspace {
     /// exist. A member's own value always wins, except for list-valued options, where the
     /// workspace entries are prepended and the member's keep their order after them.
     fn inherit_into(&self, manifest: &mut Manifest) {
+        /// Additive by contract: workspace entries keep their authored order first, and the
+        /// member's entries follow. Duplicates are not removed — a repeated entry is a manifest
+        /// value, and silently dropping one would make the merge order-dependent.
         fn prepend(values: &mut Vec<String>, defaults: &[String]) {
-            let mut merged: Vec<String> = defaults
-                .iter()
-                .filter(|entry| !values.contains(entry))
-                .cloned()
-                .collect();
+            let mut merged = defaults.to_vec();
             merged.append(values);
             *values = merged;
         }
@@ -3835,9 +3834,13 @@ impl Manifest {
                 path: Self::IN_MEMORY_NAME.to_owned(),
                 source,
             })?;
-        if let Some(workspace) = workspace
-            && manifest.workspace.is_none()
-        {
+        if let Some(workspace) = workspace {
+            if manifest.workspace.is_some() {
+                return Err(ManifestParseError::Invalid {
+                    path: Self::IN_MEMORY_NAME.to_owned(),
+                    source: ValidationError::MemberDeclaresWorkspace,
+                });
+            }
             workspace.inherit_into(&mut manifest);
         }
         manifest
@@ -4147,6 +4150,8 @@ pub enum ValidationError {
         /// The offending URL.
         url: String,
     },
+    /// A workspace member manifest carries its own `[workspace]` table.
+    MemberDeclaresWorkspace,
     /// A `[workspace]` table declares no member at all.
     EmptyWorkspace,
     /// A `[workspace]` pattern is empty or is not a resource-style glob.
@@ -4368,6 +4373,11 @@ impl fmt::Display for ValidationError {
                 f,
                 "`[registries] {name}` has a URL of `{url}` (expected an `https://` or `http://` \
                  repository base URL)"
+            ),
+            Self::MemberDeclaresWorkspace => write!(
+                f,
+                "a workspace member manifest declares its own `[workspace]`; a member cannot be a \
+                 workspace root (nested workspaces are discovered by walking to the nearest root)"
             ),
             Self::EmptyWorkspace => write!(
                 f,
@@ -7145,12 +7155,16 @@ mod tests {
              [workspace.package]\nversion = \"1.2.3\"\n",
         )
         .unwrap();
-        let manifest = Manifest::from_str_inheriting(
-            "[workspace]\nmembers = [\"app\"]\n[package]\nname = \"root\"\n",
-            root.workspace.as_ref(),
-        )
-        .unwrap();
-        assert_eq!(manifest.package.version, None);
+        assert!(matches!(
+            Manifest::from_str_inheriting(
+                "[workspace]\nmembers = [\"app\"]\n[package]\nname = \"root\"\n",
+                root.workspace.as_ref(),
+            ),
+            Err(ManifestParseError::Invalid {
+                source: ValidationError::MemberDeclaresWorkspace,
+                ..
+            })
+        ));
     }
 
     #[test]

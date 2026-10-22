@@ -3608,10 +3608,22 @@ impl App {
                 )
             })?;
         let members = workspace.manifests().await?;
-        debug_assert_eq!(workspace.members().len(), members.len());
+        if members.len() != workspace.members().len() {
+            bail!(
+                "workspace `{}` returned {} manifests for {} members",
+                workspace.root().display(),
+                members.len(),
+                workspace.members().len()
+            );
+        }
         let mut available = Vec::with_capacity(members.len());
         for (path, manifest) in workspace.members().iter().zip(members) {
-            if manifest.package.name.as_deref() == Some(package) {
+            let directory_matches = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(package);
+            if manifest.package.name.as_deref() == Some(package) || directory_matches {
                 // Return the manifest inheritance already produced. Re-reading the file through
                 // `resolve_manifest` would use `Manifest::from_file`, whose parse has no workspace
                 // attached and would silently drop every inherited value for the selected member.

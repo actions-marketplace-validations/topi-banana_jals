@@ -177,7 +177,7 @@ fn package_selects_a_workspace_member_for_build_and_run() {
         .unwrap();
     assert!(!missing.status.success());
     assert!(
-        String::from_utf8_lossy(&missing.stderr).contains("was not found"),
+        String::from_utf8_lossy(&missing.stderr).contains("`missing`"),
         "stderr: {}",
         String::from_utf8_lossy(&missing.stderr)
     );
