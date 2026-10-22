@@ -336,6 +336,7 @@ impl ProjectWorkspace {
             project_root,
             storage,
             source_roots,
+            BTreeMap::new(),
             Vec::new(),
             classfiles,
             library_sources,
@@ -379,6 +380,7 @@ impl ProjectWorkspace {
         project_root: PathBuf,
         storage: NativeStorage,
         source_roots: Vec<DirKey>,
+        source_filters: BTreeMap<DirKey, jals_config::SourceFilter>,
         project_sources: Vec<FileKey>,
         classfiles: &[jals_classfile::ClassFile],
         library_sources: Vec<FileKey>,
@@ -390,6 +392,7 @@ impl ProjectWorkspace {
     ) -> Self {
         let spec = ProjectLayout {
             source_roots,
+            source_filters,
             project_sources,
             library_sources,
             source_dep_sources,

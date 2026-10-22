@@ -198,6 +198,7 @@ impl FeatureSelection {
 pub(crate) struct AssembledWorkspace {
     storage: NativeStorage,
     source_roots: Vec<DirKey>,
+    source_filters: BTreeMap<DirKey, jals_config::SourceFilter>,
     project_sources: Vec<FileKey>,
     classpath_classes: Vec<jals_classfile::ClassFile>,
     feature_set: FeatureSet,
@@ -1107,6 +1108,7 @@ impl Actor {
         let AssembledWorkspace {
             storage,
             source_roots,
+            source_filters,
             project_sources,
             classpath_classes,
             feature_set,
@@ -1141,6 +1143,7 @@ impl Actor {
             root.clone(),
             storage,
             source_roots,
+            source_filters,
             project_sources,
             &classpath_classes,
             library_sources,
@@ -2059,6 +2062,7 @@ impl AssembledWorkspace {
         Self {
             storage,
             source_roots,
+            source_filters: effective_manifest.source_filters(),
             project_sources: project_sources.into_iter().collect(),
             classpath_classes: inputs.classpath_classes,
             feature_set: inputs.feature_set,

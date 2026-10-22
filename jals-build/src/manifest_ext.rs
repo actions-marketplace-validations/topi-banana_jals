@@ -7,11 +7,13 @@
 //! (`std::fs` reads); `jals-cli`/`jals-lsp` consume it. Dependency classification is portable and
 //! lives in `jals-classpath`'s input plan.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use jals_config::{Manifest, ManifestParseError, ValidationError};
+use jals_config::{Manifest, ManifestParseError, SourceFilter, ValidationError};
+use jals_storage::{DirKey, RelativePath};
 
 /// An error loading, parsing, or validating a manifest file from disk.
 ///
@@ -103,6 +105,14 @@ pub trait ManifestExt {
     /// lives: the main tree is where most tests are, and a separate test tree is the Java
     /// convention layered on top of that, never instead of it.
     fn test_source_roots(&self, manifest_dir: &Path) -> Vec<PathBuf>;
+
+    /// Per-root source selection for the editor index.
+    ///
+    /// Build roots carry [`Build::include`](jals_config::Build::include)'s filter; the roots
+    /// [`Test::source_dirs`](jals_config::Test::source_dirs) adds carry `[test]`'s. A root that
+    /// cannot be spelled as a portable [`DirKey`] is simply absent, which means "select every
+    /// file" — the editor must not lose a source root just because a filter cannot address it.
+    fn source_filters(&self) -> BTreeMap<DirKey, SourceFilter>;
 }
 
 impl ManifestExt for Manifest {
@@ -161,6 +171,29 @@ impl ManifestExt for Manifest {
         }
         roots
     }
+
+    fn source_filters(&self) -> BTreeMap<DirKey, SourceFilter> {
+        // This trait is implemented for any `Manifest`, not only one loaded through
+        // `Manifest::from_file`. A malformed filter therefore means "select every file", the same
+        // fallback a root that cannot be addressed gets, rather than a panic on a host path.
+        let (Ok(build), Ok(test)) = (self.build.source_filter(), self.test.source_filter()) else {
+            return BTreeMap::new();
+        };
+        let mut filters = BTreeMap::new();
+        for dir in &self.build.source_dirs {
+            if let Ok(path) = RelativePath::resolve(&RelativePath::ROOT, dir) {
+                filters.insert(DirKey::new(path), build.clone());
+            }
+        }
+        for dir in &self.test.source_dirs {
+            if let Ok(path) = RelativePath::resolve(&RelativePath::ROOT, dir) {
+                filters
+                    .entry(DirKey::new(path))
+                    .or_insert_with(|| test.clone());
+            }
+        }
+        filters
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +228,33 @@ mod tests {
             plain.test_source_roots(Path::new("/p")),
             plain.source_roots(Path::new("/p"))
         );
+    }
+
+    #[test]
+    fn source_filters_follow_the_root_they_belong_to() {
+        let m: Manifest = toml::from_str(
+            "[build]\nsource-dirs = [\".\", \"src\"]\nexclude = [\"module-info.java\"]\n\
+             [test]\nsource-dirs = [\"src/test/java\", \"src\"]\nexclude = [\"**/*IT.java\"]\n",
+        )
+        .unwrap();
+        let filters = m.source_filters();
+        let root = DirKey::ROOT;
+        let build = filters.get(&root).expect("a rootless source dir is a root");
+        assert!(!build.accepts(&RelativePath::parse("module-info.java").unwrap()));
+        assert!(build.accepts(&RelativePath::parse("Main.java").unwrap()));
+
+        let src = DirKey::parse("src").unwrap();
+        let shared = filters
+            .get(&src)
+            .expect("the build filter wins for a shared root");
+        assert!(!shared.accepts(&RelativePath::parse("module-info.java").unwrap()));
+
+        let test = DirKey::parse("src/test/java").unwrap();
+        let test_filter = filters
+            .get(&test)
+            .expect("a test-only root uses the test filter");
+        assert!(!test_filter.accepts(&RelativePath::parse("MainIT.java").unwrap()));
+        assert!(test_filter.accepts(&RelativePath::parse("Main.java").unwrap()));
     }
 
     #[test]

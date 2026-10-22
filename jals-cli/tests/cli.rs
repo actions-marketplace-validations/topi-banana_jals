@@ -429,6 +429,74 @@ fn build_dry_run_prints_javac_command() {
 }
 
 #[test]
+fn build_excludes_matching_sources_before_javac() {
+    let dir = project(
+        "[package]\nname = \"excluded\"\n\
+         [build]\nexclude = [\"module-info.java\", \"**/Broken.java\"]\n",
+    );
+    let manifest = dir.path().join("jals.toml");
+    let src = dir.path().join("src/main/java/com/example");
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { requires not.a.real.module; }\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("Broken.java"), "class Broken { void m( {\n").unwrap();
+    std::fs::write(
+        src.join("Kept.java"),
+        "package com.example; class Kept {}\n",
+    )
+    .unwrap();
+
+    let (stdout, code) = run(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        manifest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "got: {stdout}");
+    assert!(stdout.contains("Main.java"), "got: {stdout}");
+    assert!(stdout.contains("Kept.java"), "got: {stdout}");
+    assert!(!stdout.contains("module-info.java"), "got: {stdout}");
+    assert!(!stdout.contains("Broken.java"), "got: {stdout}");
+
+    // The in-process backend runs without a JDK, so the assertion below is about the compile
+    // failing on an excluded file rather than about the host having `javac`.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"excluded\"\n\
+         [build]\nbackend = { type = \"jals\" }\n\
+         exclude = [\"module-info.java\", \"**/Broken.java\"]\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(status.success(), "an excluded source must not be compiled");
+
+    // Negative control: without the exclusions the same tree must fail, so the success above is
+    // attributable to the filter rather than to a backend that tolerates the broken files.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"excluded\"\n[build]\nbackend = { type = \"jals\" }\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "an unexcluded broken source must fail the build"
+    );
+}
+
+#[test]
 fn build_dry_run_executes_and_publishes_build_script_outputs() {
     let dir = project(
         "[package]\nname = \"dry-run-script\"\n\

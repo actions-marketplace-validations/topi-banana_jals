@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::cell::OnceCell;
 use core::ops::Range;
 
-use jals_config::FeatureSet;
+use jals_config::{FeatureSet, SourceFilter};
 use jals_exec::Exec;
 use jals_hir::{FileAnalysis, FileFacts, FileId, LoweredClasspath, ProjectIndex, SourceLocations};
 use jals_storage::{CacheBackend, DirKey, FileKey, ProjectStorage, ProjectView, SourceBackend};
@@ -235,6 +235,14 @@ impl SourceFile {
 pub struct ProjectLayout {
     /// The directories walked for `.java` (virtual paths).
     pub source_roots: Vec<DirKey>,
+    /// Per-root selection of the files under [`source_roots`](Self::source_roots).
+    ///
+    /// A root absent from this map selects every `.java`, which is what every host that has no
+    /// manifest filter gets. A present filter sees the file's path *below* that root, so
+    /// `exclude = ["module-info.java"]` drops the module declaration at any root. An excluded path
+    /// is not owned by this workspace — a host that has it open answers it through its detached
+    /// single-file path, the same way it answers a file outside every root.
+    pub source_filters: BTreeMap<DirKey, SourceFilter>,
     /// Exact project source files outside (or alongside) the source-root walk. Hosts use this for
     /// generated sources explicitly selected by identity; siblings are not implicitly included.
     pub project_sources: Vec<FileKey>,
@@ -317,6 +325,7 @@ pub struct Workspace<S: SourceBackend, C: CacheBackend> {
     exec: Exec,
     storage: ProjectStorage<S, C>,
     source_roots: Vec<DirKey>,
+    source_filters: BTreeMap<DirKey, SourceFilter>,
     project_sources: Vec<FileKey>,
     files: Vec<SourceFile>,
     by_path: BTreeMap<FileKey, FileId>,
@@ -407,6 +416,7 @@ impl<S: SourceBackend, C: CacheBackend> Workspace<S, C> {
             exec,
             storage,
             source_roots: spec.source_roots,
+            source_filters: spec.source_filters,
             project_sources,
             files: Vec::new(),
             by_path: BTreeMap::new(),
@@ -450,9 +460,21 @@ impl<S: SourceBackend, C: CacheBackend> Workspace<S, C> {
         let mut paths: Vec<FileKey> = self
             .source_roots
             .iter()
-            .flat_map(|root| view.tree().files_under(root))
-            .filter(|file| file.key().has_extension("java"))
-            .map(|file| file.key().clone())
+            .flat_map(|root| {
+                view.tree()
+                    .files_under(root)
+                    .filter(|file| file.key().has_extension("java"))
+                    .filter(|file| {
+                        let Some(filter) = self.source_filters.get(root) else {
+                            return true;
+                        };
+                        let Some(relative) = file.key().path().strip_prefix(root.path()) else {
+                            return true;
+                        };
+                        filter.accepts(&relative)
+                    })
+                    .map(|file| file.key().clone())
+            })
             .collect();
         paths.extend(
             self.project_sources
@@ -770,7 +792,17 @@ impl<S: SourceBackend, C: CacheBackend> Workspace<S, C> {
 
     /// Whether `path` lies under one of this workspace's source roots.
     fn under_source_root(&self, path: &FileKey) -> bool {
-        self.source_roots.iter().any(|root| Self::under(path, root))
+        self.source_roots.iter().any(|root| {
+            if !Self::under(path, root) {
+                return false;
+            }
+            let Some(filter) = self.source_filters.get(root) else {
+                return true;
+            };
+            path.path()
+                .strip_prefix(root.path())
+                .is_none_or(|relative| filter.accepts(&relative))
+        })
     }
 
     /// Reflect an open document into the index: replace the cached copy of `path` with the
@@ -1046,6 +1078,33 @@ mod tests {
                 "unopened but under root"
             );
             assert!(!ws.owns_path(&key("elsewhere/X.java")));
+        });
+    }
+
+    #[test]
+    fn excluded_source_root_files_are_not_indexed_or_owned() {
+        block_on_inline(async {
+            let storage = memory(&[
+                ("src/Main.java", "class Main { }"),
+                ("src/module-info.java", "module demo { }"),
+            ]);
+            let mut filters = BTreeMap::new();
+            filters.insert(
+                DirKey::parse("src").unwrap(),
+                SourceFilter::new(&[], &["module-info.java".to_owned()]).unwrap(),
+            );
+            let ws = Workspace::load(
+                storage,
+                ProjectLayout {
+                    source_filters: filters,
+                    ..ProjectLayout::new(vec![DirKey::parse("src").unwrap()])
+                },
+            )
+            .await;
+
+            assert!(ws.owns_path(&key("src/Main.java")));
+            assert!(!ws.owns_path(&key("src/module-info.java")));
+            assert!(ws.file_id(&key("src/module-info.java")).is_none());
         });
     }
 

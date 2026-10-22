@@ -644,6 +644,13 @@ impl<H: GraphHost> GraphWalk<'_, H> {
         manifest: &Manifest,
     ) -> Vec<CapturedFile> {
         // Deduplicates overlapping `source-dirs` and imposes one deterministic order.
+        let filter = match manifest.build.source_filter() {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.warn_entry(location, "include/exclude", error.to_string());
+                jals_config::SourceFilter::default()
+            }
+        };
         let mut files = BTreeMap::new();
         for (index, source) in manifest.build.source_dirs.iter().enumerate() {
             let mut notes = Vec::new();
@@ -671,7 +678,9 @@ impl<H: GraphHost> GraphWalk<'_, H> {
             {
                 let member =
                     RelativePath::new(file.key().path().segments().skip(prefix_len).cloned());
-                files.insert(prefix.concat(&member), file.bytes().to_vec());
+                if filter.accepts(&member) {
+                    files.insert(prefix.concat(&member), file.bytes().to_vec());
+                }
             }
         }
         files
