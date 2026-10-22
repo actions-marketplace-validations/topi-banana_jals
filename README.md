@@ -483,6 +483,15 @@ and `[build] source-dirs` all resolve relative to its selected root. If it is mi
 the legacy source convention (`src/main/java`, then `src`, then the selected root). A present but
 malformed manifest or a dependency cycle is a hard `jals build`/`run` failure.
 
+### Workspaces
+
+A root `jals.toml` with `[workspace] members = ["app", "libs/*"]` gives its members one
+`jals.lock` and one `target` at the root. `[workspace.package] version`,
+`[workspace.dependencies]`, and `[workspace.build]` are Maven-parent-shaped defaults: a member that
+omits a value inherits it, and one that writes its own keeps it. Select one member with
+`jals build -p app` (also `run`/`test`); the command's root becomes that member, so a virtual
+workspace root needs no `[package]` of its own.
+
 Graph nodes have stable identities, so a diamond is visited once even when dependency names differ.
 Every unique node takes the preprocessing transition unconditionally and exactly once in
 dependency-first order; binary and legacy-source nodes are no-ops, while a manifest-backed node runs

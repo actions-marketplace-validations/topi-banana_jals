@@ -286,6 +286,10 @@ struct BuildArgs {
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
 
+    /// Build this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
+
     /// Print the javac command that would run and exit, without compiling.
     #[arg(long)]
     dry_run: bool,
@@ -320,6 +324,10 @@ struct RunArgs {
     /// Use this manifest instead of discovering `jals.toml` upward from the cwd.
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
+
+    /// Run this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
 
     /// Print the javac/java commands that would run and exit, without compiling or running.
     #[arg(long)]
@@ -440,6 +448,9 @@ struct TestArgs {
     /// Path to `jals.toml`.
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
+    /// Test this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
     /// Never fetch a dependency over the network.
     #[arg(long)]
     offline: bool,
@@ -1097,7 +1108,9 @@ impl BuildArgs {
         if self.dry_run {
             session.stdout_is_free("`--dry-run`")?;
         }
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         let features = self.features.resolve(&manifest)?;
         if let Some(out) = &self.out_dir {
@@ -1212,7 +1225,9 @@ impl RunArgs {
             // into the lines a script parses.
             session.owns_stdout();
         }
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         // Which of the two run steps this project has. `[build] backend` decides it, because the
         // two produce different things: class files a JVM loads by name, or one module an engine
@@ -1568,7 +1583,9 @@ impl TestArgs {
         // the result objects `--message-format json` has always named. The event stream stands
         // down rather than interleaving a second schema into the same lines.
         session.owns_stdout();
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         self.refuse_unsupported(&manifest)?;
         let features = self.features.resolve(&manifest)?;
@@ -3555,6 +3572,73 @@ impl App {
                 }
             });
         Ok(RootScript { assembled, host })
+    }
+
+    /// Resolve the manifest a command targets, optionally selecting one workspace member by
+    /// `[package] name`.
+    ///
+    /// `-p` is a selection, not a second project layout: it finds the enclosing workspace, loads
+    /// every member under the same inheritance pass, and then hands the selected member to the
+    /// ordinary path so nothing downstream knows the difference.
+    async fn resolve_manifest_for(
+        explicit: Option<&Path>,
+        package: Option<&str>,
+    ) -> Result<(Manifest, PathBuf)> {
+        let Some(package) = package else {
+            return Self::resolve_manifest(explicit).await;
+        };
+        let start = match explicit {
+            Some(path) => {
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .context("getting current dir")?
+                        .join(path)
+                };
+                path.parent().map(Path::to_path_buf).unwrap_or(path)
+            }
+            None => std::env::current_dir().context("getting current dir")?,
+        };
+        let workspace = ProjectWorkspace::discover(&start)
+            .context("discovering the workspace for `-p`")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "`-p {package}` requires a workspace: no enclosing jals.toml declares [workspace]"
+                )
+            })?;
+        let members = workspace.manifests().await?;
+        if members.len() != workspace.members().len() {
+            bail!(
+                "workspace `{}` returned {} manifests for {} members",
+                workspace.root().display(),
+                members.len(),
+                workspace.members().len()
+            );
+        }
+        let mut available = Vec::with_capacity(members.len());
+        for (path, manifest) in workspace.members().iter().zip(members) {
+            let directory_matches = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(package);
+            if manifest.package.name.as_deref() == Some(package) || directory_matches {
+                // Return the manifest inheritance already produced. Re-reading the file through
+                // `resolve_manifest` would use `Manifest::from_file`, whose parse has no workspace
+                // attached and would silently drop every inherited value for the selected member.
+                let root = path.parent().unwrap_or_else(|| Path::new("."));
+                return Ok((manifest, root.to_path_buf()));
+            }
+            if let Some(name) = manifest.package.name {
+                available.push(name);
+            }
+        }
+        bail!(
+            "workspace member `{package}` was not found in {} (available: {})",
+            workspace.root().display(),
+            available.join(", ")
+        )
     }
 
     /// Resolves the manifest from an explicit path or by discovering `jals.toml` upward from the cwd,

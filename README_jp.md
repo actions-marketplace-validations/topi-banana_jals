@@ -460,6 +460,15 @@ environment directive は、後続の明示的な `jals build` / `run` による
 規約（`src/main/java`、次に `src`、最後に selected root）を使います。file が存在するのに不正な場合や
 dependency cycle がある場合、`jals build`/`run` は hard failure になります。
 
+### Workspace
+
+`[workspace] members = ["app", "libs/*"]` を持つ root の `jals.toml` は、member 全体で 1 つの
+`jals.lock` と root の `target` を共有します。`[workspace.package] version`、
+`[workspace.dependencies]`、`[workspace.build]` は Maven parent 相当の既定値で、member が省略した
+値だけを継承し、member 自身の指定が優先されます。`jals build -p app`（`run`/`test` も同様）で
+member を 1 つ選ぶと、その member が command の root になるため、virtual workspace root に
+`[package]` は不要です。
+
 graph node は stable identity を持つため、dependency 名が異なる diamond でも一度だけ visit されます。
 一意な各 node は dependency-first 順に、無条件かつちょうど一度 preprocess transition を通ります。
 binary node と legacy-source node では no-op、manifest-backed node では任意の build script を実行します。
