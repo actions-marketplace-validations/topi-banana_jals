@@ -3288,6 +3288,19 @@ impl App {
             session,
         )
         .await?;
+        // Keep the authored spelling for the module-path promotion below: a glob must reach
+        // `--module-path` as the entries it names, not as the already-expanded classpath list.
+        let authored_classpath = manifest.build.classpath.clone();
+        // A `[build] classpath` glob is a host filesystem question, so it is resolved here, once,
+        // before invocation planning. The native plan expands again for hosts that reach it
+        // directly (the LSP); expanded entries fall through unchanged.
+        for (entry, message) in
+            jals_classpath::NativeProjectPlan::expand_build_classpath(manifest, root)
+        {
+            session
+                .shell()
+                .warn(format_args!("classpath entry `{entry}`: {message}"));
+        }
         let sources = Self::discover_sources(
             manifest,
             root,
@@ -3317,12 +3330,14 @@ impl App {
             // `[build] classpath` entries are jars a JPMS project usually needs on the module path
             // instead. They stay in `classpath` too, so `jals run` and a non-modular consumer keep
             // their existing reading.
-            for entry in &manifest.build.classpath {
+            for entry in &authored_classpath {
                 if !manifest.build.module_path.contains(entry) {
                     manifest.build.module_path.push(entry.clone());
                 }
             }
         }
+        manifest.build.module_path =
+            jals_classpath::NativeProjectPlan::expanded_module_path_entries(manifest, root);
         // The root build script's output is root project source, so it goes through the root
         // frontend alongside the authored files. Dependency-contributed sources, which land in
         // `extra_sources` further down, deliberately do not: a dependency is lowered under its

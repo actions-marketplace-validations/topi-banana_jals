@@ -810,6 +810,221 @@ impl NativeProjectPlan {
         owners
     }
 
+    /// Expand one `[build] classpath` entry into the entries it names.
+    ///
+    /// Three spellings are accepted: a glob (`libs/*.jar`, `libs/**/*.jar`) matched below the
+    /// directory before its first wildcard; a directory containing jars, expanded to those jars in
+    /// sorted order; and anything else, returned unchanged. Matches are sorted by their
+    /// project-relative spelling (or host path outside the project), so the same input produces the
+    /// same argument vector on every walk.
+    fn expand_classpath_entry(project_root: &Path, raw: &str) -> Result<Vec<String>, String> {
+        /// A hard ceiling even for `**`: a junction/bind mount is not a symlink, so the walk
+        /// still needs a finite bound of its own.
+        const MAX_DEPTH: usize = 64;
+
+        fn portable_path(project_root: &Path, path: &Path) -> String {
+            RelativePath::from_host_path(project_root, path).map_or_else(
+                || path.display().to_string(),
+                |relative| relative.to_string(),
+            )
+        }
+
+        fn relative_path(path: &Path) -> Option<RelativePath> {
+            let mut segments = Vec::new();
+            for component in path.components() {
+                segments.push(Name::new(component.as_os_str().to_str()?).ok()?);
+            }
+            Some(RelativePath::new(segments))
+        }
+
+        fn collect(
+            base: &Path,
+            dir: &Path,
+            depth: usize,
+            max_depth: Option<usize>,
+            pattern: &jals_config::ResourcePattern,
+            project_root: &Path,
+            matches: &mut Vec<String>,
+        ) -> Result<(), String> {
+            let entries = std::fs::read_dir(dir).map_err(|error| {
+                format!(
+                    "classpath glob base `{}` cannot be read: {error}",
+                    dir.display()
+                )
+            })?;
+            let paths: Vec<PathBuf> = entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    format!(
+                        "classpath glob base `{}` cannot be read: {error}",
+                        dir.display()
+                    )
+                })?;
+            for path in paths {
+                let symlink = std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
+                if path.is_dir() {
+                    // A symlinked directory can point at an ancestor; following it is how a
+                    // glob walks forever. A bounded pattern also stops descending once no
+                    // remaining segment can match.
+                    if symlink
+                        || depth + 1 >= MAX_DEPTH
+                        || max_depth.is_some_and(|limit| depth + 1 >= limit)
+                    {
+                        continue;
+                    }
+                    collect(
+                        base,
+                        &path,
+                        depth + 1,
+                        max_depth,
+                        pattern,
+                        project_root,
+                        matches,
+                    )?;
+                } else if let Ok(relative) = path.strip_prefix(base)
+                    && let Some(relative) = relative_path(relative)
+                    && pattern.matches(&relative)
+                {
+                    matches.push(portable_path(project_root, &path));
+                }
+            }
+            Ok(())
+        }
+
+        if !raw.contains(['*', '?']) {
+            let host = Self::resolve_host_path(project_root, raw);
+            if host.is_dir() {
+                let mut jars = Vec::new();
+                let entries = std::fs::read_dir(&host).map_err(|error| {
+                    format!("classpath directory `{raw}` cannot be read: {error}")
+                })?;
+                for entry in entries {
+                    let path = entry
+                        .map_err(|error| {
+                            format!("classpath directory `{raw}` cannot be read: {error}")
+                        })?
+                        .path();
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+                    {
+                        jars.push(portable_path(project_root, &path));
+                    }
+                }
+                if !jars.is_empty() {
+                    jars.sort();
+                    jars.dedup();
+                    // Keep the directory as well: a directory that holds jars may also be a
+                    // classes directory (or carry resources), and replacing it with only its
+                    // jars would silently drop everything else javac used to see.
+                    let mut expanded = vec![raw.to_owned()];
+                    expanded.extend(jars);
+                    return Ok(expanded);
+                }
+            }
+            return Ok(vec![raw.to_owned()]);
+        }
+
+        let host = Self::resolve_host_path(project_root, raw);
+        let mut base = PathBuf::new();
+        let mut pattern = Vec::new();
+        let mut wildcard = false;
+        for component in host.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if wildcard {
+                pattern.push(text.into_owned());
+            } else if text.contains(['*', '?']) {
+                wildcard = true;
+                pattern.push(text.into_owned());
+            } else {
+                base.push(component);
+            }
+        }
+        if !wildcard {
+            return Ok(vec![raw.to_owned()]);
+        }
+        let pattern_text = pattern.join("/");
+        let pattern = jals_config::ResourcePattern::parse(&pattern_text)
+            .map_err(|error| format!("classpath glob `{raw}` is invalid: {error}"))?;
+        let max_depth = (!pattern_text.split('/').any(|segment| segment == "**"))
+            .then(|| pattern_text.split('/').count());
+        let mut matches = Vec::new();
+        collect(
+            &base,
+            &base,
+            0,
+            max_depth,
+            &pattern,
+            project_root,
+            &mut matches,
+        )?;
+        // Sort the portable spellings, not the host paths visited on the way: on Windows the
+        // latter compare case-insensitively and would disagree with the documented order.
+        matches.sort();
+        matches.dedup();
+        Ok(matches)
+    }
+
+    fn expanded_classpath_entries(manifest: &Manifest, project_root: &Path) -> Vec<String> {
+        let mut expanded = Vec::with_capacity(manifest.build.classpath.len());
+        for entry in &manifest.build.classpath {
+            match Self::expand_classpath_entry(project_root, entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                _ => expanded.push(entry.clone()),
+            }
+        }
+        expanded
+    }
+
+    /// Replace every `[build] classpath` entry with the entries it expands to.
+    ///
+    /// The CLI calls this before invocation planning so a `javac --dry-run` shows the jars a glob
+    /// actually selected. Running it twice is stable while the directory contents are unchanged;
+    /// expanded file entries fall through, a directory re-expands to the same jars.
+    pub fn expand_build_classpath(
+        manifest: &mut Manifest,
+        project_root: &Path,
+    ) -> Vec<(String, String)> {
+        let mut expanded = Vec::with_capacity(manifest.build.classpath.len());
+        let mut warnings = Vec::new();
+        for entry in core::mem::take(&mut manifest.build.classpath) {
+            match Self::expand_classpath_entry(project_root, &entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                Ok(_) => {
+                    warnings.push((entry.clone(), "classpath glob matched no files".to_owned()));
+                    expanded.push(entry);
+                }
+                Err(message) => {
+                    warnings.push((entry.clone(), message));
+                    expanded.push(entry);
+                }
+            }
+        }
+        manifest.build.classpath = expanded;
+        warnings
+    }
+
+    /// The `[build] module-path` entries of `manifest`, with globs and jar directories expanded.
+    pub fn expanded_module_path_entries(manifest: &Manifest, project_root: &Path) -> Vec<String> {
+        let mut expanded = Vec::with_capacity(manifest.build.module_path.len());
+        for entry in &manifest.build.module_path {
+            // A dependency reference is not a path, even if a directory with that literal name
+            // exists; only literal entries expand.
+            if entry.starts_with("${") {
+                expanded.push(entry.clone());
+                continue;
+            }
+            match Self::expand_classpath_entry(project_root, entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                _ => expanded.push(entry.clone()),
+            }
+        }
+        expanded
+    }
+
     /// Lower `manifest` and execute the whole native input assembly against one aggregate:
     /// materialize Git sources, fetch and resolve dependencies over async HTTP, and merge the
     /// lowering warnings into the result's. Fan-out and blocking host work run on the storage's
@@ -1018,15 +1233,33 @@ impl NativeProjectPlan {
                     .push(Self::resolve_host_path(project_root, source)),
             }
         }
-        // A classpath-only `path` dependency contributes a classpath entry, not a source root.
-        // Gathering it here keeps both spellings on one lowering path, so a project entry and an
-        // external one are classified exactly like an authored `[build] classpath` entry.
-        let mut classpath_entries = manifest.build.classpath.clone();
-        for (_, dependency) in manifest.active_dependencies(scope, features) {
-            if let Some(path) = dependency.classpath_only_path() {
-                classpath_entries.push(path.classpath_path());
+        // Authored `[build] classpath` entries expand; a classpath-only `path` dependency is
+        // already an explicit output address and is kept verbatim (its `dir` may itself be a
+        // classes directory that happens to contain a jar).
+        let mut classpath_entries = Vec::with_capacity(manifest.build.classpath.len());
+        for spelling in &manifest.build.classpath {
+            match Self::expand_classpath_entry(project_root, spelling) {
+                Ok(paths) if !paths.is_empty() => classpath_entries.extend(paths),
+                Ok(_) => {
+                    result.warn_path(spelling, "classpath glob matched no files".to_owned());
+                    classpath_entries.push(spelling.clone());
+                }
+                Err(message) => {
+                    result.warn_path(spelling, message);
+                    classpath_entries.push(spelling.clone());
+                }
             }
         }
+        let mut classpath_only = Vec::new();
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                if !manifest.build.classpath.contains(&entry) && !classpath_only.contains(&entry) {
+                    classpath_only.push(entry);
+                }
+            }
+        }
+        classpath_entries.extend(classpath_only);
         for classpath in &classpath_entries {
             let Some(path) = Self::project_relative(project_root, classpath) else {
                 result
@@ -1150,8 +1383,8 @@ impl NativeProjectPlan {
                 scopes.push(NativeScope::all(path));
             }
         }
-        for classpath in &manifest.build.classpath {
-            if let Some(path) = Self::project_relative(project_root, classpath) {
+        for classpath in Self::expanded_classpath_entries(manifest, project_root) {
+            if let Some(path) = Self::project_relative(project_root, &classpath) {
                 let host = path.to_host_path(project_root);
                 scopes.push(if host.is_dir() {
                     NativeScope::extension(path, "class")
@@ -1192,13 +1425,18 @@ impl NativeProjectPlan {
                 Dependency::Path(path) => {
                     if path.is_classpath() {
                         let raw = path.classpath_path();
-                        if let Some(relative) = Self::project_relative(project_root, &raw) {
-                            let host = relative.to_host_path(project_root);
-                            scopes.push(if host.is_dir() {
-                                NativeScope::extension(relative, "class")
-                            } else {
-                                NativeScope::all(relative)
-                            });
+                        for spelling in Self::expand_classpath_entry(project_root, &raw)
+                            .unwrap_or_else(|_| vec![raw.clone()])
+                        {
+                            if let Some(relative) = Self::project_relative(project_root, &spelling)
+                            {
+                                let host = relative.to_host_path(project_root);
+                                scopes.push(if host.is_dir() {
+                                    NativeScope::extension(relative, "class")
+                                } else {
+                                    NativeScope::all(relative)
+                                });
+                            }
                         }
                         continue;
                     }
