@@ -351,7 +351,7 @@ fn classpath_globs_and_jar_directories_expand_deterministically() {
 
     // An unmatched glob keeps the authored spelling so the diagnostic names what was written.
     let unmatched = plan_for("libs/*.nomatch");
-    assert!(unmatched.plan.classpath.is_empty());
+    assert_eq!(unmatched.plan.classpath.len(), 0);
     assert!(
         unmatched
             .warnings

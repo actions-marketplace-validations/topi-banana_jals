@@ -859,8 +859,7 @@ impl NativeProjectPlan {
                 })?;
             for path in paths {
                 let symlink = std::fs::symlink_metadata(&path)
-                    .map(|metadata| metadata.file_type().is_symlink())
-                    .unwrap_or(false);
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
                 if path.is_dir() {
                     // A symlinked directory can point at an ancestor; following it is how a
                     // glob walks forever. A bounded pattern also stops descending once no
