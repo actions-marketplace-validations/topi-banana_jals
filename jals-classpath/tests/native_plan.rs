@@ -72,19 +72,19 @@ classpath = ["./libs/dep.jar"]
 "#,
     );
 
-    let root = project.path().to_path_buf();
-    let closure_root = root.clone();
-    let closure_manifest = manifest.clone();
     let plan = jals_exec::tokio_rt::run(|exec| async move {
-        let storage =
-            NativeStorage::native(&closure_root, closure_root.join("target/jals/cache"), exec)
-                .await
-                .unwrap();
+        let storage = NativeStorage::native(
+            project.path(),
+            project.path().join("target/jals/cache"),
+            exec,
+        )
+        .await
+        .unwrap();
         NativeProjectPlan::from_manifest(
-            &closure_manifest,
+            &manifest,
             DependencyScope::Build,
-            &features(&closure_manifest),
-            &closure_root,
+            &features(&manifest),
+            project.path(),
             &storage.view(),
         )
     })
