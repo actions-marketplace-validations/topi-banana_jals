@@ -544,9 +544,14 @@ fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
         dir.path().join("jals.toml").to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let stub_classes = dir.path().join("stub").join("classes");
+    let stub_classes = dir
+        .path()
+        .join("stub")
+        .join("classes")
+        .to_string_lossy()
+        .replace('\\', "/");
     assert!(
-        stdout.contains(&stub_classes.display().to_string()),
+        stdout.replace('\\', "/").contains(&stub_classes),
         "the stub's classes directory must be on the classpath: {stdout}"
     );
     assert!(!stdout.contains("Broken.java"), "got: {stdout}");
