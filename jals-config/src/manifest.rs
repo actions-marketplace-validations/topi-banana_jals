@@ -482,15 +482,17 @@ impl PathDependency {
     /// Callers must have run [`Manifest::validate`] (or [`Dependency::validate`]); this accessor
     /// joins the two fields verbatim and does not re-check that `dir` is relative and non-escaping.
     pub fn classpath_path(&self) -> String {
+        let path = self.path.replace('\\', "/");
         match &self.dir {
             Some(dir) if !dir.is_empty() => {
-                if self.path.ends_with('/') {
-                    alloc::format!("{}{dir}", self.path)
+                let dir = dir.replace('\\', "/");
+                if path.ends_with('/') {
+                    alloc::format!("{path}{dir}")
                 } else {
-                    alloc::format!("{}/{dir}", self.path)
+                    alloc::format!("{path}/{dir}")
                 }
             }
-            _ => self.path.clone(),
+            _ => path,
         }
     }
 }
@@ -2758,6 +2760,12 @@ impl Dependency {
                         return Err(DependencyError::ClasspathPathWithFeatures {
                             name: name.to_owned(),
                             field: "default-features",
+                        });
+                    }
+                    if path.optional.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "optional",
                         });
                     }
                     if let Some(dir) = &path.dir {
@@ -6844,6 +6852,33 @@ mod tests {
         let stub = manifest.dependencies.get("stub").unwrap();
         let path = stub.classpath_only_path().unwrap();
         assert_eq!(path.classpath_path(), "../stub/target/classes");
+
+        let windows: Manifest = toml::from_str(
+            "[dependencies]\nstub = { path = \"..\\\\stub\\\\\", dir = \"target\\\\classes\", mode = \"classpath\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .dependencies
+                .get("stub")
+                .unwrap()
+                .classpath_only_path()
+                .unwrap()
+                .classpath_path(),
+            "../stub/target/classes"
+        );
+
+        for entry in [
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", features = [\"x\"] }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", default-features = false }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", optional = true }",
+            "{ path = \"stub\", dir = \"/abs\", mode = \"classpath\" }",
+            "{ path = \"stub\", dir = \"../elsewhere\", mode = \"classpath\" }",
+        ] {
+            let invalid: Manifest =
+                toml::from_str(&format!("[dependencies]\nstub = {entry}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{entry} should be rejected");
+        }
         assert!(
             manifest
                 .dependencies
