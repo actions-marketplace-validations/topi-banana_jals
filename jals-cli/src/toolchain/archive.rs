@@ -129,7 +129,9 @@ impl Archive {
             let Some(relative) = entry.enclosed_name() else {
                 bail!(
                     "zip member `{}` escapes the extraction directory",
-                    entry.name()
+                    entry
+                        .name()
+                        .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()))
                 );
             };
             // `enclosed_name` normalizes; `mangled_name` would too, but a member that needed it is
