@@ -818,6 +818,10 @@ impl NativeProjectPlan {
     /// project-relative spelling (or host path outside the project), so the same input produces the
     /// same argument vector on every walk.
     fn expand_classpath_entry(project_root: &Path, raw: &str) -> Result<Vec<String>, String> {
+        /// A hard ceiling even for `**`: a junction/bind mount is not a symlink, so the walk
+        /// still needs a finite bound of its own.
+        const MAX_DEPTH: usize = 64;
+
         fn portable_path(project_root: &Path, path: &Path) -> String {
             RelativePath::from_host_path(project_root, path).map_or_else(
                 || path.display().to_string(),
@@ -864,7 +868,10 @@ impl NativeProjectPlan {
                     // A symlinked directory can point at an ancestor; following it is how a
                     // glob walks forever. A bounded pattern also stops descending once no
                     // remaining segment can match.
-                    if symlink || max_depth.is_some_and(|limit| depth + 1 >= limit) {
+                    if symlink
+                        || depth + 1 >= MAX_DEPTH
+                        || max_depth.is_some_and(|limit| depth + 1 >= limit)
+                    {
                         continue;
                     }
                     collect(
@@ -975,8 +982,8 @@ impl NativeProjectPlan {
     /// Replace every `[build] classpath` entry with the entries it expands to.
     ///
     /// The CLI calls this before invocation planning so a `javac --dry-run` shows the jars a glob
-    /// actually selected. Running it twice is harmless: expanded entries are files or plain
-    /// directories and fall through unchanged.
+    /// actually selected. Running it twice is stable while the directory contents are unchanged;
+    /// expanded file entries fall through, a directory re-expands to the same jars.
     pub fn expand_build_classpath(
         manifest: &mut Manifest,
         project_root: &Path,
