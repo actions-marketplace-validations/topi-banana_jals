@@ -478,6 +478,9 @@ impl PathDependency {
     /// `dir` is joined with `/` when present; without one the dependency directory itself is the
     /// classpath entry. Source mode never calls this: its address is resolved by a host's source
     /// root detection instead.
+    ///
+    /// Callers must have run [`Manifest::validate`] (or [`Dependency::validate`]); this accessor
+    /// joins the two fields verbatim and does not re-check that `dir` is relative and non-escaping.
     pub fn classpath_path(&self) -> String {
         match &self.dir {
             Some(dir) if !dir.is_empty() => {
@@ -2878,6 +2881,7 @@ impl Dependency {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => &[],
             Self::Git(git) => &git.features,
+            Self::Path(path) if path.is_classpath() => &[],
             Self::Path(path) => &path.features,
         }
     }
@@ -2893,6 +2897,7 @@ impl Dependency {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => true,
             Self::Git(git) => git.default_features.unwrap_or(true),
+            Self::Path(path) if path.is_classpath() => true,
             Self::Path(path) => path.default_features.unwrap_or(true),
         }
     }
@@ -2947,6 +2952,7 @@ impl Dependency {
     const fn accepts_features(&self) -> bool {
         match self {
             Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => false,
+            Self::Path(path) if path.is_classpath() => false,
             Self::Git(_) | Self::Path(_) => true,
         }
     }
