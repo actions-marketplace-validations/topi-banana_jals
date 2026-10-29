@@ -145,6 +145,19 @@ pub struct Manifest {
     /// which at most one is ever active. The plural form is what lets one reference cover a project
     /// that targets many releases, each with its own mapping text.
     pub mappings: BTreeMap<String, MappingEntry>,
+    /// Named Maven repositories (`[registries]`), keyed by the name a
+    /// [`registry`](RegistryDependency::registry) reference uses.
+    ///
+    /// `maven-central` is implicit and may be declared to point at a mirror; any other name a
+    /// dependency references must be declared here, which validation enforces.
+    pub registries: BTreeMap<String, Registry>,
+    /// Workspace settings (`[workspace]`), present on a workspace root manifest only.
+    ///
+    /// A root manifest may be *virtual* (no `[package]`) or an ordinary package that members
+    /// share. [`Workspace::members`] are the patterns the host expands to member directories; a
+    /// member's own manifest never carries this table — discovery walks upward to find the root,
+    /// so a nested `[workspace]` starts a nested workspace rather than extending one.
+    pub workspace: Option<Workspace>,
     /// `[test]`: where a test run's extra sources live and where its classes go.
     pub test: Test,
     /// Toolchain selection (`[toolchain]`): which `javac` compiles the project and which `java` runs
@@ -213,6 +226,245 @@ pub enum Dependency {
     Git(GitDependency),
     /// A local directory tree of `.java` source (analysis + editor navigation only).
     Path(PathDependency),
+    /// A **precompiled WebAssembly library**: one module that carries its own `jals.library` ABI
+    /// section, linked into the artifact a `jals-wasm` backend produces.
+    Wasm(WasmDependency),
+    /// A **Maven registry** dependency, resolved through `maven-metadata.xml` and POMs.
+    ///
+    /// The table form: the key is the artifact id with `group = "…"`, or the full
+    /// `group:artifact` coordinate. The selected version is a requirement — a bare version is a
+    /// caret requirement (`2.0.16` = `>=2.0.16, <3.0.0`), and Maven range syntax is accepted
+    /// verbatim (`[1.0,2.0)`).
+    Registry(RegistryDependency),
+    /// The coordinate-key shorthand for a registry dependency: `"org.slf4j:slf4j-api" = "2.0.16"`.
+    RegistryVersion(String),
+}
+
+/// The `wasm` form of a [`Dependency`]: a precompiled core module.
+///
+/// [`foreign`](WasmDependency::foreign) picks between its two kinds. The ordinary one is a
+/// **linked library**: a module this workspace's wasm backend emitted, whose `jals.library`
+/// section the compile reads so the project can call into it. A `foreign = true` module was
+/// emitted by something else and carries no ABI: the project's own `native` declarations are the
+/// interface, and the module's exports satisfy them at run time.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WasmDependency {
+    /// A `.wasm` location, relative to the manifest directory. Read by the host, never here: the
+    /// module's ABI, not its path, is what a compile consumes.
+    pub wasm: String,
+    /// Whether the module is a **foreign** one: a core module this workspace's backend did not
+    /// emit, without a `jals.library` section.
+    ///
+    /// A foreign module provides implementations for the project's `native` declarations, matched
+    /// by the canonical key `owner#name+descriptor` on each export — the WIT-and-Rust side of the
+    /// same seam, where the library route is the Java side. Its boundary is scalars for now: a
+    /// function reference to a GC object is not something a core module can hold.
+    pub foreign: Option<bool>,
+    /// Whether this entry is only present when a build feature activates it (Cargo's `optional`).
+    /// See [`Dependency::is_optional`].
+    optional: Option<bool>,
+}
+
+/// The `registry` form of a [`Dependency`]: a Maven coordinate resolved through POMs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RegistryDependency {
+    /// The version **requirement**. A bare version is a caret requirement (`2.0.16` =
+    /// `>=2.0.16, <3.0.0`; `0.2.3` = `<0.3.0`); `=`, `~`, `*` wildcards, and Maven range syntax
+    /// (`[1.0,2.0)`) are accepted. Resolved by `jals-resolve`, never here.
+    version: String,
+    /// The Maven `groupId`. Omit it when the dependency key already is a `group:artifact`
+    /// coordinate, which is the other spelling of the same entry.
+    group: Option<String>,
+    /// The `[registries]` key to resolve from. Defaults to `maven-central`.
+    registry: Option<String>,
+    /// Whether this entry is only present when a build feature activates it (Cargo's `optional`).
+    /// See [`Dependency::is_optional`].
+    optional: Option<bool>,
+}
+
+/// One `[registries]` entry: a named Maven repository.
+///
+/// `maven-central` is implicit; declaring it overrides its URL (a mirror). Every other name is
+/// available to `registry = "…"` on a [`RegistryDependency`], and a reference to a name that is
+/// neither declared nor `maven-central` is refused at validation rather than resolved to nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Registry {
+    /// The repository base URL, e.g. `https://repo1.maven.org/maven2`.
+    pub url: String,
+}
+
+/// `[workspace]`: the member patterns and inherited defaults a root manifest shares with its
+/// subprojects.
+///
+/// The **root** is the manifest carrying this table. Discovery walks upward from a project's
+/// manifest until it finds one, so a member never restates the workspace; `members` are patterns
+/// relative to the root (`"app"`, `"libs/*"`), `exclude` removes matched directories, and
+/// `default-members` must name a subset of what `members` discovers (the host validates that
+/// against the filesystem, which this pure type cannot see).
+///
+/// Inheritance is Maven-parent shaped rather than Cargo-marker shaped: a member that omits a value
+/// receives the workspace one, and a member that writes its own keeps it. `[workspace.dependencies]`
+/// are defaults by name, so a member can override one without restating the rest. `[mappings]` and
+/// `[registries]` stay member-local: an inherited dependency that names one must have it in the
+/// member, exactly as if the dependency were written there.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Workspace {
+    /// Member directories, as resource-style globs relative to the workspace root (`*` within one
+    /// segment, `**` across segments). `"."` names the root itself, which is a member exactly
+    /// when the root manifest has a `[package]`.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Member directories the patterns must not include.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// The members a command with no explicit selection targets. Must match at least one member,
+    /// which only the host can decide.
+    #[serde(default)]
+    pub default_members: Vec<String>,
+    /// Values inherited by members that omit them (`[workspace.package]`).
+    #[serde(default)]
+    package: WorkspacePackage,
+    /// Dependency defaults by name (`[workspace.dependencies]`). A member's own entry of the same
+    /// name wins; the rest are added verbatim.
+    #[serde(default)]
+    dependencies: BTreeMap<String, Dependency>,
+    /// The same defaults for `[dev-dependencies]`.
+    #[serde(default)]
+    dev_dependencies: BTreeMap<String, Dependency>,
+    /// Build defaults members inherit (`[workspace.build]`).
+    #[serde(default)]
+    build: WorkspaceBuild,
+}
+
+/// `[workspace.package]`: the package values a member may omit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+struct WorkspacePackage {
+    /// The version a member inherits when it declares none.
+    version: Option<String>,
+}
+
+/// `[workspace.build]`: build defaults a member inherits.
+///
+/// Only values with an unambiguous "omitted" spelling live here. `source-dirs` is deliberately
+/// absent: its default is a real value (`src/main/java`), so a workspace default would silently
+/// rewrite every member that never mentioned the key.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+struct WorkspaceBuild {
+    /// `javac --release N` for members that declare none.
+    release: Option<u32>,
+    /// `javac --source N` for members that declare neither `release` nor `source`.
+    source: Option<u32>,
+    /// `javac --target N` for members that declare neither `release` nor `target`.
+    target: Option<u32>,
+    /// Classpath entries prepended to every member's own list.
+    classpath: Vec<String>,
+    /// Module-path entries prepended to every member's own list.
+    module_path: Vec<String>,
+    /// `javac` flags prepended to every member's own list.
+    javac_flags: Vec<String>,
+}
+
+impl Workspace {
+    /// Apply this workspace's inherited values to a member manifest.
+    ///
+    /// Runs before [`Manifest::validate`]: a member may reference an inherited dependency in
+    /// `[features]` or `module-path`, and validating first would reject a name that is about to
+    /// exist. A member's own value always wins, except for list-valued options, where the
+    /// workspace entries are prepended and the member's keep their order after them.
+    fn inherit_into(&self, manifest: &mut Manifest) {
+        /// Additive by contract: workspace entries keep their authored order first, and the
+        /// member's entries follow. Duplicates are not removed — a repeated entry is a manifest
+        /// value, and silently dropping one would make the merge order-dependent.
+        fn prepend(values: &mut Vec<String>, defaults: &[String]) {
+            let mut merged = defaults.to_vec();
+            merged.append(values);
+            *values = merged;
+        }
+
+        if manifest.package.version.is_none() {
+            manifest.package.version.clone_from(&self.package.version);
+        }
+        for (name, dependency) in &self.dependencies {
+            manifest
+                .dependencies
+                .entry(name.clone())
+                .or_insert_with(|| dependency.clone());
+        }
+        for (name, dependency) in &self.dev_dependencies {
+            manifest
+                .dev_dependencies
+                .entry(name.clone())
+                .or_insert_with(|| dependency.clone());
+        }
+
+        let build = &mut manifest.build;
+        if build.release.is_none() {
+            build.release = self.build.release;
+        }
+        if build.release.is_some() {
+            // `--release` wins over the pair, so a member's `source`/`target` would look
+            // effective while `javac` ignores them. Clear them whether `release` was the
+            // member's own or inherited, so the two spellings produce one manifest shape.
+            build.source = None;
+            build.target = None;
+        } else {
+            if build.source.is_none() {
+                build.source = self.build.source;
+            }
+            if build.target.is_none() {
+                build.target = self.build.target;
+            }
+        }
+        prepend(&mut build.classpath, &self.build.classpath);
+        prepend(&mut build.module_path, &self.build.module_path);
+        prepend(&mut build.javac_flags, &self.build.javac_flags);
+    }
+
+    /// Validate every pattern as a resource-style glob, and reject an empty entry.
+    fn validate(&self) -> Result<(), ValidationError> {
+        for (key, patterns) in [
+            ("members", &self.members),
+            ("exclude", &self.exclude),
+            ("default-members", &self.default_members),
+        ] {
+            for pattern in patterns {
+                if pattern.is_empty() {
+                    return Err(ValidationError::InvalidWorkspacePattern {
+                        key,
+                        pattern: pattern.clone(),
+                        reason: None,
+                    });
+                }
+                // `"."` names the root; the resource grammar rejects it as a relative segment,
+                // so it is the one spelling handled before the grammar sees it.
+                if pattern == "." {
+                    continue;
+                }
+                if let Err(error) = ResourcePattern::parse(pattern) {
+                    return Err(ValidationError::InvalidWorkspacePattern {
+                        key,
+                        pattern: pattern.clone(),
+                        reason: Some(error),
+                    });
+                }
+            }
+        }
+        if self.members.is_empty() {
+            return Err(ValidationError::EmptyWorkspace);
+        }
+        for (name, dependency) in self.dependencies.iter().chain(&self.dev_dependencies) {
+            dependency
+                .validate(name)
+                .map_err(ValidationError::Dependency)?;
+        }
+        Ok(())
+    }
 }
 
 /// The `jar` form of a [`Dependency`]: a compiled `.jar` and its optional companion `sources` jar.
@@ -282,16 +534,22 @@ pub struct GitDependency {
     optional: Option<bool>,
 }
 
-/// The `path` form of a [`Dependency`]: a local directory tree of `.java` source.
+/// The `path` form of a [`Dependency`]: a local directory tree, consumed either as Java sources or
+/// as already-compiled classes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PathDependency {
-    /// A local directory tree of `.java` source, relative to the manifest directory. The sources are an
-    /// analysis + editor-navigation input only — never compiled.
+    /// A local directory tree, relative to the manifest directory. What is read out of it is
+    /// selected by [`mode`](PathDependency::mode).
     pub path: String,
-    /// The source root *within* the directory (e.g. `core/src/main/java`), for a non-standard layout;
-    /// omit to let the host auto-detect it (`src/main/java` → `src` → the root itself).
+    /// The root *within* the directory. In [`PathMode::Source`] this is the source root (e.g.
+    /// `core/src/main/java`); omit to let the host auto-detect it (`src/main/java` → `src` → the
+    /// root itself). In [`PathMode::Classpath`] it is the compiled-output directory or jar path
+    /// (e.g. `target/classes`); omit to use the dependency directory itself.
     pub dir: Option<String>,
+    /// How this dependency is consumed.
+    #[serde(default)]
+    mode: PathMode,
     /// The **build features** to enable in this dependency (Cargo's per-dependency `features`). See
     /// [`Dependency::features`] for the semantics, which are the same for both source forms.
     #[serde(default)]
@@ -303,6 +561,50 @@ pub struct PathDependency {
     /// Whether this entry is only present when a build feature activates it (Cargo's `optional`).
     /// See [`Dependency::is_optional`].
     optional: Option<bool>,
+}
+
+/// What a [`PathDependency`] contributes to its consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PathMode {
+    /// Build the dependency from its `.java` sources and lower them into the consumer's compile —
+    /// the historical behavior, and the default.
+    #[default]
+    Source,
+    /// Do **not** read its sources. Put its already-compiled classes (a directory or a jar) on the
+    /// consumer's classpath, like a binary/provided dependency. This is what a stub library that
+    /// must not shadow the real implementation uses.
+    Classpath,
+}
+
+impl PathDependency {
+    /// Whether this dependency is consumed as compiled classes rather than sources.
+    pub const fn is_classpath(&self) -> bool {
+        matches!(self.mode, PathMode::Classpath)
+    }
+
+    /// The path this dependency contributes in [`PathMode::Classpath`], relative to the manifest.
+    ///
+    /// `dir` is joined with `/` when present; without one the dependency directory itself is the
+    /// classpath entry. Source mode never calls this: its address is resolved by a host's source
+    /// root detection instead.
+    ///
+    /// Callers must have run [`Manifest::validate`] (or [`Dependency::validate`]); this accessor
+    /// joins the two fields verbatim and does not re-check that `dir` is relative and non-escaping.
+    pub fn classpath_path(&self) -> String {
+        let path = self.path.replace('\\', "/");
+        match &self.dir {
+            Some(dir) if !dir.is_empty() => {
+                let dir = dir.replace('\\', "/");
+                if path.ends_with('/') {
+                    alloc::format!("{path}{dir}")
+                } else {
+                    alloc::format!("{path}/{dir}")
+                }
+            }
+            _ => path,
+        }
+    }
 }
 
 /// Which commit of a git dependency to check out: the default branch, or a named branch / tag / commit.
@@ -404,6 +706,40 @@ pub enum DependencyError {
         /// The dependency's name.
         name: String,
     },
+    /// A classpath-only `path` dependency declares build features or `default-features`, but it
+    /// runs no build script and has no source form to route a feature into.
+    ClasspathPathWithFeatures {
+        /// The dependency's name.
+        name: String,
+        /// Which field carried the meaningless value.
+        field: &'static str,
+    },
+    /// A classpath-only `path` dependency's `dir` is absolute or escapes the dependency root.
+    ClasspathDir {
+        /// The dependency's name.
+        name: String,
+        /// The offending value.
+        value: String,
+    },
+    /// A registry entry's `version` is not a version requirement.
+    RegistryRequirement {
+        /// The dependency's name.
+        name: String,
+        /// The offending value.
+        value: String,
+    },
+    /// A registry entry names no coordinate: no `group`, and a key that is not `group:artifact`.
+    RegistryCoordinate {
+        /// The dependency's name.
+        name: String,
+    },
+    /// A registry entry's `group` is empty, or carries `:` or `/`.
+    RegistryGroup {
+        /// The dependency's name.
+        name: String,
+        /// The offending value.
+        value: String,
+    },
 }
 
 impl fmt::Display for DependencyError {
@@ -443,6 +779,31 @@ impl fmt::Display for DependencyError {
                 "dependency `{name}` sets both `remap` and `sources`, but only the classes are \
                  remapped: go-to-definition would land on obfuscated names for types the classpath \
                  now spells out (drop one)"
+            ),
+            Self::ClasspathPathWithFeatures { name, field } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but sets `{field}`; a classpath-only \
+                 path dependency runs no build script and has no source form to route it into"
+            ),
+            Self::ClasspathDir { name, value } => write!(
+                f,
+                "dependency `{name}` is `mode = \"classpath\"` but its `dir` `{value}` is absolute \
+                 or escapes the dependency root"
+            ),
+            Self::RegistryRequirement { name, value } => write!(
+                f,
+                "registry dependency `{name}` has a `version` of `{value}`, which is not a version \
+                 requirement (`2.0.16`, `=2.0.16`, `~2.0`, `1.*`, `[1.0,2.0)`)"
+            ),
+            Self::RegistryCoordinate { name } => write!(
+                f,
+                "registry dependency `{name}` names no coordinate: write `group = \"org.example\"` \
+                 or use a `group:artifact` key"
+            ),
+            Self::RegistryGroup { name, value } => write!(
+                f,
+                "registry dependency `{name}` has a `group` of `{value}` (expected a dot-separated \
+                 group id with no `:` or `/`)"
             ),
         }
     }
@@ -1002,7 +1363,7 @@ impl<'a> FeatureRef<'a> {
     /// [`FeatureRefError`] for an empty entry or side, a second `/`, `dep/default` — the reserved
     /// directive is never enableable by name (see [`DEFAULT_BUILD_FEATURE`]) — or a `dep:` entry
     /// carrying a `/`, which would name a feature of an entry it is only meant to switch on.
-    fn parse(entry: &'a str) -> Result<Self, FeatureRefError> {
+    pub(crate) fn parse(entry: &'a str) -> Result<Self, FeatureRefError> {
         if entry.is_empty() {
             return Err(FeatureRefError::Empty);
         }
@@ -1647,6 +2008,22 @@ pub struct Build {
     /// Source roots, relative to the manifest directory. These feed `javac`'s `-sourcepath` and
     /// are the roots scanned for `.java` files. Defaults to `["src/main/java"]`.
     pub source_dirs: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the build source roots are compiled.
+    ///
+    /// Matched against a file's path *below* the `[build] source-dirs` entry it was found under,
+    /// using the resource glob grammar (`*` within a segment, `?` one character, `**` whole
+    /// segments). Empty means every source. [`exclude`](Build::exclude) wins over an include.
+    ///
+    /// The filter is applied where sources are gathered, before the frontend lowering key is
+    /// computed, so an excluded file is neither compiled nor able to affect the cache identity.
+    include: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the build source roots are skipped.
+    ///
+    /// Same grammar and address as [`include`](Build::include). Unlike
+    /// [`[build.resources] template`](BuildResources::template), a pattern that matches nothing is
+    /// not an error: the sources a project holds change, and a stale exclusion should not stop a
+    /// build.
+    exclude: Vec<String>,
     /// Output directory for `.class` files (`javac -d`), relative to the manifest directory.
     /// Defaults to `"target/classes"`.
     pub classes_dir: String,
@@ -1683,6 +2060,20 @@ pub struct Build {
     pub target: Option<u32>,
     /// Classpath entries (jars or directories), relative to the manifest directory.
     pub classpath: Vec<String>,
+    /// Entries for `javac --module-path` (jars or directories), relative to the manifest
+    /// directory, or a `${dependency.<name>}` reference to a resolved dependency jar.
+    ///
+    /// This is also `java --module-path` for [`jals run`](Build::modular). Literal paths are
+    /// resolved by the host exactly like [`classpath`](Build::classpath); a dependency reference
+    /// names a key of `[dependencies]`/`[dev-dependencies]` and is evaluated after resolution,
+    /// because a fetched jar has no manifest-relative spelling.
+    pub module_path: Vec<String>,
+    /// How a project that declares `module-info.java` treats the module path.
+    ///
+    /// Defaults to [`ModularMode::Classpath`], so adding `module-info.java` to an existing project
+    /// does not silently change what its dependencies' jars are put on. `auto` switches to the
+    /// module path when a module declaration is present, and `module-path` always does.
+    pub modular: ModularMode,
     /// Extra raw flags appended verbatim after the generated `javac` arguments (before the source
     /// files). An escape hatch for anything the manifest does not model yet.
     pub javac_flags: Vec<String>,
@@ -1709,6 +2100,34 @@ pub struct Build {
     pub remap: Option<BuildRemap>,
 }
 
+/// How `[build] module-path` is selected (`[build] modular`).
+///
+/// A named value rather than a boolean: the three states are genuinely different, and `auto`
+/// without a `module-info.java` must keep compiling exactly the way `classpath` does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModularMode {
+    /// Every input stays on the classpath, even when a `module-info.java` is present.
+    #[default]
+    Classpath,
+    /// Put dependencies and `[build] classpath` on the module path when a `module-info.java` is
+    /// among the compiled sources; stay on the classpath otherwise.
+    Auto,
+    /// Always put dependencies and `[build] classpath` on the module path.
+    ModulePath,
+}
+
+impl ModularMode {
+    /// Whether this mode puts inputs on the module path for a project with `has_module_info`.
+    pub const fn uses_module_path(self, has_module_info: bool) -> bool {
+        match self {
+            Self::Classpath => false,
+            Self::Auto => has_module_info,
+            Self::ModulePath => true,
+        }
+    }
+}
+
 /// `[test]`: what a test run compiles on top of the project, and where it puts the result.
 ///
 /// Deliberately small. A `#[test]` method lives wherever its subject lives — the Rust model, and
@@ -1726,6 +2145,16 @@ pub struct Test {
     /// Extra source roots compiled only by `jals test`, relative to the manifest directory.
     /// Empty by default: `src/test/java` is opted into, not assumed.
     pub source_dirs: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the test source roots are compiled.
+    ///
+    /// The build roots keep [`Build::include`]'s selection under a test run; these patterns apply
+    /// only to the roots [`source_dirs`](Test::source_dirs) adds. Empty means every test source.
+    include: Vec<String>,
+    /// Glob patterns selecting which `.java` files under the test source roots are skipped.
+    ///
+    /// Same grammar and address as [`include`](Test::include), with exclude winning. A test file
+    /// in a build root is governed by [`Build::exclude`], not this list.
+    exclude: Vec<String>,
     /// Output directory for a test run's `.class` files. Defaults to `"target/test-classes"`.
     pub classes_dir: String,
 }
@@ -1734,6 +2163,8 @@ impl Default for Test {
     fn default() -> Self {
         Self {
             source_dirs: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             classes_dir: DEFAULT_TEST_CLASSES_DIR.to_owned(),
         }
     }
@@ -1829,6 +2260,8 @@ impl fmt::Display for ResourcePatternError {
         }
     }
 }
+
+impl core::error::Error for ResourcePatternError {}
 
 impl ResourcePattern {
     /// Parse one `[build.resources] template` entry.
@@ -1943,6 +2376,191 @@ impl ResourcePattern {
     }
 }
 
+/// The parsed form of `[build] include`/`exclude` (or `[test]`'s pair).
+///
+/// One vocabulary for both tables: a pattern is matched against the file's path *below* the
+/// source root it was found under, and an excluded file loses to nothing. Empty include means
+/// every source, so a project that only wants to drop `module-info.java` writes one `exclude`
+/// entry and nothing else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceFilter {
+    include: Vec<ResourcePattern>,
+    exclude: Vec<ResourcePattern>,
+}
+
+impl SourceFilter {
+    /// Parse an include/exclude pair, naming which side failed.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] for the first malformed pattern.
+    pub fn new(include: &[String], exclude: &[String]) -> Result<Self, SourceFilterError> {
+        Ok(Self {
+            include: Self::parse_all(SourceFilterSide::Include, include)?,
+            exclude: Self::parse_all(SourceFilterSide::Exclude, exclude)?,
+        })
+    }
+
+    fn parse_all(
+        side: SourceFilterSide,
+        patterns: &[String],
+    ) -> Result<Vec<ResourcePattern>, SourceFilterError> {
+        patterns
+            .iter()
+            .map(|pattern| {
+                ResourcePattern::parse(pattern).map_err(|reason| SourceFilterError {
+                    side,
+                    pattern: pattern.clone(),
+                    reason,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a file at `path` (below its source root) is selected.
+    pub fn accepts(&self, path: &RelativePath) -> bool {
+        let included = self.include.is_empty() || self.include.iter().any(|p| p.matches(path));
+        included && !self.exclude.iter().any(|p| p.matches(path))
+    }
+}
+
+/// Which list of a [`SourceFilter`] carried the malformed pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceFilterSide {
+    /// `include`.
+    Include,
+    /// `exclude`.
+    Exclude,
+}
+
+impl fmt::Display for SourceFilterSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Include => f.write_str("include"),
+            Self::Exclude => f.write_str("exclude"),
+        }
+    }
+}
+
+/// A malformed `[build]`/`[test]` source-filter glob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFilterError {
+    /// Which list the pattern came from.
+    side: SourceFilterSide,
+    /// The offending pattern, as written.
+    pattern: String,
+    /// Why the glob grammar rejected it.
+    reason: ResourcePatternError,
+}
+
+impl fmt::Display for SourceFilterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` entry `{}` is not a glob: {}",
+            self.side, self.pattern, self.reason
+        )
+    }
+}
+
+impl core::error::Error for SourceFilterError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+impl Build {
+    /// Parse this table's source filter.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] when a pattern is malformed; [`Manifest::validate`] already rejects
+    /// that, so a validated manifest never fails here.
+    pub fn source_filter(&self) -> Result<SourceFilter, SourceFilterError> {
+        SourceFilter::new(&self.include, &self.exclude)
+    }
+}
+
+impl Test {
+    /// Parse the filter that applies to the roots [`Test::source_dirs`] adds.
+    ///
+    /// # Errors
+    /// [`SourceFilterError`] when a pattern is malformed.
+    pub fn source_filter(&self) -> Result<SourceFilter, SourceFilterError> {
+        SourceFilter::new(&self.include, &self.exclude)
+    }
+}
+
+impl Build {
+    /// Classify every `[build] module-path` entry as a literal path or a dependency reference.
+    ///
+    /// # Errors
+    /// [`ModulePathError`] for a malformed or empty entry. [`Manifest::validate`] rejects the
+    /// same shapes, so a validated manifest never fails here.
+    pub fn module_path_entries(&self) -> Result<Vec<ModulePathEntry<'_>>, ModulePathError> {
+        const PREFIX: &str = "${dependency.";
+        const SUFFIX: char = '}';
+        fn dependency_name(entry: &str) -> Option<&str> {
+            entry
+                .strip_prefix(PREFIX)?
+                .strip_suffix(SUFFIX)
+                .filter(|name| !name.is_empty())
+        }
+        self.module_path
+            .iter()
+            .map(|entry| {
+                if entry.is_empty() {
+                    return Err(ModulePathError::Empty);
+                }
+                if let Some(name) = dependency_name(entry) {
+                    if name.is_empty()
+                        || name.contains('.')
+                        || name.contains('/')
+                        || jals_storage::Name::new(name).is_err()
+                    {
+                        return Err(ModulePathError::Malformed(entry.clone()));
+                    }
+                    return Ok(ModulePathEntry::Dependency(name));
+                }
+                if entry.starts_with("${") {
+                    return Err(ModulePathError::Malformed(entry.clone()));
+                }
+                Ok(ModulePathEntry::Path(entry.as_str()))
+            })
+            .collect()
+    }
+}
+
+/// One `[build] module-path` entry, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulePathEntry<'a> {
+    /// A literal path, relative to the manifest directory.
+    Path(&'a str),
+    /// A `${dependency.<name>}` reference, resolved against the dependency graph.
+    Dependency(&'a str),
+}
+
+/// A malformed `[build] module-path` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulePathError {
+    /// The entry is the empty string.
+    Empty,
+    /// The entry opens with `${` but is not exactly `${dependency.<name>}`.
+    Malformed(String),
+}
+
+impl fmt::Display for ModulePathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a `[build] module-path` entry is empty"),
+            Self::Malformed(entry) => write!(
+                f,
+                "`[build] module-path` entry `{entry}` is not a path or `${{dependency.<name>}}`"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ModulePathError {}
+
 /// The `[build] remap` step: which mapping set reobfuscates the compiled output, and where the jar
 /// goes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1983,8 +2601,11 @@ impl BuildRemap {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BuildScript {
-    /// A Rhai build script stored at a project-relative portable file path.
-    Rhai {
+    /// A Java build script stored at a project-relative portable file path.
+    ///
+    /// The script is compiled and run by the in-process wasm engine: its declarations reach the
+    /// host through the `jals.build` package, and its failures name the line they happened on.
+    Java {
         /// The script file, relative to the project root.
         file: String,
     },
@@ -1994,9 +2615,8 @@ impl BuildScript {
     /// The value of the script's serialized `type` tag.
     #[cfg(test)]
     const fn tag_name(&self) -> &'static str {
-        match self {
-            Self::Rhai { .. } => "rhai",
-        }
+        let Self::Java { .. } = self;
+        "java"
     }
 }
 
@@ -2121,6 +2741,10 @@ impl Default for Build {
             source: None,
             target: None,
             classpath: Vec::new(),
+            module_path: Vec::new(),
+            modular: ModularMode::default(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             javac_flags: Vec::new(),
             native_packages: Vec::new(),
             remap: None,
@@ -2129,6 +2753,14 @@ impl Default for Build {
 }
 
 impl Dependency {
+    /// The path form, when this entry consumes compiled classes instead of sources.
+    pub const fn classpath_only_path(&self) -> Option<&PathDependency> {
+        match self {
+            Self::Path(path) if path.is_classpath() => Some(path),
+            _ => None,
+        }
+    }
+
     /// Validate a jar-location string without building any path.
     ///
     /// The string is a `jar` or `sources` value: non-empty and, if it carries a URL scheme, a known
@@ -2227,10 +2859,130 @@ impl Dependency {
                         field: "path",
                     });
                 }
+                if path.is_classpath() {
+                    if !path.features.is_empty() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "features",
+                        });
+                    }
+                    if path.default_features.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "default-features",
+                        });
+                    }
+                    if path.optional.is_some() {
+                        return Err(DependencyError::ClasspathPathWithFeatures {
+                            name: name.to_owned(),
+                            field: "optional",
+                        });
+                    }
+                    if let Some(dir) = &path.dir {
+                        let absolute = dir.starts_with('/')
+                            || dir.starts_with('\\')
+                            || dir.as_bytes().get(1) == Some(&b':');
+                        let escapes = dir.split(['/', '\\']).any(|part| part == "..");
+                        if dir.is_empty() || absolute || escapes {
+                            return Err(DependencyError::ClasspathDir {
+                                name: name.to_owned(),
+                                value: dir.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Self::Wasm(wasm) => {
+                if wasm.wasm.is_empty() {
+                    return Err(DependencyError::Empty {
+                        name: name.to_owned(),
+                        field: "wasm",
+                    });
+                }
+                Ok(())
+            }
+            Self::Registry(registry) => {
+                Self::validate_registry_requirement(&registry.version, name)?;
+                if let Some(group) = &registry.group {
+                    if group.is_empty() || group.contains(':') || group.contains('/') {
+                        return Err(DependencyError::RegistryGroup {
+                            name: name.to_owned(),
+                            value: group.clone(),
+                        });
+                    }
+                } else if !name.contains(':') {
+                    // Without `group`, the key itself must be the coordinate. Naming neither is
+                    // an entry that could never resolve.
+                    return Err(DependencyError::RegistryCoordinate {
+                        name: name.to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            Self::RegistryVersion(version) => {
+                Self::validate_registry_requirement(version, name)?;
+                if !name.contains(':') {
+                    return Err(DependencyError::RegistryCoordinate {
+                        name: name.to_owned(),
+                    });
+                }
                 Ok(())
             }
         }?;
         self.validate_features(name)
+    }
+
+    /// The value-level checks on a registry version requirement: it parses as a
+    /// [`VersionReq`](jals_resolve::version::VersionReq).
+    fn validate_registry_requirement(value: &str, name: &str) -> Result<(), DependencyError> {
+        if value.is_empty() {
+            return Err(DependencyError::Empty {
+                name: name.to_owned(),
+                field: "version",
+            });
+        }
+        jals_resolve::version::VersionReq::parse(value).map_err(|_| {
+            DependencyError::RegistryRequirement {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            }
+        })?;
+        Ok(())
+    }
+
+    /// The Maven `group:artifact` coordinate this entry names, derived from the manifest key.
+    ///
+    /// `None` for a non-registry form. A registry entry that names neither a `group` nor a
+    /// `group:artifact` key returns `None` too, which validation has already rejected on a
+    /// validated manifest.
+    pub(crate) fn registry_coordinate(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Registry(registry) => registry.group.as_ref().map_or_else(
+                || name.contains(':').then(|| name.to_owned()),
+                |group| Some(alloc::format!("{group}:{name}")),
+            ),
+            Self::RegistryVersion(_) => name.contains(':').then(|| name.to_owned()),
+            _ => None,
+        }
+    }
+
+    /// The version requirement of a registry entry, as written.
+    pub fn registry_version(&self) -> Option<&str> {
+        match self {
+            Self::Registry(registry) => Some(&registry.version),
+            Self::RegistryVersion(version) => Some(version),
+            _ => None,
+        }
+    }
+
+    /// The `[registries]` key a registry entry resolves from, or `None` for the implicit
+    /// `maven-central`.
+    pub(crate) fn registry_name(&self) -> Option<&str> {
+        match self {
+            Self::Registry(registry) => registry.registry.as_deref(),
+            _ => None,
+        }
     }
 
     /// The **build features** this entry enables in the dependency project — Cargo's per-dependency
@@ -2245,8 +2997,9 @@ impl Dependency {
     /// parse error) and this returns an empty slice.
     pub fn features(&self) -> &[String] {
         match self {
-            Self::Jar(_) => &[],
+            Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => &[],
             Self::Git(git) => &git.features,
+            Self::Path(path) if path.is_classpath() => &[],
             Self::Path(path) => &path.features,
         }
     }
@@ -2260,8 +3013,9 @@ impl Dependency {
     /// is never read.
     pub fn default_features(&self) -> bool {
         match self {
-            Self::Jar(_) => true,
+            Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => true,
             Self::Git(git) => git.default_features.unwrap_or(true),
+            Self::Path(path) if path.is_classpath() => true,
             Self::Path(path) => path.default_features.unwrap_or(true),
         }
     }
@@ -2275,7 +3029,11 @@ impl Dependency {
     pub fn remap(&self) -> Option<&str> {
         match self {
             Self::Jar(jar) => jar.remap.as_deref(),
-            Self::Git(_) | Self::Path(_) => None,
+            Self::Git(_)
+            | Self::Path(_)
+            | Self::Wasm(_)
+            | Self::Registry(_)
+            | Self::RegistryVersion(_) => None,
         }
     }
 
@@ -2297,6 +3055,9 @@ impl Dependency {
             Self::Jar(jar) => jar.optional.unwrap_or(false),
             Self::Git(git) => git.optional.unwrap_or(false),
             Self::Path(path) => path.optional.unwrap_or(false),
+            Self::Wasm(wasm) => wasm.optional.unwrap_or(false),
+            Self::Registry(registry) => registry.optional.unwrap_or(false),
+            Self::RegistryVersion(_) => false,
         }
     }
 
@@ -2308,7 +3069,8 @@ impl Dependency {
     /// answer here rather than inherit whichever side of the question the two callers assumed.
     const fn accepts_features(&self) -> bool {
         match self {
-            Self::Jar(_) => false,
+            Self::Jar(_) | Self::Wasm(_) | Self::Registry(_) | Self::RegistryVersion(_) => false,
+            Self::Path(path) if path.is_classpath() => false,
             Self::Git(_) | Self::Path(_) => true,
         }
     }
@@ -2461,7 +3223,56 @@ impl Manifest {
             })?;
         }
 
-        if let Some(BuildScript::Rhai { file }) = &self.build.script {
+        // Source filters share the resource glob grammar but not its "a pattern must match"
+        // policy: sources appear and disappear as a project grows, so only syntax is checked.
+        for (table, include, exclude) in [
+            ("build", &self.build.include, &self.build.exclude),
+            ("test", &self.test.include, &self.test.exclude),
+        ] {
+            for (key, patterns) in [("include", include), ("exclude", exclude)] {
+                for pattern in patterns {
+                    ResourcePattern::parse(pattern).map_err(|reason| {
+                        ValidationError::InvalidSourcePattern {
+                            table,
+                            key,
+                            pattern: pattern.clone(),
+                            reason,
+                        }
+                    })?;
+                }
+            }
+        }
+
+        // `module-path` entries are paths or named dependency references. A reference is
+        // validated against both tables because a test compile sees `[dev-dependencies]` too.
+        for entry in match self.build.module_path_entries() {
+            Ok(entries) => entries,
+            Err(ModulePathError::Empty) => {
+                return Err(ValidationError::InvalidModulePath {
+                    entry: String::new(),
+                });
+            }
+            Err(ModulePathError::Malformed(entry)) => {
+                return Err(ValidationError::InvalidModulePath { entry });
+            }
+        } {
+            if let ModulePathEntry::Dependency(name) = entry
+                && !self.dependencies.contains_key(name)
+                && !self.dev_dependencies.contains_key(name)
+            {
+                return Err(ValidationError::UnknownModulePathDependency {
+                    dependency: name.to_owned(),
+                    declared: self
+                        .dependencies
+                        .keys()
+                        .chain(self.dev_dependencies.keys())
+                        .cloned()
+                        .collect(),
+                });
+            }
+        }
+
+        if let Some(BuildScript::Java { file }) = &self.build.script {
             let script = FileKey::parse(file)
                 .map_err(|_| ValidationError::InvalidBuildScriptFile { file: file.clone() })?;
             // A script is always a portable project path, so it cannot be inside a `classes-dir`
@@ -2563,6 +3374,36 @@ impl Manifest {
             if let Some(mapping) = dep.remap() {
                 self.require_mapping(RemapSite::Dependency(name.clone()), mapping)?;
             }
+            if let Some(registry) = dep.registry_name()
+                && registry != jals_resolve::id::RegistryId::MAVEN_CENTRAL
+                && !self.registries.contains_key(registry)
+            {
+                return Err(ValidationError::UndeclaredRegistry {
+                    dependency: name.clone(),
+                    registry: registry.to_owned(),
+                });
+            }
+        }
+
+        // `[registries]`: a name a dependency can reference and a URL the host can join paths to.
+        for (name, registry) in &self.registries {
+            if jals_resolve::id::RegistryId::new(name.clone()).is_err() {
+                return Err(ValidationError::InvalidRegistryName { name: name.clone() });
+            }
+            if registry.url.is_empty()
+                || !(registry.url.starts_with("https://") || registry.url.starts_with("http://"))
+            {
+                return Err(ValidationError::InvalidRegistryUrl {
+                    name: name.clone(),
+                    url: registry.url.clone(),
+                });
+            }
+        }
+
+        // `[workspace]` patterns are globs this crate can parse; whether they match a directory
+        // is the host's question, answered during discovery.
+        if let Some(workspace) = &self.workspace {
+            workspace.validate()?;
         }
 
         // `[features]`: every local name a `default`/`enables` list references must itself be a
@@ -2619,6 +3460,20 @@ impl Manifest {
             return Err(ValidationError::NativePackagesWithoutWasmBackend {
                 backend: self.build.backend.tag_name(),
             });
+        }
+        // A `wasm` dependency is a module linked at run time, which only the wasm backend emits a
+        // module to link into. Checked entry by entry so the message names the one to move, and
+        // over `[dev-dependencies]` too: a test run resolves those, so a `wasm` entry there is
+        // just as contradicted by a class-file backend as one in `[dependencies]`.
+        if !matches!(self.build.backend, BackendKind::JalsWasm {}) {
+            for (name, dependency) in self.dependencies.iter().chain(&self.dev_dependencies) {
+                if matches!(dependency, Dependency::Wasm(_)) {
+                    return Err(ValidationError::WasmDependencyWithoutWasmBackend {
+                        name: name.clone(),
+                        backend: self.build.backend.tag_name(),
+                    });
+                }
+            }
         }
         // A name that is empty, or declared twice. Both are decidable here; whether a name *exists*
         // is not — the set is a property of the binary that holds the registry, so an unknown name
@@ -2955,10 +3810,39 @@ impl FromStr for Manifest {
     type Err = ManifestParseError;
 
     fn from_str(text: &str) -> Result<Self, ManifestParseError> {
-        let manifest: Self = toml::from_str(text).map_err(|source| ManifestParseError::Parse {
-            path: Self::IN_MEMORY_NAME.to_owned(),
-            source,
-        })?;
+        Self::from_str_inheriting(text, None)
+    }
+}
+
+impl Manifest {
+    /// Parse a member manifest and apply a workspace's inherited values before validation.
+    ///
+    /// `workspace` is `None` for a standalone manifest (exactly [`FromStr`]) and for a workspace
+    /// root, whose own `[workspace]` table is not a parent of itself. The inheritance pass runs
+    /// before [`validate`](Self::validate) so an inherited dependency may be referenced by
+    /// `[features]` or `[build] module-path` in the member text.
+    ///
+    /// # Errors
+    /// [`ManifestParseError::Parse`] for invalid TOML, [`ManifestParseError::Invalid`] for a
+    /// structurally invalid manifest (including one the inherited values make invalid).
+    pub fn from_str_inheriting(
+        text: &str,
+        workspace: Option<&Workspace>,
+    ) -> Result<Self, ManifestParseError> {
+        let mut manifest: Self =
+            toml::from_str(text).map_err(|source| ManifestParseError::Parse {
+                path: Self::IN_MEMORY_NAME.to_owned(),
+                source,
+            })?;
+        if let Some(workspace) = workspace {
+            if manifest.workspace.is_some() {
+                return Err(ManifestParseError::Invalid {
+                    path: Self::IN_MEMORY_NAME.to_owned(),
+                    source: ValidationError::MemberDeclaresWorkspace,
+                });
+            }
+            workspace.inherit_into(&mut manifest);
+        }
         manifest
             .validate()
             .map_err(|source| ManifestParseError::Invalid {
@@ -3048,6 +3932,29 @@ pub enum ValidationError {
         /// Which rule it broke.
         reason: ResourcePatternError,
     },
+    /// A `[build]` or `[test]` source-filter entry is not a well-formed glob.
+    InvalidSourcePattern {
+        /// Which table carried it (`build` / `test`).
+        table: &'static str,
+        /// Which list carried it (`include` / `exclude`).
+        key: &'static str,
+        /// The malformed glob.
+        pattern: String,
+        /// Which rule it broke.
+        reason: ResourcePatternError,
+    },
+    /// A `[build] module-path` entry is empty or is not a path / `${dependency.<name>}`.
+    InvalidModulePath {
+        /// The offending entry.
+        entry: String,
+    },
+    /// A `[build] module-path` reference names a dependency this manifest does not declare.
+    UnknownModulePathDependency {
+        /// The referenced name.
+        dependency: String,
+        /// The declared names, for an actionable message.
+        declared: Vec<String>,
+    },
     /// A `[build] script.file` is not a non-root portable project file path.
     InvalidBuildScriptFile {
         /// The invalid script file value.
@@ -3096,6 +4003,17 @@ pub enum ValidationError {
     /// exists for the same reason: a native package's implementation is a host function supplied to
     /// a WebAssembly module, and no other backend emits one for it to be supplied to.
     NativePackagesWithoutWasmBackend {
+        /// The backend actually selected, by its serialized `type` tag.
+        backend: &'static str,
+    },
+    /// A `[dependencies]` entry uses the `wasm` form without `[build] backend = { type =
+    /// "jals-wasm" }`.
+    ///
+    /// The third of the same shape: the module is linked into the artifact the wasm backend
+    /// produces, and no other backend emits one to link it into.
+    WasmDependencyWithoutWasmBackend {
+        /// The dependency's name.
+        name: String,
         /// The backend actually selected, by its serialized `type` tag.
         backend: &'static str,
     },
@@ -3212,6 +4130,39 @@ pub enum ValidationError {
         /// The compiler output directory containing it.
         classes_dir: String,
     },
+    /// A registry dependency names a `[registries]` key that is neither declared nor
+    /// `maven-central`.
+    UndeclaredRegistry {
+        /// The dependency that referenced it.
+        dependency: String,
+        /// The undeclared registry name.
+        registry: String,
+    },
+    /// A `[registries]` key is not a valid registry name.
+    InvalidRegistryName {
+        /// The offending key.
+        name: String,
+    },
+    /// A `[registries]` entry's URL is empty or is not `http(s)://`.
+    InvalidRegistryUrl {
+        /// The registry key.
+        name: String,
+        /// The offending URL.
+        url: String,
+    },
+    /// A workspace member manifest carries its own `[workspace]` table.
+    MemberDeclaresWorkspace,
+    /// A `[workspace]` table declares no member at all.
+    EmptyWorkspace,
+    /// A `[workspace]` pattern is empty or is not a resource-style glob.
+    InvalidWorkspacePattern {
+        /// Which workspace key carried it (`members` / `exclude` / `default-members`).
+        key: &'static str,
+        /// The offending pattern.
+        pattern: String,
+        /// The grammar failure, when the pattern reached the glob parser at all.
+        reason: Option<ResourcePatternError>,
+    },
 }
 
 /// Where a `remap` reference was written, for [`ValidationError::UnknownMapping`]'s message.
@@ -3258,6 +4209,26 @@ impl fmt::Display for ValidationError {
                 f,
                 "invalid `[build.resources] template` entry `{pattern}`: {reason}"
             ),
+            Self::InvalidSourcePattern {
+                table,
+                key,
+                pattern,
+                reason,
+            } => write!(f, "invalid `[{table}] {key}` entry `{pattern}`: {reason}"),
+            Self::InvalidModulePath { entry } => write!(
+                f,
+                "invalid `[build] module-path` entry `{entry}`: expected a path or \
+                 `${{dependency.<name>}}`"
+            ),
+            Self::UnknownModulePathDependency {
+                dependency,
+                declared,
+            } => write!(
+                f,
+                "`[build] module-path` references dependency `{dependency}`, which is not declared \
+                 (declared: {})",
+                declared.join(", ")
+            ),
             Self::InvalidBuildScriptFile { file } => write!(
                 f,
                 "invalid `[build] script.file` `{file}`: expected a non-root portable file path"
@@ -3281,6 +4252,11 @@ impl fmt::Display for ValidationError {
             Self::EmptyBinField { field } => {
                 write!(f, "a `[[bin]]` has an empty `{field}`")
             }
+            Self::WasmDependencyWithoutWasmBackend { name, backend } => write!(
+                f,
+                "dependency `{name}` uses the `wasm` form, which links a module into the artifact \
+                 a WebAssembly backend produces, and `[build] backend` is `{backend}`"
+            ),
             Self::WasmRuntimeWithoutWasmBackend { backend } => write!(
                 f,
                 "`[toolchain] runtime` is `wasm`, which runs a WebAssembly module, and `[build] \
@@ -3379,16 +4355,66 @@ impl fmt::Display for ValidationError {
                 "invalid `[build] remap` jar `{jar}`: it must be outside `[build] classes-dir` \
                  `{classes_dir}`, which the compiler writes and `jals clean` removes"
             ),
+            Self::UndeclaredRegistry {
+                dependency,
+                registry,
+            } => write!(
+                f,
+                "dependency `{dependency}` resolves from registry `{registry}`, which `[registries]` \
+                 does not declare (declare it, or omit `registry` for `maven-central`)"
+            ),
+            Self::InvalidRegistryName { name } => {
+                write!(
+                    f,
+                    "`[registries]` key `{name}` is not a valid registry name"
+                )
+            }
+            Self::InvalidRegistryUrl { name, url } => write!(
+                f,
+                "`[registries] {name}` has a URL of `{url}` (expected an `https://` or `http://` \
+                 repository base URL)"
+            ),
+            Self::MemberDeclaresWorkspace => write!(
+                f,
+                "a workspace member manifest declares its own `[workspace]`; a member cannot be a \
+                 workspace root (nested workspaces are discovered by walking to the nearest root)"
+            ),
+            Self::EmptyWorkspace => write!(
+                f,
+                "`[workspace]` declares no `members`; a workspace with no member pattern would \
+                 capture every upward walk and resolve nothing"
+            ),
+            Self::InvalidWorkspacePattern {
+                key,
+                pattern,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "`[workspace] {key}` entry `{pattern}` is not a member glob"
+                )?;
+                reason
+                    .as_ref()
+                    .map_or(Ok(()), |reason| write!(f, ": {reason}"))
+            }
         }
     }
 }
 
 impl Error for ValidationError {
+    #[allow(clippy::match_same_arms)]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Dependency(err) => Some(err),
             Self::Mapping(err) => Some(err),
+            // Same body, different error types; combining the patterns would ask one binding to
+            // have two types.
             Self::InvalidFeatureRef { reason, .. } => Some(reason),
+            Self::InvalidSourcePattern { reason, .. } => Some(reason),
+            Self::InvalidWorkspacePattern {
+                reason: Some(reason),
+                ..
+            } => Some(reason),
             _ => None,
         }
     }
@@ -3405,12 +4431,12 @@ mod tests {
         assert_eq!(m.build.source_dirs, alloc::vec!["src/main/java".to_owned()]);
         assert_eq!(m.build.classes_dir, "target/classes");
         assert_eq!(m.build.release, None);
-        assert!(m.build.classpath.is_empty());
-        assert!(m.build.javac_flags.is_empty());
+        assert!(m.build.classpath.is_empty(), "{:?}", m.build.classpath);
+        assert!(m.build.javac_flags.is_empty(), "{:?}", m.build.javac_flags);
         assert_eq!(m.package.name, None);
         assert_eq!(m.package.default_run, None);
         assert_eq!(m.run.main_class, None);
-        assert!(m.bin.is_empty());
+        assert!(m.bin.is_empty(), "{:?}", m.bin);
         assert!(m.dependencies.is_empty());
     }
 
@@ -3418,24 +4444,24 @@ mod tests {
     fn parses_build_script_inline_and_dotted_syntax() {
         let m: Manifest = r#"
             [build]
-            script = { type = "rhai", file = "build.rhai" }
+            script = { type = "java", file = "build.java" }
             "#
         .parse()
         .unwrap();
         assert_eq!(
             m.build.script,
-            Some(BuildScript::Rhai {
-                file: "build.rhai".to_owned(),
+            Some(BuildScript::Java {
+                file: "build.java".to_owned(),
             })
         );
 
-        let m: Manifest = "build.script = { type = \"rhai\", file = \"scripts/build.rhai\" }\n"
+        let m: Manifest = "build.script = { type = \"java\", file = \"scripts/build.java\" }\n"
             .parse()
             .unwrap();
         assert_eq!(
             m.build.script,
-            Some(BuildScript::Rhai {
-                file: "scripts/build.rhai".to_owned(),
+            Some(BuildScript::Java {
+                file: "scripts/build.java".to_owned(),
             })
         );
     }
@@ -3444,35 +4470,35 @@ mod tests {
     fn parses_build_script_table_syntax() {
         let m: Manifest = r#"
             [build.script]
-            type = "rhai"
-            file = "build.rhai"
+            type = "java"
+            file = "build.java"
             "#
         .parse()
         .unwrap();
         assert_eq!(
             m.build.script,
-            Some(BuildScript::Rhai {
-                file: "build.rhai".to_owned(),
+            Some(BuildScript::Java {
+                file: "build.java".to_owned(),
             })
         );
     }
 
     #[test]
     fn build_script_tag_name_matches_serde_tag() {
-        let script = BuildScript::Rhai {
-            file: "build.rhai".to_owned(),
+        let script = BuildScript::Java {
+            file: "build.java".to_owned(),
         };
-        assert_eq!(script.tag_name(), "rhai");
+        assert_eq!(script.tag_name(), "java");
     }
 
     #[test]
     fn build_script_rejects_missing_and_unknown_fields() {
         for text in [
-            "[build]\nscript = { file = \"build.rhai\" }\n",
-            "[build]\nscript = { type = \"rhai\" }\n",
-            "[build]\nscript = { type = \"unknown\", file = \"build.rhai\" }\n",
-            "[build]\nscript = { type = \"rhai\", file = \"build.rhai\", extra = true }\n",
-            "[build.script]\ntype = \"rhai\"\nfile = \"build.rhai\"\nextra = true\n",
+            "[build]\nscript = { file = \"build.java\" }\n",
+            "[build]\nscript = { type = \"java\" }\n",
+            "[build]\nscript = { type = \"unknown\", file = \"build.java\" }\n",
+            "[build]\nscript = { type = \"java\", file = \"build.java\", extra = true }\n",
+            "[build.script]\ntype = \"java\"\nfile = \"build.java\"\nextra = true\n",
         ] {
             assert!(
                 toml::from_str::<Manifest>(text).is_err(),
@@ -3483,9 +4509,9 @@ mod tests {
 
     #[test]
     fn build_script_file_must_be_a_non_root_portable_file_key() {
-        for file in ["../build.rhai", ""] {
+        for file in ["../build.java", ""] {
             let text =
-                alloc::format!("[build]\nscript = {{ type = \"rhai\", file = \"{file}\" }}\n");
+                alloc::format!("[build]\nscript = {{ type = \"java\", file = \"{file}\" }}\n");
             let error = text.parse::<Manifest>().unwrap_err();
             let ManifestParseError::Invalid { source, .. } = error else {
                 panic!("invalid build script file must be a validation error");
@@ -3509,11 +4535,11 @@ mod tests {
     fn build_script_file_must_be_outside_the_managed_build_root() {
         for file in [
             "target/jals/build",
-            "target/jals/build/build.rhai",
-            "target/jals/build/rhai/out/build.rhai",
+            "target/jals/build/build.java",
+            "target/jals/build/script/out/build.java",
         ] {
             let text =
-                alloc::format!("[build]\nscript = {{ type = \"rhai\", file = \"{file}\" }}\n");
+                alloc::format!("[build]\nscript = {{ type = \"java\", file = \"{file}\" }}\n");
             let error = text.parse::<Manifest>().unwrap_err();
             let ManifestParseError::Invalid { source, .. } = error else {
                 panic!("managed build script file must be a validation error");
@@ -3533,7 +4559,7 @@ mod tests {
         let error = r#"
             [build]
             classes-dir = "out"
-            script = { type = "rhai", file = "out/build.rhai" }
+            script = { type = "java", file = "out/build.java" }
             "#
         .parse::<Manifest>()
         .unwrap_err();
@@ -3543,7 +4569,7 @@ mod tests {
         assert_eq!(
             source,
             ValidationError::BuildScriptInClassesDir {
-                file: "out/build.rhai".to_owned(),
+                file: "out/build.java".to_owned(),
                 classes_dir: "out".to_owned(),
             }
         );
@@ -3571,7 +4597,7 @@ mod tests {
     fn rejects_an_unknown_build_key() {
         let error = r#"
             [build]
-            scripts = { type = "rhai", file = "build.rhai" }
+            scripts = { type = "java", file = "build.java" }
             "#
         .parse::<Manifest>()
         .unwrap_err();
@@ -3607,7 +4633,11 @@ mod tests {
         // Absent entirely: a project needs nothing here, and the defaults keep a test run's
         // output clear of an ordinary build's.
         let manifest: Manifest = toml::from_str("[package]\nname = \"x\"\n").unwrap();
-        assert!(manifest.test.source_dirs.is_empty());
+        assert!(
+            manifest.test.source_dirs.is_empty(),
+            "{:?}",
+            manifest.test.source_dirs
+        );
         assert_eq!(manifest.test.classes_dir, "target/test-classes");
         assert!(manifest.validate().is_ok());
 
@@ -3689,10 +4719,10 @@ mod tests {
         assert_eq!(m.build.javac_flags, alloc::vec!["-Xlint:all".to_owned()]);
         assert_eq!(m.run.main_class.as_deref(), Some("com.example.Main"));
         // No `[[bin]]`: the bin list is empty and selection falls back to `[run] main-class`.
-        assert!(m.bin.is_empty());
+        assert!(m.bin.is_empty(), "{:?}", m.bin);
         assert_eq!(m.package.default_run, None);
         // No `[package] features`: every feature gate stays off.
-        assert!(m.package.features.is_empty());
+        assert!(m.package.features.is_empty(), "{:?}", m.package.features);
         assert!(m.feature_set().is_empty());
     }
 
@@ -4244,7 +5274,7 @@ mod tests {
         assert_eq!(m.build.source_dirs, alloc::vec!["src/main/java".to_owned()]);
         assert_eq!(m.build.classes_dir, "target/classes");
         assert_eq!(m.run.main_class, None);
-        assert!(m.bin.is_empty());
+        assert!(m.bin.is_empty(), "{:?}", m.bin);
     }
 
     #[test]
@@ -4406,6 +5436,65 @@ mod tests {
         }
     }
 
+    /// A `wasm` dependency is a module linked into the artifact the wasm backend emits; no other
+    /// backend emits one to link into, so the pairing is the manifest's contradiction too — named
+    /// entry by entry, so the message points at the one to move.
+    #[test]
+    fn validate_rejects_a_wasm_dependency_without_the_wasm_backend() {
+        for backend in [BackendKind::Javac {}, BackendKind::Jals {}] {
+            let mut m = Manifest::default();
+            m.build.backend = backend;
+            m.dependencies.insert(
+                "demo".to_owned(),
+                Dependency::Wasm(WasmDependency {
+                    wasm: "../demo/demo.wasm".to_owned(),
+                    foreign: None,
+                    optional: None,
+                }),
+            );
+            assert_eq!(
+                m.validate(),
+                Err(ValidationError::WasmDependencyWithoutWasmBackend {
+                    name: "demo".to_owned(),
+                    backend: backend.tag_name(),
+                })
+            );
+
+            // `[dev-dependencies]` goes through the identical check: a test run resolves those,
+            // so the contradiction with a class-file backend is exactly the same one.
+            let mut m = Manifest::default();
+            m.build.backend = backend;
+            m.dev_dependencies.insert(
+                "demo".to_owned(),
+                Dependency::Wasm(WasmDependency {
+                    wasm: "../demo/demo.wasm".to_owned(),
+                    foreign: None,
+                    optional: None,
+                }),
+            );
+            assert_eq!(
+                m.validate(),
+                Err(ValidationError::WasmDependencyWithoutWasmBackend {
+                    name: "demo".to_owned(),
+                    backend: backend.tag_name(),
+                })
+            );
+        }
+
+        // Beside the backend that links it, the same manifest is accepted.
+        let mut m = Manifest::default();
+        m.build.backend = BackendKind::JalsWasm {};
+        m.dependencies.insert(
+            "demo".to_owned(),
+            Dependency::Wasm(WasmDependency {
+                wasm: "../demo/demo.wasm".to_owned(),
+                foreign: None,
+                optional: None,
+            }),
+        );
+        assert_eq!(m.validate(), Ok(()));
+    }
+
     /// Beside the backend that can take one in, and with the value-level checks this layer *can*
     /// answer. Whether a name exists is not one of them: the set is a property of the binary that
     /// holds the registry, so an unknown name is that host's to report.
@@ -4448,7 +5537,11 @@ mod tests {
             manifest.build.native_packages,
             alloc::vec!["jals.io".to_owned()]
         );
-        assert!(Manifest::default().build.native_packages.is_empty());
+        assert!(
+            Manifest::default().build.native_packages.is_empty(),
+            "{:?}",
+            Manifest::default().build.native_packages
+        );
     }
 
     /// A `jar`-form dependency with no companion `sources` jar and no bundled-jar recursion.
@@ -4592,6 +5685,7 @@ mod tests {
             Some(&Dependency::Path(PathDependency {
                 path: "../sibling".to_owned(),
                 dir: None,
+                mode: PathMode::Source,
                 features: Vec::new(),
                 default_features: None,
                 optional: None,
@@ -4779,6 +5873,7 @@ mod tests {
                     Dependency::Path(PathDependency {
                         path: "../sibling".to_owned(),
                         dir: None,
+                        mode: PathMode::Source,
                         features: Vec::new(),
                         default_features: None,
                         optional: None,
@@ -4851,7 +5946,11 @@ mod tests {
         assert_eq!(m.validate(), Ok(()));
         assert_eq!(m.dependencies["g"].features(), ["hello"]);
         assert_eq!(m.dependencies["p"].features(), ["hello", "world"]);
-        assert!(m.dependencies["j"].features().is_empty());
+        assert!(
+            m.dependencies["j"].features().is_empty(),
+            "{:?}",
+            m.dependencies["j"].features()
+        );
     }
 
     #[test]
@@ -5292,7 +6391,11 @@ mod tests {
         assert!(matches!(local, MappingSource::File(_)));
         // Both forms default the format, so an entry that says nothing still names one grammar.
         assert_eq!(local.format(), &MappingFormatKind::Proguard {});
-        assert!(local.required_features().is_empty());
+        assert!(
+            local.required_features().is_empty(),
+            "{:?}",
+            local.required_features()
+        );
 
         let [MappingSource::Url(mojmap)] = manifest.mappings["mojmap"].alternatives() else {
             panic!("the `url` form should classify as `Url`");
@@ -5650,7 +6753,11 @@ mod tests {
     fn a_resource_template_declaration_is_off_by_default_and_round_trips() {
         // Off by default is the whole compatibility story: a project that says nothing keeps the
         // byte-for-byte copy it always had.
-        assert!(Build::default().resources.template.is_empty());
+        assert!(
+            Build::default().resources.template.is_empty(),
+            "{:?}",
+            Build::default().resources.template
+        );
 
         let declared: Manifest =
             toml::from_str("[build.resources]\ntemplate = [\"fabric.mod.json\"]\n").unwrap();
@@ -5832,5 +6939,249 @@ mod tests {
             in_managed.validate(),
             Err(ValidationError::RemapOutputInManagedRoot { .. })
         ));
+    }
+
+    #[test]
+    fn source_filters_use_the_resource_glob_grammar_and_exclude_wins() {
+        let manifest: Manifest = toml::from_str(
+            "[build]\ninclude = [\"com/example/**\"]\nexclude = [\"**/module-info.java\"]\n\
+             [test]\nexclude = [\"**/*IT.java\"]\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+
+        let build = manifest.build.source_filter().unwrap();
+        let selected = RelativePath::parse("com/example/Main.java").unwrap();
+        let excluded = RelativePath::parse("com/example/module-info.java").unwrap();
+        let outside = RelativePath::parse("org/other/Main.java").unwrap();
+        assert!(build.accepts(&selected));
+        assert!(!build.accepts(&excluded));
+        assert!(!build.accepts(&outside));
+
+        let test = manifest.test.source_filter().unwrap();
+        assert!(!test.accepts(&RelativePath::parse("com/example/MainIT.java").unwrap()));
+        assert!(test.accepts(&RelativePath::parse("com/example/Main.java").unwrap()));
+    }
+
+    #[test]
+    fn an_empty_include_selects_every_source_and_a_malformed_entry_is_rejected() {
+        let manifest: Manifest =
+            toml::from_str("[build]\nexclude = [\"module-info.java\"]\n").unwrap();
+        assert!(
+            manifest
+                .build
+                .source_filter()
+                .unwrap()
+                .accepts(&RelativePath::parse("com/example/Main.java").unwrap())
+        );
+
+        let invalid: Manifest = toml::from_str("[test]\ninclude = [\"**bad\"]\n").unwrap();
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::InvalidSourcePattern {
+                table: "test",
+                key: "include",
+                pattern: "**bad".to_owned(),
+                reason: ResourcePatternError::MalformedAnyDepth,
+            })
+        );
+    }
+
+    #[test]
+    fn path_dependency_mode_selects_classpath_consumption() {
+        let manifest: Manifest = toml::from_str(
+            "[dependencies]\nstub = { path = \"../stub\", dir = \"target/classes\", mode = \"classpath\" }\n\
+             source = { path = \"../source\" }\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+        let stub = manifest.dependencies.get("stub").unwrap();
+        let path = stub.classpath_only_path().unwrap();
+        assert_eq!(path.classpath_path(), "../stub/target/classes");
+
+        let windows: Manifest = toml::from_str(
+            "[dependencies]\nstub = { path = \"..\\\\stub\\\\\", dir = \"target\\\\classes\", mode = \"classpath\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .dependencies
+                .get("stub")
+                .unwrap()
+                .classpath_only_path()
+                .unwrap()
+                .classpath_path(),
+            "../stub/target/classes"
+        );
+
+        for entry in [
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", features = [\"x\"] }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", default-features = false }",
+            "{ path = \"stub\", dir = \"classes\", mode = \"classpath\", optional = true }",
+            "{ path = \"stub\", dir = \"/abs\", mode = \"classpath\" }",
+            "{ path = \"stub\", dir = \"../elsewhere\", mode = \"classpath\" }",
+        ] {
+            let invalid: Manifest =
+                toml::from_str(&format!("[dependencies]\nstub = {entry}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{entry} should be rejected");
+        }
+        assert!(
+            manifest
+                .dependencies
+                .get("source")
+                .unwrap()
+                .classpath_only_path()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn modular_mode_and_module_path_references_are_validated() {
+        let manifest: Manifest = toml::from_str(
+            "[build]\nmodular = \"auto\"\nmodule-path = [\"libs/modules\", \"${dependency.guava}\"]\n\
+             [dependencies]\nguava = { jar = \"libs/guava.jar\" }\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.validate(), Ok(()));
+        assert_eq!(manifest.build.modular, ModularMode::Auto);
+        assert_eq!(
+            manifest.build.module_path_entries().unwrap(),
+            vec![
+                ModulePathEntry::Path("libs/modules"),
+                ModulePathEntry::Dependency("guava"),
+            ]
+        );
+
+        let unknown: Manifest =
+            toml::from_str("[build]\nmodule-path = [\"${dependency.missing}\"]\n").unwrap();
+        assert_eq!(
+            unknown.validate(),
+            Err(ValidationError::UnknownModulePathDependency {
+                dependency: "missing".to_owned(),
+                declared: Vec::new(),
+            })
+        );
+
+        let malformed: Manifest =
+            toml::from_str("[build]\nmodule-path = [\"${dependency}\"]\n").unwrap();
+        assert_eq!(
+            malformed.validate(),
+            Err(ValidationError::InvalidModulePath {
+                entry: "${dependency}".to_owned(),
+            })
+        );
+
+        assert!(!ModularMode::Classpath.uses_module_path(true));
+        assert!(ModularMode::Auto.uses_module_path(true));
+        assert!(!ModularMode::Auto.uses_module_path(false));
+        assert!(ModularMode::ModulePath.uses_module_path(false));
+    }
+
+    #[test]
+    fn workspace_inheritance_fills_omitted_values_and_member_wins() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+             [workspace.package]\nversion = \"1.2.3\"\n\
+             [workspace.dependencies]\nguava = { jar = \"libs/guava.jar\" }\n\
+             [workspace.build]\nrelease = 21\nclasspath = [\"libs/common.jar\"]\n\
+             javac-flags = [\"-Xlint:all\"]\n",
+        )
+        .unwrap();
+        let workspace = root.workspace.as_ref().unwrap();
+
+        let mut member: Manifest = toml::from_str(
+            "[package]\nname = \"app\"\n\
+             [build]\nclasspath = [\"libs/app.jar\"]\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut member);
+        assert_eq!(member.validate(), Ok(()));
+        assert_eq!(member.package.version.as_deref(), Some("1.2.3"));
+        assert!(member.dependencies.contains_key("guava"));
+        assert_eq!(member.build.release, Some(21));
+        assert_eq!(
+            member.build.classpath,
+            vec!["libs/common.jar".to_owned(), "libs/app.jar".to_owned()]
+        );
+        assert_eq!(member.build.javac_flags, vec!["-Xlint:all".to_owned()]);
+
+        let mut overriding: Manifest = toml::from_str(
+            "[package]\nname = \"lib\"\nversion = \"9.9.9\"\n\
+             [dependencies]\nguava = { jar = \"libs/other.jar\" }\n\
+             [build]\nrelease = 17\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut overriding);
+        assert_eq!(overriding.package.version.as_deref(), Some("9.9.9"));
+        assert!(matches!(
+            overriding.dependencies.get("guava"),
+            Some(Dependency::Jar(jar)) if jar.jar == "libs/other.jar"
+        ));
+        assert_eq!(overriding.build.release, Some(17));
+    }
+
+    #[test]
+    fn workspace_build_source_and_target_do_not_survive_an_inherited_release() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+             [workspace.build]\nsource = 11\ntarget = 11\n\
+             [workspace.dev-dependencies]\ntestkit = { jar = \"libs/testkit.jar\" }\n",
+        )
+        .unwrap();
+        let workspace = root.workspace.as_ref().unwrap();
+
+        let mut member: Manifest =
+            toml::from_str("[package]\nname = \"app\"\nsource = 17\ntarget = 17\n").unwrap();
+        workspace.inherit_into(&mut member);
+        assert_eq!(member.build.release, None);
+        assert_eq!(member.build.source, Some(11));
+        assert_eq!(member.build.target, Some(11));
+        assert!(member.dev_dependencies.contains_key("testkit"));
+
+        let mut released: Manifest = toml::from_str(
+            "[package]\nname = \"lib\"\n[build]\nrelease = 21\nsource = 17\ntarget = 17\n",
+        )
+        .unwrap();
+        workspace.inherit_into(&mut released);
+        assert_eq!(released.build.release, Some(21));
+        assert_eq!(released.build.source, None);
+        assert_eq!(released.build.target, None);
+    }
+
+    #[test]
+    fn a_workspace_root_is_not_its_own_parent() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\"]\n\
+             [workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Manifest::from_str_inheriting(
+                "[workspace]\nmembers = [\"app\"]\n[package]\nname = \"root\"\n",
+                root.workspace.as_ref(),
+            ),
+            Err(ManifestParseError::Invalid {
+                source: ValidationError::MemberDeclaresWorkspace,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn workspace_inheritance_runs_before_member_validation() {
+        let root: Manifest = toml::from_str(
+            "[workspace]\nmembers = [\"app\"]\n\
+             [workspace.dependencies]\nstub = { jar = \"libs/stub.jar\" }\n\
+             [workspace.build]\nmodule-path = [\"${dependency.stub}\"]\n",
+        )
+        .unwrap();
+        let member: Manifest =
+            Manifest::from_str_inheriting("[package]\nname = \"app\"\n", root.workspace.as_ref())
+                .unwrap();
+        assert_eq!(
+            member.build.module_path,
+            vec!["${dependency.stub}".to_owned()]
+        );
+        assert!(member.dependencies.contains_key("stub"));
     }
 }

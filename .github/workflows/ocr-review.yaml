@@ -1,0 +1,61 @@
+name: OpenCodeReview
+
+# AI code review for pull requests using OpenCodeReview
+# (https://github.com/alibaba/open-code-review). It reviews the base-to-head
+# diff and posts inline comments plus a sticky summary comment on the PR.
+#
+# Required configuration (Settings -> Secrets and variables -> Actions):
+#   secret    OCR_LLM_URL            LLM API endpoint
+#   secret    OCR_LLM_AUTH_TOKEN     API token for that endpoint
+#   variable  OCR_LLM_MODEL          Model name
+#   variable  OCR_LLM_USE_ANTHROPIC  'true' for Anthropic Claude,
+#                                    'false' for an OpenAI-compatible endpoint
+#                                    (defaults to 'false' when unset)
+
+on:
+  # Use pull_request_target instead of pull_request so that secrets are
+  # available even for PRs from forks. This is safe because OCR only reads
+  # the diff and does not execute any code from the PR.
+  # jactionlint ignore=dangerous-triggers
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  # Posting the review as pull request comments is what this scope is for.
+  # jactionlint ignore=excessive-permissions
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: AI review
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Run OpenCodeReview
+        uses: alibaba/open-code-review@55450a95e5999dfd00ec2d582c23d76e269922fb # v1.13.2
+        env:
+          # The npm launcher spawns a detached self-update on every `ocr`
+          # invocation; once a newer release exists, its `npm i -g` briefly
+          # removes the global launcher and later `ocr` calls fail with
+          # MODULE_NOT_FOUND (alibaba/open-code-review#703). The action owns
+          # the installation for this job, so keep self-update off.
+          OCR_NO_UPDATE: '1'
+        with:
+          ocr_version: '1.13.0'
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC || 'false' }}
+          llm_extra_body: '{"reasoning": {"enabled": false}, "stream": true}'
+          llm_timeout: '600'
+          review_task_timeout: '30'
+          sticky_summary: 'true'
+          incremental: 'true'
+          upload_artifacts: 'true'

@@ -9,12 +9,13 @@
 //! # There is no `main`
 //!
 //! wasm has no entry-point convention, and the one Java has cannot be lowered here: `main` takes a
-//! `String[]`, and a wasm host has no `java.base` to supply `String`. So the entry point is
-//! *named*: an exported function, called by the name the source spells it with. The
-//! [`jals_javac::wasm`] backend exports every `static` method that is not a constructor, which is
-//! wider than "public" and is why an export can turn out to take a parameter no command line can
-//! write — a reference to an object the embedder's collector owns. That is refused with the
-//! position that caused it rather than mis-parsed.
+//! `String[]`, and this runner has no way to build one — its elements are references the
+//! embedder's collector owns, so building the array is a platform's job and not a command line's.
+//! So the entry point is *named*: an exported function, called by the name the source spells it
+//! with. The [`jals_javac::wasm`] backend exports every `static` method that is not a constructor,
+//! which is wider than "public" and is why an export can turn out to take a parameter no command
+//! line can write — a reference to an object the embedder's collector owns. That is refused with
+//! the position that caused it rather than mis-parsed.
 //!
 //! Naming no export at all is still a run: instantiating a module executes its start function,
 //! which is where this backend lowers a class's `static` initialisers. A project with no static
@@ -29,16 +30,55 @@
 //! implementer and an unreachable branch. A second engine is when the seam is worth having.
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::Range;
 
+use jals_hir::FileId;
+use jals_javac::wasm::{POSITION_GLOBAL, Positions};
 use jals_native::{Args, NativeBindings, NativeError, NativeHost, NativeValue, RefSlot, Results};
 use jals_progress::{Activity, Outcome, Progress};
-use tinywasm::types::{ImportType, WasmType};
-use tinywasm::{ExternItem, FuncContext, HostFunction, Imports, ModuleInstance, RefValue, Store};
+use tinywasm::types::{ExportType, ImportType, WasmType};
+use tinywasm::{
+    ExecProgress, ExternItem, FuncContext, Function, HostFunction, Imports, ModuleInstance,
+    RefValue, Store,
+};
+
+/// A library module to instantiate and link before the project's own.
+///
+/// The same bytes the compile linked against, resolved by the host from a `wasm` dependency. The
+/// compile consumed the module's ABI; the run consumes the module.
+pub struct WasmLibrary<'a> {
+    /// The link name, which is the module name every import from it is spelled with.
+    pub name: &'a str,
+    /// The module's bytes.
+    pub bytes: &'a [u8],
+}
+
+/// A core module that provides implementations for the project's `native` declarations.
+///
+/// Not a linked library: a foreign module has no `jals.library` section and none of the Java
+/// types. Each export whose name is a canonical member key (`owner#name+descriptor`) satisfies the
+/// project's import of that member — the shape a Rust library generated through a WIT interface
+/// hits, where the interface's functions *are* the module's exports. Scalars only for now: a
+/// reference to a GC object is not something a core module can hold, so a signature that has one
+/// links against nothing.
+///
+/// A foreign module is linked under its [`name`](Self::name) as well, so a *later* foreign module
+/// can import from it the ordinary wasm way: an import whose module is that name resolves to this
+/// module's export of the same function name. Which pairs can be spelled is the order they are
+/// passed in — cycles cannot, because one of the two has to instantiate first.
+pub struct WasmForeignModule<'a> {
+    /// The dependency name this module was declared by: what its diagnostics name it, and the
+    /// module name a later foreign module imports from it under.
+    pub name: &'a str,
+    /// The module's bytes.
+    pub bytes: &'a [u8],
+}
 
 /// What to run, and what to call in it.
 pub struct WasmRunRequest<'a> {
@@ -59,6 +99,41 @@ pub struct WasmRunRequest<'a> {
     /// — so passing [`NativeBindings::new`] is not a degraded mode, it is what "this module needs
     /// nothing from the host" looks like.
     pub natives: &'a NativeBindings,
+    /// The precompiled libraries the module imports from, in the order they are instantiated:
+    /// each links against what the ones before it contributed, so a library that imports another
+    /// has to come after it.
+    ///
+    /// Empty for the ordinary single-module build, which is what a project with no `wasm`
+    /// dependency produces.
+    ///
+    /// The CLI passes them in the manifest's dependency-key order. Nothing declares that order and
+    /// nothing needs to yet: `CompileWasm::library` takes no linked list, so a library module
+    /// cannot import another library — an ordering *edge* would have to exist before the order
+    /// could matter.
+    pub libraries: &'a [WasmLibrary<'a>],
+    /// The foreign modules that satisfy the project's `native` imports by canonical key, in the
+    /// order they are instantiated: each is linked under its name, so one that imports from an
+    /// earlier one sees that module's exports. Their exports are searched only for imports nothing
+    /// else supplies — see [`WasmForeignModule`].
+    pub foreign: &'a [WasmForeignModule<'a>],
+    /// How much the run may execute before it is stopped, or `None` to let it run to completion.
+    ///
+    /// In the engine's fuel units — one per instruction executed, as the engine counts them — so
+    /// this is an instruction budget, not the source-level operation count a host may expose to
+    /// its user. A run that exhausts it comes back as [`WasmRunError::OutOfFuel`], with the
+    /// statement it was in when the budget ran out when the module carries positions.
+    ///
+    /// `None` is what every host but the build-script engine passes: a script is someone else's
+    /// code and the cap is what keeps one from hanging the build, while `jals run` runs the user's
+    /// own project and stopping it early would be surprising. The module's own code is metered —
+    /// its start function, where the `static` initialisers are, as well as the export — while a
+    /// linked library's start runs untimed: a library is a package the host selected, not code
+    /// under the budget. Code a host binding calls back into does not consume fuel either, because
+    /// the engine runs a reentrant call to completion.
+    ///
+    /// There is no out-of-fuel *trap*: the engine reports a suspension, not an error, which is why
+    /// this has a variant of its own rather than arriving as a trap would.
+    pub fuel: Option<u32>,
     /// Where the run reports what it is doing.
     pub progress: &'a Progress,
 }
@@ -124,6 +199,15 @@ pub enum WasmRunError {
     /// project's own code running, and it comes back as [`Trap`](Self::Trap) or
     /// [`Exception`](Self::Exception) like any other execution failure.
     Instantiate(String),
+    /// A linked library or foreign module could not be decoded, instantiated, or registered under
+    /// its name.
+    Library {
+        /// The name the module was declared under: a `wasm` dependency's key, or a selected native
+        /// package's name.
+        name: String,
+        /// What the engine said.
+        message: String,
+    },
     /// Nothing is exported under that name.
     ///
     /// Carries the names that *are* exported, because the one thing a caller cannot see from here
@@ -132,15 +216,17 @@ pub enum WasmRunError {
     /// and the second is dropped when the module is built. The list is the only evidence of that.
     /// The module imports a `native` method nothing supplies an implementation for.
     ///
-    /// Reported when the module is linked, before any of its code runs, and carrying every key the
-    /// selection *does* bind — which is the only evidence a reader gets that a signature was
-    /// spelled two ways, since the import's own name carries the descriptor.
+    /// Reported while the module is being linked, before any of its code runs, and carrying what
+    /// could have supplied it — the selection's keys and the foreign modules' exports — which is
+    /// the only evidence a reader gets that a signature was spelled two ways, since the import's
+    /// own name carries the descriptor.
     UnresolvedImport {
         /// The declaring class's internal name, as the module imports it.
         module: String,
         /// The method's name with its descriptor, as the module imports it.
         name: String,
-        /// Every `<owner>.<signature>` the selected packages bind.
+        /// What could have supplied the import: every `<owner>.<signature>` the selected packages
+        /// bind, then every function the foreign modules export, under the export's own name.
         available: Vec<String>,
     },
     NoSuchExport {
@@ -181,6 +267,12 @@ pub enum WasmRunError {
     /// store is gone by the time a caller sees this — so the message says that rather than
     /// pretending a trap occurred.
     Exception,
+    /// The run was still executing when its instruction budget ran out.
+    ///
+    /// Its own answer rather than a [`Trap`](Self::Trap), because nothing went wrong with the
+    /// code: it went on too long. The engine reports a budgeted call that exhausts its fuel as a
+    /// suspension rather than an error, so there is no engine error for this to be folded into.
+    OutOfFuel,
     /// The export was found, and the engine then refused the handle it had just produced.
     ///
     /// Its own answer rather than folded into [`Instantiate`](Self::Instantiate), which means
@@ -191,6 +283,23 @@ pub enum WasmRunError {
     /// either would be the wrong place. Kept rather than unwrapped because a panic in a library
     /// is worse than an answer nobody expects to read.
     Signature { name: String, message: String },
+    /// A failure inside the program, with where it happened when the module carries positions.
+    ///
+    /// Attached by the runner after the failure, from the module's exported `$jals$position`
+    /// global and the `jals.positions` table that came with it — see [`Positions`]. The wrapped
+    /// error is the engine's answer; this adds the one thing the engine cannot know, which is
+    /// which statement of which source the module was executing. The same shape as the
+    /// compile-time [`WasmError::Located`](jals_javac::wasm::WasmError::Located), and attached
+    /// where the module was compiled *with*
+    /// [`positions`](jals_javac::wasm::WasmOptions::positions): a module without them fails here
+    /// as the bare error.
+    Located {
+        error: Box<Self>,
+        /// The source file, numbered the way the compile numbered its inputs.
+        file: FileId,
+        /// The statement's byte range in that file.
+        range: Range<usize>,
+    },
 }
 
 impl WasmRunError {
@@ -211,7 +320,39 @@ impl WasmRunError {
     /// `native`-gated module has to carry that gate itself or it is dead code there.
     #[cfg(feature = "native")]
     pub(crate) const fn is_execution_failure(&self) -> bool {
-        matches!(self, Self::Trap(_) | Self::Exception)
+        match self {
+            Self::Trap(_) | Self::Exception | Self::OutOfFuel => true,
+            Self::Located { error, .. } => error.is_execution_failure(),
+            _ => false,
+        }
+    }
+
+    /// Where a failure inside the program happened, when the module carries positions.
+    ///
+    /// The file is the one the compile numbered its inputs with — the same numbering
+    /// [`WasmError::location`](jals_javac::wasm::WasmError::location) reports for a compile error
+    /// — and the range is a byte range into that file's text. `None` when the module was compiled
+    /// without positions, or when the failure came before any statement ran.
+    pub fn location(&self) -> Option<(FileId, Range<usize>)> {
+        match self {
+            Self::Located { file, range, .. } => Some((*file, range.clone())),
+            _ => None,
+        }
+    }
+
+    /// This failure, with where the module was executing when it happened.
+    ///
+    /// A failure with no position to add is itself: there is nothing to say, and a `Located`
+    /// wrapping nothing would only make a caller unwrap it to find the error it already had.
+    fn located(self, position: Option<(FileId, Range<usize>)>) -> Self {
+        match position {
+            Some((file, range)) => Self::Located {
+                error: Box::new(self),
+                file,
+                range,
+            },
+            None => self,
+        }
     }
 }
 
@@ -229,13 +370,15 @@ impl fmt::Display for WasmRunError {
             } => {
                 write!(
                     f,
-                    "the module imports `{name}` from `{module}`, and no selected native package \
-                     supplies it"
+                    "the module imports `{name}` from `{module}`, and nothing supplies it"
                 )?;
                 if available.is_empty() {
-                    return f.write_str(" (no package is selected)");
+                    return f.write_str(" (nothing is bound)");
                 }
-                write!(f, "; the selection binds {}", available.join(", "))
+                write!(f, "; what is bound: {}", available.join(", "))
+            }
+            Self::Library { name, message } => {
+                write!(f, "the library `{name}` could not be linked: {message}")
             }
             Self::NoSuchExport { name, available } => {
                 write!(f, "the module exports no function named `{name}`")?;
@@ -270,10 +413,17 @@ impl fmt::Display for WasmRunError {
             ),
             Self::Trap(message) => write!(f, "the call trapped: {message}"),
             Self::Exception => f.write_str("the code threw an exception and nothing caught it"),
+            Self::OutOfFuel => {
+                f.write_str("the run exhausted its instruction budget before it finished")
+            }
             Self::Signature { name, message } => write!(
                 f,
                 "the engine exports `{name}` but would not describe it: {message}"
             ),
+            // The position is a file number and a byte range, which mean nothing without the
+            // source they number; a host that has the source renders it with
+            // [`location`](Self::location), and one that does not has nothing better to print.
+            Self::Located { error, .. } => write!(f, "{error}"),
         }
     }
 }
@@ -427,6 +577,19 @@ impl NativeHost for EngineHost<'_> {
     }
 }
 
+/// What the module's own code runs under, and what it leaves behind if it stops.
+///
+/// The request's two fields that reach the code, carried as one value because they travel
+/// together: the budget is what stops a run early and the table is what says where it stopped.
+/// `Copy`, so the start function and the export are handed it in turn without a borrow dance.
+#[derive(Clone, Copy, Default)]
+struct Metering<'a> {
+    /// How much the run may execute before it is stopped — [`WasmRunRequest::fuel`].
+    fuel: Option<u32>,
+    /// The module's statement table, when it carries one.
+    positions: Option<&'a Positions>,
+}
+
 /// Runs a `jals-wasm` module with the embedded interpreter.
 ///
 /// A namespace rather than a value: the engine holds no configuration of its own, and a `Store` is
@@ -438,7 +601,23 @@ impl WasmRunner {
     pub fn run(request: &WasmRunRequest<'_>) -> Result<WasmRunOutcome, WasmRunError> {
         Self::reporting(request.progress, request.invoke, || {
             let module = Self::parse(request.module)?;
-            Self::invoke(&module, request.invoke, request.args, request.natives)
+            let libraries = Self::parse_libraries(request.libraries)?;
+            let foreign = Self::parse_foreign(request.foreign)?;
+            // Read here rather than in `invoke`, because the parsed module no longer holds the
+            // bytes and the section is only ever looked at after something went wrong.
+            let positions = Positions::of_module(request.module);
+            Self::invoke(
+                &module,
+                &libraries,
+                &foreign,
+                request.invoke,
+                request.args,
+                request.natives,
+                Metering {
+                    fuel: request.fuel,
+                    positions: positions.as_ref(),
+                },
+            )
         })
     }
 
@@ -449,14 +628,58 @@ impl WasmRunner {
     #[cfg(feature = "native")]
     pub(crate) fn run_parsed(
         module: &ParsedModule,
+        libraries: &[(String, ParsedModule)],
+        foreign: &[(String, ParsedModule)],
         invoke: Option<&str>,
         args: &[String],
         natives: &NativeBindings,
         progress: &Progress,
     ) -> Result<WasmRunOutcome, WasmRunError> {
         Self::reporting(progress, invoke, || {
-            Self::invoke(module, invoke, args, natives)
+            // The test launcher's modules are compiled for tests: neither a budget nor a position
+            // table is part of that arrangement. The launcher keeps the parse — that is what it is
+            // for — and a hypothetical module with positions would still fail here without one,
+            // because the bytes are gone by this point.
+            Self::invoke(
+                module,
+                libraries,
+                foreign,
+                invoke,
+                args,
+                natives,
+                Metering::default(),
+            )
         })
+    }
+
+    /// Decode every foreign module once, against the name its diagnostics use.
+    pub(crate) fn parse_foreign(
+        modules: &[WasmForeignModule<'_>],
+    ) -> Result<Vec<(String, ParsedModule)>, WasmRunError> {
+        let mut parsed = Vec::with_capacity(modules.len());
+        for module in modules {
+            let bytes = Self::parse(module.bytes).map_err(|error| WasmRunError::Library {
+                name: module.name.to_owned(),
+                message: alloc::format!("{error}"),
+            })?;
+            parsed.push((module.name.to_owned(), bytes));
+        }
+        Ok(parsed)
+    }
+
+    /// Decode every library once, in the order given, against the name it links under.
+    pub(crate) fn parse_libraries(
+        libraries: &[WasmLibrary<'_>],
+    ) -> Result<Vec<(String, ParsedModule)>, WasmRunError> {
+        let mut parsed = Vec::with_capacity(libraries.len());
+        for library in libraries {
+            let module = Self::parse(library.bytes).map_err(|error| WasmRunError::Library {
+                name: library.name.to_owned(),
+                message: format!("{error}"),
+            })?;
+            parsed.push((library.name.to_owned(), module));
+        }
+        Ok(parsed)
     }
 
     /// Decode and validate the bytes, without running anything.
@@ -511,15 +734,116 @@ impl WasmRunner {
     }
 
     /// The run itself, minus the decode: instantiate, then call the named export when there is one.
+    ///
+    /// The metering is the request's, threaded down to the two calls that run the module's own
+    /// code — its start function and, when one was named, its export. Everything before those is
+    /// this crate's own work: decoding, instantiating, linking, and resolving the export, none of
+    /// which the budget is for.
     fn invoke(
         module: &ParsedModule,
+        libraries: &[(String, ParsedModule)],
+        foreign: &[(String, ParsedModule)],
         invoke: Option<&str>,
         args: &[String],
         natives: &NativeBindings,
+        metering: Metering<'_>,
     ) -> Result<WasmRunOutcome, WasmRunError> {
         let module = &module.0;
-        let imports = Self::link(module, natives)?;
+        let (mut imports, deferred) = Self::link(module, natives, libraries)?;
+        // Every deferred import's supplier is decided here, from the foreign modules' export
+        // sections — readable without instantiating anything. Deciding before the store exists is
+        // what makes the refusal early: otherwise a linked library's `static` initialisers, whose
+        // effects are host-visible, run first, and a trap among them replaces the diagnostic about
+        // a program that was never going to start. The position chosen here is also what the
+        // binding loop below uses, so the check and the binding cannot disagree.
+        let mut suppliers = Vec::with_capacity(deferred.len());
+        for (owner, name) in &deferred {
+            let key = alloc::format!("{owner}#{name}");
+            let supplier = foreign.iter().position(|(_, module)| {
+                module.0.exports().any(|export| {
+                    export.name == key.as_str() && matches!(export.ty, ExportType::Func(_))
+                })
+            });
+            let Some(supplier) = supplier else {
+                // What *was* bound, from both halves: the selection's keys, then every foreign
+                // module's exports. A key spelled two ways is the failure this list exists for.
+                let mut available: Vec<String> = natives
+                    .keys()
+                    .map(|(owner, signature)| alloc::format!("{owner}.{signature}"))
+                    .collect();
+                available.extend(foreign.iter().flat_map(|(_, module)| {
+                    module.0.exports().filter_map(|export| {
+                        matches!(export.ty, ExportType::Func(_)).then(|| export.name.to_owned())
+                    })
+                }));
+                return Err(WasmRunError::UnresolvedImport {
+                    module: owner.clone(),
+                    name: name.clone(),
+                    available,
+                });
+            };
+            suppliers.push(supplier);
+        }
         let mut store = Store::default();
+        // The libraries first, in the order given: a project's imports are resolved when it is
+        // instantiated, so everything it imports has to exist by then. Each library links against
+        // what the ones before it contributed and runs its own start — where a class's `static`
+        // initialisers are lowered.
+        for (name, library) in libraries {
+            let instance =
+                ModuleInstance::instantiate_no_start(&mut store, &library.0, Some(&imports))
+                    .map_err(|error| WasmRunError::Library {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
+            instance
+                .start(&mut store)
+                .map_err(|error| Self::execution_failure(error, None))?;
+            imports
+                .link_module(name, instance)
+                .map_err(|error| WasmRunError::Library {
+                    name: name.clone(),
+                    message: error.to_string(),
+                })?;
+        }
+        // A foreign module is instantiated so its exports exist. Each is linked under the name it
+        // was declared by, which is how a later one imports from it; and once they all exist, the
+        // project's deferred imports bind to their exports by canonical key, because a foreign
+        // module knows nothing of this project's module names.
+        let mut foreign_instances = Vec::with_capacity(foreign.len());
+        for (name, module) in foreign {
+            let instance =
+                ModuleInstance::instantiate_no_start(&mut store, &module.0, Some(&imports))
+                    .map_err(|error| WasmRunError::Library {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
+            instance
+                .start(&mut store)
+                .map_err(|error| Self::execution_failure(error, None))?;
+            // The clone is the handle the deferred bindings reach into; `link_module` takes its
+            // own.
+            imports
+                .link_module(name, instance.clone())
+                .map_err(|error| WasmRunError::Library {
+                    name: name.clone(),
+                    message: error.to_string(),
+                })?;
+            foreign_instances.push(instance);
+        }
+        for ((owner, name), supplier) in deferred.iter().zip(&suppliers) {
+            let key = alloc::format!("{owner}#{name}");
+            let function = foreign_instances[*supplier]
+                .exports()
+                .find_map(|(exported, item)| match item {
+                    ExternItem::Func(function) if exported == key.as_str() => Some(function),
+                    _ => None,
+                })
+                // The supplier was chosen because its module's export section names the key, and
+                // an instance exposes exactly its module's exports.
+                .expect("the export that satisfied the deferred check is on its instance");
+            imports.define(owner, name, function);
+        }
         // Instantiating in two halves rather than through `instantiate`, which is exactly these
         // two calls. Only the first is *linking* — a malformed module, an unknown import, a
         // segment that traps. The second runs the start function, which is where a class's
@@ -528,9 +852,7 @@ impl WasmRunner {
         // as "the module could not be instantiated", which sends the reader to the encoding.
         let instance = ModuleInstance::instantiate_no_start(&mut store, module, Some(&imports))
             .map_err(|error| WasmRunError::Instantiate(error.to_string()))?;
-        instance
-            .start(&mut store)
-            .map_err(Self::execution_failure)?;
+        Self::start(&instance, &mut store, metering)?;
 
         let Some(name) = invoke else {
             return Ok(WasmRunOutcome::Instantiated);
@@ -578,8 +900,14 @@ impl WasmRunner {
         // The engine writes into a buffer the caller sizes, and `tinywasm::WasmValue` has no
         // `Default` — the placeholder is overwritten by every result the call produces.
         let mut returned = vec![tinywasm::WasmValue::I32(0); results];
-        func.call(&mut store, &arguments, &mut returned)
-            .map_err(Self::execution_failure)?;
+        Self::call(
+            &func,
+            &instance,
+            &mut store,
+            &arguments,
+            &mut returned,
+            metering,
+        )?;
         Ok(WasmRunOutcome::Returned(
             returned.iter().map(Self::value).collect(),
         ))
@@ -597,35 +925,115 @@ impl WasmRunner {
     /// What is left to check is therefore only whether a name is bound at all — and because the
     /// import's field name carries the method's descriptor, a Rust half that spelled the signature
     /// differently shows up exactly here, as an unresolved import listing what *is* registered.
-    fn link(module: &tinywasm::Module, natives: &NativeBindings) -> Result<Imports, WasmRunError> {
+    ///
+    /// Every *library*'s import section is swept too. A library is a module of its own: a `native`
+    /// method its Java declares is an import there whether or not the project ever calls it, and
+    /// the project's own table says nothing about it — so a library whose embedder supplies a host
+    /// function could never be instantiated. `define` overwrites, so an import both modules carry
+    /// is bound once.
+    fn link(
+        module: &tinywasm::Module,
+        natives: &NativeBindings,
+        libraries: &[(String, ParsedModule)],
+    ) -> Result<(Imports, Vec<(String, String)>), WasmRunError> {
         let mut imports = Imports::new();
+        let mut deferred = Vec::new();
+        // The project's own imports first: one the selection does not answer may still be an
+        // export of a foreign module, so it is deferred rather than refused, and `invoke` checks
+        // every deferral against those exports before anything instantiates.
         for import in module.imports() {
-            let ImportType::Func(signature) = import.ty else {
-                // The backend emits function imports and nothing else. A module carrying another
-                // kind did not come from it, and guessing at one is worse than saying so.
-                return Err(WasmRunError::UnresolvedImport {
-                    module: import.module.to_owned(),
-                    name: import.name.to_owned(),
-                    available: natives.keys().map(|(o, s)| format!("{o}.{s}")).collect(),
-                });
-            };
-            let Some(binding) = natives.get(import.module, import.name) else {
-                return Err(WasmRunError::UnresolvedImport {
-                    module: import.module.to_owned(),
-                    name: import.name.to_owned(),
-                    available: natives.keys().map(|(o, s)| format!("{o}.{s}")).collect(),
-                });
-            };
-            let binding = binding.clone();
-            imports.define(
-                import.module,
-                import.name,
-                HostFunction::from_untyped(signature, move |ctx, args, results| {
-                    Self::dispatch(&binding, ctx, args, results)
-                }),
-            );
+            Self::define_import(
+                &mut imports,
+                &import,
+                natives,
+                libraries,
+                Some(&mut deferred),
+            )?;
         }
-        Ok(imports)
+        // Every *library*'s import section is swept too. A library is a module of its own: a
+        // `native` method its Java declares is an import there whether or not the project ever
+        // calls it, and the project's own table says nothing about it — so a library whose
+        // embedder supplies a host function could never be instantiated. `define` overwrites, so
+        // an import both modules carry is bound once.
+        //
+        // Nothing defers a library's imports. A library is instantiated before any foreign module,
+        // and a foreign export is only known after instantiation, so a library import is either a
+        // selected binding or an unresolved import — and saying so now is what keeps the library's
+        // `static` initialisers from running for a link that cannot complete.
+        for import in libraries
+            .iter()
+            .flat_map(|(_, library)| library.0.imports())
+        {
+            Self::define_import(&mut imports, &import, natives, libraries, None)?;
+        }
+        Ok((imports, deferred))
+    }
+
+    /// Define one import's host function, deferring an unbound *project* import for a foreign
+    /// export.
+    ///
+    /// `deferred` is `Some` exactly for the project's own imports. Every other unbound import is
+    /// refused here, with the same error the deferred check produces, so both halves of the link
+    /// report a missing import in the same vocabulary.
+    fn define_import(
+        imports: &mut Imports,
+        import: &tinywasm::types::ModuleImport<'_>,
+        natives: &NativeBindings,
+        libraries: &[(String, ParsedModule)],
+        deferred: Option<&mut Vec<(String, String)>>,
+    ) -> Result<(), WasmRunError> {
+        // A library import is not a host function: it is satisfied when the library instance is
+        // registered under its name, after it has been instantiated. Its type check happens there,
+        // against the type both modules replayed.
+        if libraries
+            .iter()
+            .any(|(name, _)| name.as_str() == import.module)
+        {
+            return Ok(());
+        }
+        let ImportType::Func(signature) = import.ty else {
+            // The backend emits function imports and nothing else. A module carrying another kind
+            // did not come from it, and guessing at one is worse than saying so.
+            return Err(Self::unresolved(import, natives));
+        };
+        let Some(binding) = natives.get(import.module, import.name) else {
+            // Nothing in the selection supplies it. A foreign module may: the project's import is
+            // deferred until those are instantiated and their exports are known.
+            return deferred.map_or_else(
+                || Err(Self::unresolved(import, natives)),
+                |deferred| {
+                    deferred.push((import.module.to_owned(), import.name.to_owned()));
+                    Ok(())
+                },
+            );
+        };
+        let binding = binding.clone();
+        imports.define(
+            import.module,
+            import.name,
+            HostFunction::from_untyped(signature, move |ctx, args, results| {
+                Self::dispatch(&binding, ctx, args, results)
+            }),
+        );
+        Ok(())
+    }
+
+    /// The import nothing binds, as the error that lists the selection's keys instead.
+    ///
+    /// The foreign exports that can also answer an import are added where they are known — see
+    /// [`WasmRunError::UnresolvedImport`].
+    fn unresolved(
+        import: &tinywasm::types::ModuleImport<'_>,
+        natives: &NativeBindings,
+    ) -> WasmRunError {
+        WasmRunError::UnresolvedImport {
+            module: import.module.to_owned(),
+            name: import.name.to_owned(),
+            available: natives
+                .keys()
+                .map(|(owner, signature)| format!("{owner}.{signature}"))
+                .collect(),
+        }
     }
 
     /// One call into a native binding: decode the arguments, run it, encode what it wrote back.
@@ -655,16 +1063,118 @@ impl WasmRunner {
         Ok(())
     }
 
+    /// Run the module's start function, metering it when the request named a budget.
+    ///
+    /// The start function is where every `static` initialiser lives, so it is the module's own
+    /// code and inside the budget — for a run with no export named, it is *all* the code there
+    /// is. A linked library's start function is the opposite case and calls
+    /// [`execution_failure`](Self::execution_failure) directly: a library is a package the host
+    /// selected, not code the budget is for.
+    fn start(
+        instance: &ModuleInstance,
+        store: &mut Store,
+        metering: Metering<'_>,
+    ) -> Result<(), WasmRunError> {
+        let Some(func) = instance
+            .start_func(store)
+            .map_err(|error| Self::execution_failure(error, None))?
+        else {
+            return Ok(());
+        };
+        // A start function takes nothing and returns nothing, so both slices are empty and the
+        // engine has nothing to write.
+        let mut returned = [];
+        Self::call(&func, instance, store, &[], &mut returned, metering)
+    }
+
+    /// Call one function of the module, metering it when the request named a budget.
+    ///
+    /// The two paths differ only in whether the engine stops at a fuel checkpoint. Without a
+    /// budget, `call` runs the function to completion; with one, the whole budget is handed to a
+    /// single resumable round and a suspension means the budget is gone. One round rather than a
+    /// loop because the budget *is* the cap: a host binding can charge extra from inside the run
+    /// and what remains when it reaches zero is a run that has to stop, so there is nothing for a
+    /// second round to spend. The engine overshoots the requested fuel by at most its checkpoint
+    /// interval before reporting the suspension.
+    fn call(
+        func: &Function,
+        instance: &ModuleInstance,
+        store: &mut Store,
+        arguments: &[tinywasm::WasmValue],
+        returned: &mut [tinywasm::WasmValue],
+        metering: Metering<'_>,
+    ) -> Result<(), WasmRunError> {
+        let Some(fuel) = metering.fuel else {
+            return func.call(store, arguments, returned).map_err(|error| {
+                let position = Self::position(instance, store, metering.positions);
+                Self::execution_failure(error, position)
+            });
+        };
+        let mut execution = func
+            .call_resumable(store, arguments, returned)
+            .map_err(|error| Self::execution_failure(error, None))?;
+        let progress = execution.resume_with_fuel(fuel);
+        // The handle's borrow of the store ends at its last use, which was that resume — it has no
+        // destructor to run — and where the run stopped is read out of the same store. The global
+        // it reads survives: it belongs to the instance, not to the call.
+        match progress {
+            Ok(ExecProgress::Completed(())) => Ok(()),
+            Ok(ExecProgress::Suspended) => {
+                let position = Self::position(instance, store, metering.positions);
+                Err(WasmRunError::OutOfFuel.located(position))
+            }
+            Err(error) => {
+                let position = Self::position(instance, store, metering.positions);
+                Err(Self::execution_failure(error, position))
+            }
+        }
+    }
+
     /// One failure of the project's own code, as this crate's vocabulary.
     ///
     /// A `throw` and a trap leave the engine as different variants and are different things to
     /// tell a reader about, so they stay apart here. Everything else the engine can return at a
     /// call is a trap as far as a caller is concerned.
-    fn execution_failure(error: tinywasm::Error) -> WasmRunError {
-        match error {
+    ///
+    /// A package's refusal arrives as a host trap — see [`EngineHost::trap`] — and the engine's
+    /// rendering of one carries its own scaffolding (`host function trap: unknown error: …`),
+    /// which is not part of what the package said. The payload is this crate's own
+    /// [`tinywasm::Error::Other`], so unwrapping it back to the refusal is exact rather than a
+    /// guess at the engine's formatting.
+    fn execution_failure(
+        error: tinywasm::Error,
+        position: Option<(FileId, Range<usize>)>,
+    ) -> WasmRunError {
+        let error = match error {
             tinywasm::Error::Exception(_) => WasmRunError::Exception,
+            tinywasm::Error::Trap(tinywasm::Trap::HostFunction(payload)) => {
+                match payload.downcast_ref::<tinywasm::Error>() {
+                    Some(tinywasm::Error::Other(message)) => WasmRunError::Trap(message.clone()),
+                    _ => WasmRunError::Trap(payload.to_string()),
+                }
+            }
             error => WasmRunError::Trap(error.to_string()),
-        }
+        };
+        error.located(position)
+    }
+
+    /// Where the module was executing when a failure stopped it, when the module carries positions.
+    ///
+    /// The module's exported `$jals$position` global holds the index of the last statement entered
+    /// — `-1` until one has — and the `jals.positions` section that came with it says where that
+    /// statement was written. Nothing is read off a call stack: a stack is gone by the time a trap
+    /// reaches the host, and this is what the compile left behind to replace it.
+    fn position(
+        instance: &ModuleInstance,
+        store: &mut Store,
+        positions: Option<&Positions>,
+    ) -> Option<(FileId, Range<usize>)> {
+        let positions = positions?;
+        let Ok(tinywasm::WasmValue::I32(index)) = instance.global_get(store, POSITION_GLOBAL)
+        else {
+            return None;
+        };
+        positions.get(index)
     }
 
     /// The names of every function the module exports, in module order.
@@ -808,6 +1318,7 @@ mod tests {
         let request = BackendRequest {
             tree: &tree,
             classpath: &[],
+            libraries: &[],
             options: &options,
             progress: &Progress::SILENT,
         };
@@ -839,10 +1350,13 @@ mod tests {
         natives: &NativeBindings,
     ) -> Result<WasmRunOutcome, WasmRunError> {
         WasmRunner::run(&WasmRunRequest {
+            libraries: &[],
+            foreign: &[],
             module,
             invoke,
             args,
             natives,
+            fuel: None,
             progress: &Progress::SILENT,
         })
     }
@@ -927,11 +1441,11 @@ mod tests {
         assert_eq!(available, &vec!["test/host/Host.answer()J".to_owned()]);
         assert!(error.to_string().contains("answer()J"));
 
-        // And with nothing selected at all, the message says that rather than listing nothing.
+        // And with nothing bound at all, the message says so rather than listing nothing.
         let Err(error) = run_with(&module, Some("run"), &[], &NativeBindings::new()) else {
             panic!("the import is unresolved");
         };
-        assert!(error.to_string().contains("no package is selected"));
+        assert!(error.to_string().contains("nothing is bound"));
     }
 
     /// A binding may read the arrays the module hands it, which is what a package's Java is

@@ -18,9 +18,11 @@ members = [
   "jals-lint",
   "jals-lsp",
   "jals-native",
+  "jals-platform",
   "jals-playground",
   "jals-progress",
   "jals-project",
+  "jals-resolve",
   "jals-syntax",
   "jals-tests",
   "xtask",
@@ -44,6 +46,10 @@ clap = { version = "4.6.1", features = ["derive"] }
 # Raw-deflate decompression and crc32 for jals-classpath's in-house zip reader; both stay
 # `default-features = false` so the archive path is `no_std + alloc` and wasm-safe.
 crc32fast = { version = "1", default-features = false }
+# Host-only gzip/tar decoding for `jals toolchain`'s JDK archives. The in-house zip reader remains
+# the only archive decoder portable code uses; a JDK tarball is read once on the host and never
+# crosses a `no_std` seam, so the battle-tested decoders are the right side of that line.
+flate2 = { version = "1" }
 futures = { version = "0.3" }
 hashbrown = { version = "0.17" }
 # Host-only progress rendering. Confined to `jals-cli`: portable crates report *what* they are
@@ -73,8 +79,18 @@ jals-lsp = { path = "jals-lsp" }
 # so a plain `cargo check` is this crate's portability check and a package author's crate needs
 # nothing else on its dependency line.
 jals-native = { path = "jals-native" }
+# `java.base` as a package: the compiled module (which carries the Java it publishes in its ABI
+# section) plus the name its imports are spelled with. Featureless like the package seam it uses,
+# and built by its own build script so a binary that ships it needs no JVM.
+jals-platform = { path = "jals-platform" }
 jals-progress = { path = "jals-progress" }
 jals-project = { path = "jals-project", default-features = false }
+# Featureless by design: dependency resolution is a pure algorithm over a provider seam, so the
+# same resolver runs in the CLI and in the browser playground, and `no_std + alloc` is provable
+# rather than a feature combination. It must stay free of `jals-config`/`jals-classpath`/
+# `jals-project`: those crates consume this vocabulary, so a dependency back would invert the
+# stack.
+jals-resolve = { path = "jals-resolve" }
 jals-syntax = { path = "jals-syntax" }
 # Featureless by design: rendering a template is pure computation over `core + alloc`.
 jinja = { path = "crates/jinja" }
@@ -105,11 +121,6 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "stream",
 ] }
-rhai = { version = "=1.26.1", default-features = false, features = [
-  "no_module",
-  "no_time",
-  "no_custom_syntax",
-] }
 rowan = { version = "0.17.0" }
 serde = { version = "1.0.219", default-features = false, features = [
   "derive",
@@ -117,6 +128,8 @@ serde = { version = "1.0.219", default-features = false, features = [
 ] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 similar = { version = "3" }
+# Host-only tar decoding for `jals toolchain`; see `flate2` above.
+tar = { version = "0.4" }
 text-size = { version = "1.1.1" }
 # The engine that runs what the `jals-wasm` backend emits, behind `jals-build`'s `wasm-run`.
 # Pinned to a `next` revision rather than a published release because the GC proposal is
@@ -150,7 +163,7 @@ walkdir = { version = "2" }
 # Dev-only: jals-classpath reads jars through its own portable zip reader; the `zip` crate remains
 # solely to write test fixtures and cross-verify that reader. `deflate` is the only compression
 # jars use.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

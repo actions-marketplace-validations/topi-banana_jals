@@ -86,6 +86,13 @@ filesystem reads into portable interfaces.
   that must see an entry a selection did not activate (discovery, the LSP watch set). A name in both
   tables is rejected rather than overridden as Cargo does: one name denotes one entry wherever it is
   read — `dep:<name>`, `<name>/<feature>`, one discovery edge.
+
+  The `registry` form (table with `group`/`version`/`registry`, or the `group:artifact` <=>
+  version shorthand) joins `jar`/`git`/`path`/`wasm`, and `[registries]` declares named Maven
+  repositories (`maven-central` implicit). Validation checks the requirement parses, a coordinate
+  is derivable, the name and URL are well formed, and a referenced registry is declared.
+  `resolution.rs` lowers every form into `jals-resolve`'s `Summary`/`DependencyRequest`; a
+  registry entry becomes `SourceRequest::Registry` with an exact POM version or a Maven range.
   A crate that produces diagnostics states how they present without depending on an editor, which
   is why the vocabulary lives here: `jals-editor` and `jals-project` both assemble diagnostics and
   neither depends on the other. `jals-editor` re-exports the name, so a host still spells it
@@ -116,6 +123,15 @@ filesystem reads into portable interfaces.
   `streams` key). `Lint<O>`'s serialized *shape* follows the options **type**
   (`LintOptions::HAS_KEYS`) and not the values, which is what lets `jals-lint/tests/registry.rs`
   find every option by walking one serialized config.
+- `jals-resolve`: the dependency-resolution core — Maven-compatible versions and requirements,
+  package/source identity (`PackageId` is `(name, version, resolved source)`, never a locator),
+  the feature-graph `Summary`, the `Provider` seam, the Cargo-style resolver (one version per
+  name, unified features, cycles as edges), and the deterministic `jals.lock` model. Portable
+  and featureless: it performs no I/O, and the same resolver runs in the browser playground and
+  in the CLI. It must stay free of `jals-config`/`jals-classpath`/`jals-project` — those crates
+  consume this vocabulary, so a dependency back would invert the stack. The target architecture
+  and migration plan live in `jals-resolve/DESIGN.md`; `hawk.toml` records why the crate is
+  excluded from the visibility gate while parts of its vocabulary await a production caller.
 - `jals-classpath`: resolution over project bytes and cache artifacts.
   - The in-house zip reader is isolated in `zip.rs` behind `archive` (portable, `no_std`, over the
     async io seam; also a stored-only writer for jar remap/merge; the `zip` crate is a dev-only
@@ -169,6 +185,17 @@ filesystem reads into portable interfaces.
   - A `Warning` carries its subject in `origin`, not in `message` — several messages name no
     location at all — so a host reports one by rendering the whole `Warning` through its `Display`,
     never `warning.message` alone.
+  - **Registry resolution is `maven.rs`, and it is a `jals-resolve::Provider` like any other.**
+    The batch methods are the parallel seam: every `maven-metadata.xml` in one resolver batch, and
+    every selected POM in one summary batch, is fetched concurrently with `jals_exec::join_ordered`
+    from a *shared* `Fetcher` reference, then parsed and expanded in input order — concurrency
+    never moves the output. `NativeProjectPlan::assemble_native` runs the resolver before plan
+    execution and appends the resolved jars as ordinary `DependencySpec`s, so POMs are one batch
+    and jars download through the same verified, content-addressed path as explicit ones. Registry
+    entries are deliberately **not** project-graph nodes: `jals-project`'s `root_only` keeps them
+    (it strips only entries the graph already lowered), and the graph walk skips them. A host owns
+    lock persistence through `RegistryResolution` (`jals-cli` reads/writes `jals.lock`; the LSP
+    passes `None` and drops the outcome).
   - `NetworkPolicy` is part of the `Fetcher`, not a value travelling beside it: a host that must
     not fetch constructs one that refuses, and every step it is handed inherits the refusal. That
     is why `ReqwestFetcher::for_project` takes the policy and has no `Default`, and why nothing
@@ -715,11 +742,11 @@ Portable crates use `core + alloc`.
   any worker count), and `native` implies `archive` and introduces HTTP plus `jals-storage/std` and
   `jals-exec/tokio`.
 - `jals-project --no-default-features` is `no_std + alloc`; it includes the portable in-memory
-  graph, Rhai dependency preprocessing (via `jals-build/rhai`, which it always enables), and
-  archive projection. `native` adds host path/Git acquisition plus the native classpath, execution,
-  and storage adapters.
-- `jals-build --no-default-features` must remain a genuine portable core; its `rhai` feature stays
-  portable too, and CI builds it for `wasm32`. `native` is the host half (JDK discovery, `javac`
+  graph, Java build-script preprocessing (via `jals-build/build-script`, which it always enables),
+  and archive projection. `native` adds host path/Git acquisition plus the native classpath,
+  execution, and storage adapters.
+- `jals-build --no-default-features` must remain a genuine portable core; its `build-script`
+  feature stays portable too, and CI builds it for `wasm32`. `native` is the host half (JDK discovery, `javac`
   spawning, `native.rs`). `wasm-run` adds `WasmRunner` and is portable and independent of `native`
   — `jals-cli` and the browser enable the same feature and reach the same interpreter — but it is
   a feature rather than an unconditional dependency because it is the one thing here pinned to an
@@ -776,9 +803,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo unused-allow --all-targets -- --workspace --all-features
 cargo nextest run --workspace --all-features --no-fail-fast
 cargo test --workspace --all-features --doc     # nextest does not run doctests
-cargo hawk check --exclude-crate jinja -D warnings   # closed-world visibility over hawk.toml's
-                                                    # roots; `jinja`'s API is an external
-                                                    # boundary, and hawk.toml says why
+# Closed-world visibility over hawk.toml's roots; `jinja`'s API is an external boundary and
+# hawk.toml says why. `jals_resolve` is excluded while parts of its vocabulary await a caller.
+cargo hawk check --exclude-crate jinja --exclude-crate jals_resolve -D warnings
 ```
 
 The portable-core and feature audit (CI's `portable core and feature audit` job) — run it whenever
@@ -791,14 +818,16 @@ cargo check -p jals-build --no-default-features
 cargo check -p jals-project --no-default-features
 cargo check -p jals-frontend
 cargo check -p jals-progress
+cargo check -p jals-resolve
 cargo check -p jinja
 cargo check -p jals-project --all-features
-cargo check -p jals-build --no-default-features --features rhai --target wasm32-unknown-unknown
+cargo check -p jals-build --no-default-features --features build-script --target wasm32-unknown-unknown
 cargo check -p jals-build --no-default-features --features wasm-run --target wasm32-unknown-unknown
 cargo check -p jals-classpath --no-default-features --target wasm32-unknown-unknown
 cargo check -p jals-project --no-default-features --target wasm32-unknown-unknown
 cargo check -p jals-frontend --target wasm32-unknown-unknown
 cargo check -p jals-progress --target wasm32-unknown-unknown
+cargo check -p jals-resolve --target wasm32-unknown-unknown
 cargo check -p jinja --target wasm32-unknown-unknown
 cargo build -p jals-playground --target wasm32-unknown-unknown
 cargo tree -e features -p jals-classpath --no-default-features
@@ -864,14 +893,14 @@ the moment it has a tracked `.java`. Seven consequences for an example:
   `logs/` and `crash-reports/`. It is also the cell whose fmt/lint step depends on the *test* step
   having run: analysis is always offline, and the client's runtime jars are fetched by a
   `[dev-dependencies]` entry, which `jals build` does not resolve.
-- `examples/scripts/gen-client-runtime.py` is a **generator, not a build step**: it rewrites the
-  `const RUNTIME` table in `examples/minecraft_client_test/build.rhai` between two exact markers,
+- `examples/scripts/gen-client-runtime.py` is a **generator, not a build step**: it rewrites
+  `examples/minecraft_client_test/runtime.tsv`, the table `build.java` parses at script run time,
   and its output is committed. CI never runs it. It takes no arguments and writes **every** release
-  — the list and each release's metadata digest come from `examples/minecraft/build.rhai`'s own
-  `CATALOG`, so no release list is restated and no mutable version manifest is consulted — and it
+  — the list and each release's metadata digest come from `examples/minecraft/build.java`'s own
+  catalog, so no release list is restated and no mutable version manifest is consulted — and it
   refuses to write at all when it cannot read one library of one release, because a table that is
   partly regenerated is a boot that dies in `SharedLibraryLoader` with its cause two files away.
-- The client harness supports the same 43 releases the SDK does, and **one feature selects it** — a
+- The client harness supports the same 44 releases the SDK does, and **one feature selects it** — a
   release (`minecraft/<version>` into the SDK, plus one threshold). There is deliberately no second
   feature asking whether the harness is wanted: being a `[dev-dependencies]` entry is already that
   answer, since `jals test` and the analysis hosts resolve one and nothing that produces output
@@ -881,18 +910,18 @@ the moment it has a tracked `.java`. Seven consequences for an example:
   jar and the ~60 runtime libraries even without the consumer's own `client-test`, so a consumer
   whose defaults route `minecraft/server` compiles its tests against the SDK's **merged** jar where
   its build used the server one — a second fetch and a second whole-game remap, which is why all
-  three `minecraft_mod` cells now run `jals test` before their offline lint. `build.rhai` rejects a selection naming no release,
+  three `minecraft_mod` cells now run `jals test` before their offline lint. `build.java` rejects a selection naming no release,
   because the SDK falls back to its newest while every threshold stays off. The `#[cfg]` in
   `GameClient.java` names a *threshold*, never a release, and the fourteen thresholds are that
   project's own: `examples/minecraft_mod` reads the same catalog through five of its own, because it
   branches on different things. Two of the fourteen boundaries are invisible in a mapping file,
-  which carries no access flags — they were found by compiling, which is what the 43-cell matrix is
+  which carries no access flags — they were found by compiling, which is what the 44-cell matrix is
   for.
 - The harness is **Java 8 source** and its `--release` follows the game's own
   `javaVersion.majorVersion` (8/16/17/21), because it is loaded by the JVM the release runs on. That
   is also the one place `jals build` and `jals test` want different JDKs, and `$JAVAC`/`$JAVA`
   resolve independently so one command can say both.
-- `client harness (<release>)` is a 43-cell matrix modelled on `mod jar`, and its assertion is not
+- `client harness (<release>)` is a 44-cell matrix modelled on `mod jar`, and its assertion is not
   the exit status: a green build says a selection resolved, not that a type came out, so the cell
-  checks `GameClient.class` exists. Running the build script is also what verifies all 2287 pinned
+  checks `GameClient.class` exists. Running the build script is also what verifies all 2352 pinned
   library digests.

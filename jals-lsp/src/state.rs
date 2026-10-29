@@ -310,9 +310,16 @@ impl ProjectWorkspace {
             RelativePath::from_host_path(&project_root, path)
                 .map(|relative| NativeScope::extension(relative, "java"))
         });
-        let storage = NativeStorage::for_project_scoped(&project_root, scopes, exec)
-            .await
-            .expect("a discovered project root must be readable");
+        // A source root can cover the project root (`source-dirs = ["."]`), so the toolchain
+        // store is excluded here exactly as the root-wide assembly excludes it.
+        let storage = NativeStorage::for_project_scoped_excluding(
+            &project_root,
+            scopes,
+            [crate::toolchain_exclusion()],
+            exec,
+        )
+        .await
+        .expect("a discovered project root must be readable");
         let source_roots = source_roots
             .iter()
             .filter_map(|path| Self::dir_key(&project_root, path))
@@ -329,6 +336,7 @@ impl ProjectWorkspace {
             project_root,
             storage,
             source_roots,
+            BTreeMap::new(),
             Vec::new(),
             classfiles,
             library_sources,
@@ -372,6 +380,7 @@ impl ProjectWorkspace {
         project_root: PathBuf,
         storage: NativeStorage,
         source_roots: Vec<DirKey>,
+        source_filters: BTreeMap<DirKey, jals_config::SourceFilter>,
         project_sources: Vec<FileKey>,
         classfiles: &[jals_classfile::ClassFile],
         library_sources: Vec<FileKey>,
@@ -383,6 +392,7 @@ impl ProjectWorkspace {
     ) -> Self {
         let spec = ProjectLayout {
             source_roots,
+            source_filters,
             project_sources,
             library_sources,
             source_dep_sources,

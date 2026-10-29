@@ -1,6 +1,6 @@
 //! Assembly of classpath inputs from one revisioned project storage aggregate.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -49,6 +49,11 @@ pub enum ProjectInputOptions {
 #[derive(Debug, Clone, Default)]
 pub struct ProjectInputPlan {
     pub dependencies: Vec<DependencySpec>,
+    /// Artifacts fetched into the verified cache that are not classpath entries — a registry
+    /// dependency's `tar.gz` native bundle, a `war`. Nothing consumes them; they are acquired
+    /// (and the lock names the package either way) because a transitive graph pulled them in,
+    /// while handing one to `javac` would be worse than not fetching it.
+    pub auxiliary_artifacts: Vec<DependencySpec>,
     pub source_archives: Vec<DependencySpec>,
     pub classpath: Vec<ClasspathEntry>,
     pub source_dependency_roots: Vec<DirKey>,
@@ -155,14 +160,54 @@ pub enum SourceFile {
     Artifact(LibrarySource),
 }
 
+/// What registry resolution answered for one selection, for a host that reports it.
+///
+/// The manifest declares only a coordinate and a version; whether the artifact that came back is a
+/// classpath jar or a fetched-only artifact (a POM's non-jar `<type>`) is what resolution knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryStatus {
+    /// Selected registry artifacts that are classpath jars.
+    pub jars: usize,
+    /// Selected registry artifacts fetched and locked but not classpath entries (a `tar.gz`
+    /// native bundle).
+    pub artifacts: usize,
+}
+
+impl RegistryStatus {
+    /// Selected registry packages the resolver answered for, jars and non-jars together.
+    pub const fn resolved(&self) -> usize {
+        self.jars + self.artifacts
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectInputs {
     pub dependency_jars: Vec<CacheKey>,
+    /// The top-level dependency jars by manifest name.
+    ///
+    /// `dependency_jars` is the ordered list the compiler consumes and has lost the names by the
+    /// time it is built; a host that has to address one dependency *by name* (a
+    /// `${dependency.<name>}` module-path entry) reads it here. Recursive members are absent: they
+    /// are addressed by the jar that carries them, not by a manifest key. A `git`/`path` dependency
+    /// has no jar here either; a module-path reference to one is reported by the host rather than
+    /// silently omitted.
+    pub named_dependency_jars: BTreeMap<Name, CacheKey>,
+    /// Artifacts that were acquired into the verified cache but are not classpath entries — a
+    /// registry package whose POM declared a non-jar `<type>`. Kept so a host can say what was
+    /// fetched and why the classpath does not name it.
+    pub auxiliary_artifacts: Vec<CacheKey>,
     pub classpath_classes: Vec<ClassFile>,
     pub library_sources: Vec<LibrarySource>,
     pub source_dep_sources: Vec<SourceFile>,
     pub feature_set: FeatureSet,
     pub warnings: Vec<Warning>,
+    /// Failures the classpath phase could not recover from, which make the assembled inputs
+    /// incomplete in the way the caller's own purpose cannot tolerate. A `Compile` lowering is the
+    /// only producer today: `Analysis` and `Editor` report the same condition as a warning.
+    pub errors: Vec<Warning>,
+    /// What registry resolution answered for this selection, for a host that reports each
+    /// dependency form's fate.
+    pub registry_status: RegistryStatus,
 }
 
 impl ProjectInputs {
@@ -203,6 +248,21 @@ impl ProjectInputs {
         )
         .await;
         let mut warnings = resolved.warnings;
+
+        // The non-classpath half of the plan: acquired, verified, and cached exactly like a jar,
+        // then left out of every classpath list. A `tar.gz` native bundle pulled in by a POM is
+        // fetched so the graph resolves without a 404, and the lock names its package either way.
+        let auxiliary = DependencyResolver::resolve(
+            fetcher,
+            &view,
+            storage.artifacts_mut(),
+            &plan.auxiliary_artifacts,
+            progress,
+        )
+        .await;
+        warnings.extend(auxiliary.warnings);
+        let auxiliary_artifacts: Vec<CacheKey> =
+            auxiliary.jars.into_iter().map(|jar| jar.key).collect();
 
         // Deobfuscate every jar whose entry declared a `remap`, before anything reads one. Doing it
         // here rather than at each consumer is what makes the classpath, the analysis index, and the
@@ -271,6 +331,15 @@ impl ProjectInputs {
 
         // Keep top-level dependencies in request order; recursive members are additions appended in
         // the same second-pass order.
+        // First wins: two requests can legitimately share a name (a registry coordinate can
+        // collide with another label), and the first one in request order is the classpath jar
+        // the manifest asked for. Last-wins would let a later duplicate silently replace it.
+        let mut named_dependency_jars: BTreeMap<Name, CacheKey> = BTreeMap::new();
+        for jar in &resolved_jars {
+            named_dependency_jars
+                .entry(jar.name.clone())
+                .or_insert_with(|| jar.key.clone());
+        }
         let mut dependency_jars: Vec<_> = resolved_jars.iter().map(|jar| jar.key.clone()).collect();
         for jar in resolved_jars.iter().filter(|jar| jar.recursive) {
             let nested = JarExtraction::nested(&exec, storage.artifacts_mut(), &jar.key).await;
@@ -363,11 +432,19 @@ impl ProjectInputs {
 
         Self {
             dependency_jars,
+            named_dependency_jars,
+            auxiliary_artifacts,
             classpath_classes,
             library_sources,
             source_dep_sources,
             feature_set: plan.feature_set,
             warnings,
+            // `ProjectInputs::assemble` has no failing step of its own — everything it can
+            // recover from is a warning — so the caller fills this from its lowering state.
+            errors: Vec::new(),
+            // Filled by the caller too: only a lowering knows what it declared and what the
+            // resolver answered.
+            registry_status: RegistryStatus::default(),
         }
     }
 }
@@ -425,12 +502,12 @@ impl MemoryProjectPlan {
 
     /// Lower `manifest`'s source roots and `[build] classpath` against one immutable view.
     ///
-    /// `[dependencies]` are deliberately *not* lowered, and this is the only place that decides so:
-    /// a caller assembling a dependency graph projects each declared dependency as a graph node, so
-    /// lowering them here as well would resolve every jar twice and double-count it on the classpath.
-    /// Anything added here that reads `manifest.dependencies` breaks callers that hand over the
-    /// manifest whole, which is all of them — `declared_dependencies_are_left_to_the_graph` is what
-    /// holds the line.
+    /// Non-classpath `[dependencies]` are deliberately *not* lowered, and this is the only place
+    /// that decides so: a caller assembling a dependency graph projects each declared dependency as
+    /// a graph node, so lowering them here as well would resolve every jar twice and double-count it
+    /// on the classpath. Classpath-only `path` entries are the exception: the walk skips them (they
+    /// have no project to lower), so this lowering is their only route to the plan.
+    /// `declared_dependencies_are_left_to_the_graph` holds the line for the rest.
     fn from_manifest(manifest: &Manifest, view: &ProjectView) -> Self {
         let mut result = Self {
             plan: ProjectInputPlan {
@@ -464,7 +541,16 @@ impl MemoryProjectPlan {
                 Err(message) => result.warn_path(source, message),
             }
         }
-        for classpath in &manifest.build.classpath {
+        let mut classpath_entries = manifest.build.classpath.clone();
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                if !classpath_entries.contains(&entry) {
+                    classpath_entries.push(entry);
+                }
+            }
+        }
+        for classpath in &classpath_entries {
             let path = match Self::project_relative(classpath) {
                 Ok(path) => path,
                 Err(message) => {
@@ -491,6 +577,24 @@ impl MemoryProjectPlan {
                     classpath,
                     "classpath entry is missing or invalid".to_owned(),
                 ),
+            }
+        }
+        // Registry entries need a network-capable host: the in-memory assembly has one address
+        // space and no fetcher, so it can report the entry but cannot resolve it. Saying so is
+        // what keeps the browser playground's classpath honest rather than silently short. Only
+        // the build table is warned about — a dev entry would not be resolved by this plan under
+        // any scope.
+        for (name, dependency) in &manifest.dependencies {
+            if matches!(
+                dependency,
+                jals_config::Dependency::Registry(_) | jals_config::Dependency::RegistryVersion(_)
+            ) {
+                result.warn_path(
+                    name,
+                    "registry dependency requires a host fetch capability and is not resolved \
+                     in-memory"
+                        .to_owned(),
+                );
             }
         }
 
@@ -579,7 +683,11 @@ mod tests {
 
         let lowered = MemoryProjectPlan::from_manifest(&manifest, &storage.view());
 
-        assert!(lowered.plan.classpath.is_empty());
+        assert!(
+            lowered.plan.classpath.is_empty(),
+            "{:?}",
+            lowered.plan.classpath
+        );
         let messages: Vec<_> = lowered
             .warnings
             .iter()
@@ -663,17 +771,44 @@ mod tests {
     /// its root manifest over with `[dependencies]` still in place, on the strength of this.
     #[test]
     fn declared_dependencies_are_left_to_the_graph() {
-        let storage = MemoryStorage::memory(CodeTree::default());
+        let storage = MemoryStorage::memory(
+            CodeTree::new([Entry::File(
+                FileKey::parse("deps/stub/classes/Stub.class").expect("portable key"),
+                class_bytes().to_vec(),
+            )])
+            .expect("tree is valid"),
+        );
         let manifest: Manifest = "[dependencies]\nlib = { jar = \"vendor/lib.jar\" }\n\
-             child = { path = \"deps/child\" }\n"
+             child = { path = \"deps/child\" }\n\
+             stub = { path = \"deps/stub\", dir = \"classes\", mode = \"classpath\" }\n"
             .parse()
             .expect("manifest parses");
 
         let lowered = MemoryProjectPlan::from_manifest(&manifest, &storage.view());
 
-        assert!(lowered.plan.dependencies.is_empty());
-        assert!(lowered.plan.source_archives.is_empty());
-        assert!(lowered.plan.source_dependency_roots.is_empty());
+        assert!(
+            lowered.plan.dependencies.is_empty(),
+            "{:?}",
+            lowered.plan.dependencies
+        );
+        // A classpath-only path entry is the one dependency form lowered here: the graph walk
+        // deliberately creates no node for it, so nothing else would put it on the classpath.
+        assert_eq!(
+            lowered.plan.classpath,
+            [crate::ClasspathEntry::ProjectDirectory(
+                jals_storage::DirKey::parse("deps/stub/classes").unwrap()
+            )]
+        );
+        assert!(
+            lowered.plan.source_archives.is_empty(),
+            "{:?}",
+            lowered.plan.source_archives
+        );
+        assert!(
+            lowered.plan.source_dependency_roots.is_empty(),
+            "{:?}",
+            lowered.plan.source_dependency_roots
+        );
         assert!(lowered.warnings.is_empty(), "{:?}", lowered.warnings);
     }
 }

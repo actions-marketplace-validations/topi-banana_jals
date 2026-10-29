@@ -7,7 +7,9 @@ mod session;
 mod shell;
 mod testrun;
 mod timings;
+mod toolchain;
 mod ui;
+mod workspace;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -22,10 +24,12 @@ use jals_build::{ManifestExt, Runtime};
 use jals_config::fmt::Config;
 use jals_config::lint::Config as LintConfig;
 use jals_config::{
-    DependencyScope, DiscoverableConfig, FeatureSet, Manifest, ResolvedBuildFeatures,
+    Dependency, DependencyScope, DiscoverableConfig, FeatureSet, Manifest, ResolvedBuildFeatures,
+    SourceFilter,
 };
 use jals_exec::Exec;
 use jals_storage::{DirKey, FileKey, Name, NativeScope, NativeStorage, RelativePath};
+use workspace::ProjectWorkspace;
 
 use report::Reporter;
 use session::Session;
@@ -64,8 +68,12 @@ enum Commands {
     Test(TestArgs),
     /// Remove a project's `classes-dir` and reserved build-script outputs.
     Clean(CleanArgs),
+    /// Re-resolve registry dependencies and rewrite `jals.lock`.
+    Update(UpdateArgs),
     /// Scaffold a new JALS/Java project (`jals.toml`, a starter `Main.java`, and `.gitignore`).
     Init(InitArgs),
+    /// Install and manage project-local JDKs under `target/jdk` (rustup/jabba style).
+    Toolchain(toolchain::ToolchainArgs),
 }
 
 #[derive(Args)]
@@ -115,6 +123,10 @@ struct LintArgs {
     /// manifest's `default` list.
     #[command(flatten)]
     features: FeatureArgs,
+
+    /// Lockfile policy for dependency resolution.
+    #[command(flatten)]
+    lock: LockArgs,
 }
 
 #[derive(Args)]
@@ -152,6 +164,45 @@ impl FeatureArgs {
         manifest
             .resolve_build_features(&self.features, self.all_features, self.no_default_features)
             .map_err(|e| anyhow!("{e}"))
+    }
+}
+
+/// Lockfile policy, shared by the commands that resolve dependencies.
+///
+/// `--locked` refuses to change `jals.lock`; `--frozen` additionally refuses the network, so a
+/// build that can only succeed by re-resolving fails instead of quietly rewriting the lock.
+#[derive(Args, Clone, Copy, Default)]
+struct LockArgs {
+    /// Fail if `jals.lock` would need to change.
+    #[arg(long)]
+    locked: bool,
+    /// Equivalent to `--locked --offline`.
+    #[arg(long)]
+    frozen: bool,
+}
+
+impl LockArgs {
+    const fn policy(self) -> LockPolicy {
+        LockPolicy {
+            locked: self.locked || self.frozen,
+            frozen: self.frozen,
+        }
+    }
+}
+
+/// What a command is allowed to do with `jals.lock`.
+#[derive(Clone, Copy)]
+struct LockPolicy {
+    /// A resolution that would change the lock is an error.
+    locked: bool,
+    /// The lock may not change and no network locator may be fetched.
+    frozen: bool,
+}
+
+impl LockPolicy {
+    /// Whether a fetch may reach the network under this policy.
+    const fn offline(self, requested: bool) -> bool {
+        requested || self.frozen
     }
 }
 
@@ -235,6 +286,10 @@ struct BuildArgs {
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
 
+    /// Build this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
+
     /// Print the javac command that would run and exit, without compiling.
     #[arg(long)]
     dry_run: bool,
@@ -258,6 +313,10 @@ struct BuildArgs {
 
     #[command(flatten)]
     features: FeatureArgs,
+
+    /// Lockfile policy for dependency resolution.
+    #[command(flatten)]
+    lock: LockArgs,
 }
 
 #[derive(Args)]
@@ -265,6 +324,10 @@ struct RunArgs {
     /// Use this manifest instead of discovering `jals.toml` upward from the cwd.
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
+
+    /// Run this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
 
     /// Print the javac/java commands that would run and exit, without compiling or running.
     #[arg(long)]
@@ -297,6 +360,10 @@ struct RunArgs {
 
     #[command(flatten)]
     features: FeatureArgs,
+
+    /// Lockfile policy for dependency resolution.
+    #[command(flatten)]
+    lock: LockArgs,
 }
 
 /// `jals test`, with `cargo nextest run` as the model for both the flags and the output.
@@ -381,6 +448,9 @@ struct TestArgs {
     /// Path to `jals.toml`.
     #[arg(long, value_name = "PATH")]
     manifest_path: Option<PathBuf>,
+    /// Test this workspace member (`[package] name`) instead of the project the cwd selects.
+    #[arg(short = 'p', long = "package", value_name = "NAME")]
+    package: Option<String>,
     /// Never fetch a dependency over the network.
     #[arg(long)]
     offline: bool,
@@ -390,6 +460,10 @@ struct TestArgs {
     network_retry: u32,
     #[command(flatten)]
     features: FeatureArgs,
+
+    /// Lockfile policy for dependency resolution.
+    #[command(flatten)]
+    lock: LockArgs,
 }
 
 /// The `--run-ignored` spelling, mapped onto `jals-build`'s own value.
@@ -424,6 +498,101 @@ struct CleanArgs {
     dry_run: bool,
 }
 
+/// `jals update`: ignore the lock's pins, resolve every registry entry afresh, and write the
+/// result.
+///
+/// Cargo's `cargo update`. There is no per-package selection yet: the whole lock moves together,
+/// which is also what makes the command safe to run at any time.
+#[derive(Args)]
+struct UpdateArgs {
+    /// Use this manifest instead of discovering `jals.toml` upward from the cwd.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+
+    /// Resolve only from what is already cached; never fetch.
+    #[arg(long)]
+    offline: bool,
+    /// Extra attempts a transient network failure is given before the fetch fails.
+    #[arg(long, value_name = "N", default_value_t = jals_classpath::RetrySchedule::DEFAULT_RETRIES)]
+    network_retry: u32,
+}
+
+impl UpdateArgs {
+    /// Re-resolve the project's registry dependencies without lock preference and write
+    /// `jals.lock`.
+    ///
+    /// The lock is generated from the all-active pass (see `LockMode::Generate`), so it does not
+    /// depend on a feature selection. A project with no registry dependency has no lock to write
+    /// and says so.
+    async fn run(&self, session: &Session) -> Result<ExitCode> {
+        let (manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        session.note_project(&root, manifest.package.name.as_deref());
+        let features = manifest
+            .resolve_build_features(&[], false, false)
+            .map_err(|error| anyhow!("{error}"))?;
+        let fetcher = jals_classpath::ReqwestFetcher::for_project(
+            root.clone(),
+            jals_classpath::NetworkPolicy::when_offline(self.offline),
+            jals_classpath::RetrySchedule::new(self.network_retry),
+        );
+        // A workspace updates one file for every member, from the root; a standalone project
+        // updates its own.
+        let workspace = ProjectWorkspace::discover(&root)?;
+        let (lock_root, graphs) = if let Some(workspace) = workspace {
+            let manifests = workspace.manifests().await?;
+            let members: Vec<&Manifest> = manifests.iter().collect();
+            let graphs = jals_classpath::RegistryResolver::resolve_workspace(
+                &members, &fetcher,
+                // No lock preference: that is the whole point of the command.
+                None,
+            )
+            .await
+            .map_err(|error| {
+                anyhow!("workspace registry dependencies could not be resolved: {error}")
+            })?;
+            (workspace.root().to_path_buf(), graphs)
+        } else {
+            let graphs = jals_classpath::RegistryResolver::resolve(
+                &manifest,
+                DependencyScope::Test,
+                &features,
+                &fetcher,
+                None,
+                jals_classpath::LockMode::Generate,
+            )
+            .await
+            .map_err(|error| anyhow!("registry dependencies could not be resolved: {error}"))?;
+            (root.clone(), graphs)
+        };
+        // A `[package] version` fallback is advisory, not fatal: `jals update` still writes the
+        // lock it resolved.
+        for message in &graphs.warnings {
+            session.shell().warn(format_args!("{message}"));
+        }
+        if graphs.packages.is_empty() {
+            session
+                .shell()
+                .status(Verb::Resolving, "no registry dependencies; nothing to lock");
+            return Ok(ExitCode::SUCCESS);
+        }
+        let Some(lock) = graphs.lock else {
+            session
+                .shell()
+                .status(Verb::Resolving, "no registry dependencies; nothing to lock");
+            return Ok(ExitCode::SUCCESS);
+        };
+        let text = lock.render();
+        let lock_path = lock_root.join("jals.lock");
+        std::fs::write(&lock_path, &text)
+            .map_err(|error| anyhow!("cannot write {}: {error}", lock_path.display()))?;
+        session.shell().status(
+            Verb::Resolving,
+            format_args!("{} dependencies locked", graphs.packages.len()),
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
 #[derive(Args)]
 struct InitArgs {
     /// Directory to initialize. Created if it does not exist. Defaults to the current directory.
@@ -454,7 +623,9 @@ fn main() -> ExitCode {
             Commands::Run(args) => args.run(&session).await,
             Commands::Test(args) => args.run(&session).await,
             Commands::Clean(args) => args.run(&session).await,
+            Commands::Update(args) => args.run(&session).await,
             Commands::Init(args) => args.run(&session).await,
+            Commands::Toolchain(args) => args.run(&session).await,
         };
         session.finish_display();
         session.shell().clear_progress();
@@ -759,7 +930,8 @@ impl LintArgs {
         let anchor = named
             .first()
             .map_or_else(|| PathBuf::from("."), |file| file.config_dir.clone());
-        let mut project = LintProject::open(&anchor, exec, &self.features, session).await?;
+        let mut project =
+            LintProject::open(&anchor, exec, &self.features, self.lock, session).await?;
 
         // Reported ⊆ indexed. The workspace indexes the source-root walk ∪ `project_sources`,
         // because diagnostics assembly reports every type name that resolves to nothing and a
@@ -936,7 +1108,9 @@ impl BuildArgs {
         if self.dry_run {
             session.stdout_is_free("`--dry-run`")?;
         }
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         let features = self.features.resolve(&manifest)?;
         if let Some(out) = &self.out_dir {
@@ -947,16 +1121,33 @@ impl BuildArgs {
         if let Some(name) = &self.bin {
             jals_build::RunTarget::resolve(&manifest, Some(name)).map_err(|e| anyhow!("{e}"))?;
         }
+        // One fetch capability for the whole command. It carries `--offline`, so every phase that
+        // can fetch — the toolchain below included — is handed the same answer instead of being
+        // told it separately.
+        let fetcher = jals_classpath::ReqwestFetcher::for_project(
+            root.clone(),
+            jals_classpath::NetworkPolicy::when_offline(self.lock.policy().offline(self.offline)),
+            jals_classpath::RetrySchedule::new(self.network_retry),
+        );
+        // A `[toolchain] compiler` naming a distribution makes this compile depend on a JDK the
+        // project may not have yet; acquire it before the build asks for it. A `--dry-run` previews
+        // and installs nothing, which is what "prints without compiling" promises.
+        if !self.dry_run {
+            toolchain::Toolchain::ensure(
+                &manifest,
+                &root,
+                &fetcher,
+                session,
+                toolchain::Needs {
+                    compiler: matches!(manifest.build.backend, jals_config::BackendKind::Javac {}),
+                    runtime: false,
+                },
+            )
+            .await?;
+        }
         // Assemble the root script outputs and complete transitive dependency graph. Structural graph
         // and dependency-script failures abort before javac; lower-level classpath misses remain
         // warnings so the resolver can report all deterministic diagnostics.
-        // One fetch capability for the whole command. It carries `--offline`, so every phase that
-        // can fetch is handed the same answer instead of being told it separately.
-        let fetcher = jals_classpath::ReqwestFetcher::for_project(
-            root.clone(),
-            jals_classpath::NetworkPolicy::when_offline(self.offline),
-            jals_classpath::RetrySchedule::new(self.network_retry),
-        );
         let (sources, tree, inputs, _) = App::prepare_compile_inputs(
             &mut manifest,
             &root,
@@ -968,6 +1159,7 @@ impl BuildArgs {
                 jals_project::SourcePublication::Apply
             },
             Lowering::Build,
+            self.lock.policy(),
             session,
         )
         .await?;
@@ -982,6 +1174,7 @@ impl BuildArgs {
             Lowering::Build,
             natives::Natives::select(session.shell(), &manifest)?,
             exec,
+            &features,
             session.for_package(App::package_ref(&manifest)),
         )
         .await?;
@@ -1032,7 +1225,9 @@ impl RunArgs {
             // into the lines a script parses.
             session.owns_stdout();
         }
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         // Which of the two run steps this project has. `[build] backend` decides it, because the
         // two produce different things: class files a JVM loads by name, or one module an engine
@@ -1118,9 +1313,25 @@ impl RunArgs {
         // One fetch capability for the whole command; see `BuildArgs::run`.
         let fetcher = jals_classpath::ReqwestFetcher::for_project(
             root.clone(),
-            jals_classpath::NetworkPolicy::when_offline(self.offline),
+            jals_classpath::NetworkPolicy::when_offline(self.lock.policy().offline(self.offline)),
             jals_classpath::RetrySchedule::new(self.network_retry),
         );
+        // Acquire whatever this run will actually reach. `compiler` follows the same `[build]
+        // backend` rule as `jals build`; `runtime` is exactly the JVM arm, because a module is
+        // executed by the engine compiled into this binary and resolves no `java`.
+        if !self.dry_run {
+            toolchain::Toolchain::ensure(
+                &manifest,
+                &root,
+                &fetcher,
+                session,
+                toolchain::Needs {
+                    compiler: matches!(manifest.build.backend, jals_config::BackendKind::Javac {}),
+                    runtime: main_class.is_some(),
+                },
+            )
+            .await?;
+        }
         let (sources, tree, inputs, _) = App::prepare_compile_inputs(
             &mut manifest,
             &root,
@@ -1132,6 +1343,7 @@ impl RunArgs {
                 jals_project::SourcePublication::Apply
             },
             Lowering::Build,
+            self.lock.policy(),
             session,
         )
         .await?;
@@ -1146,6 +1358,7 @@ impl RunArgs {
                 main_class,
                 program_args: &self.args,
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 run_env: &inputs.run_env,
             });
         // One selection for the whole command: the same packages are compiled into the module and
@@ -1165,6 +1378,7 @@ impl RunArgs {
             Lowering::Build,
             natives.clone(),
             exec,
+            &features,
             session.for_package(App::package_ref(&manifest)),
         )
         .await?;
@@ -1176,7 +1390,7 @@ impl RunArgs {
         // produces no main class — so it cannot reach a `Some(run_request)`, and collapsing the
         // two `None`s keeps one absent runtime rather than two spellings of it.
         let runtime = match &run_request {
-            Some(_) => <dyn Runtime>::select(&manifest, exec).await,
+            Some(_) => <dyn Runtime>::select(&manifest, &root, exec).await,
             None => None,
         };
         let compile_request = plan.request();
@@ -1212,8 +1426,29 @@ impl RunArgs {
 
         // The two are built together, so one without the other cannot happen; the module arm is
         // what the `else` is.
+        let mut linked: Vec<jals_build::WasmLibrary<'_>> = plan
+            .libraries
+            .iter()
+            .zip(&plan.library_bytes)
+            .map(|(library, bytes)| jals_build::WasmLibrary {
+                name: &library.name,
+                bytes,
+            })
+            .collect();
+        // A selected package that ships its Java as a module links like a `wasm` dependency, under
+        // the name it was selected by.
+        linked.extend(
+            natives
+                .libraries()
+                .map(|(name, bytes)| jals_build::WasmLibrary { name, bytes }),
+        );
+        let foreign: Vec<jals_build::WasmForeignModule<'_>> = plan
+            .foreign
+            .iter()
+            .map(|(name, bytes)| jals_build::WasmForeignModule { name, bytes })
+            .collect();
         let (Some(runtime), Some(run_request)) = (&runtime, &run_request) else {
-            return self.run_module(session, &outcome, &natives, &package);
+            return self.run_module(session, &outcome, &natives, &linked, &foreign, &package);
         };
         let running = package.begin(jals_progress::Activity::Run, run_request.main_class);
         // The child owns this terminal from here on and never gives it back, so the display comes
@@ -1248,6 +1483,8 @@ impl RunArgs {
         session: &Session,
         outcome: &jals_build::BackendOutcome,
         natives: &jals_native::NativePackageSet,
+        libraries: &[jals_build::WasmLibrary<'_>],
+        foreign: &[jals_build::WasmForeignModule<'_>],
         progress: &jals_progress::Progress,
     ) -> Result<ExitCode> {
         let module = outcome
@@ -1266,6 +1503,11 @@ impl RunArgs {
             // imports none links against an empty table, which is what every project that selected
             // no package produces.
             natives: &natives.bindings(),
+            // The `wasm` dependencies this project links, loaded from where the manifest declared
+            // them. A project that declared none links an empty list, which is the ordinary run.
+            libraries,
+            foreign,
+            fuel: None,
             progress,
         };
         match jals_build::WasmRunner::run(&request).map_err(|error| anyhow!("{error}"))? {
@@ -1341,7 +1583,9 @@ impl TestArgs {
         // the result objects `--message-format json` has always named. The event stream stands
         // down rather than interleaving a second schema into the same lines.
         session.owns_stdout();
-        let (mut manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
+        let (mut manifest, root) =
+            App::resolve_manifest_for(self.manifest_path.as_deref(), self.package.as_deref())
+                .await?;
         session.note_project(&root, manifest.package.name.as_deref());
         self.refuse_unsupported(&manifest)?;
         let features = self.features.resolve(&manifest)?;
@@ -1363,9 +1607,24 @@ impl TestArgs {
         let reporter = self.reporter(0, session);
         let fetcher = jals_classpath::ReqwestFetcher::for_project(
             root.clone(),
-            jals_classpath::NetworkPolicy::when_offline(self.offline),
+            jals_classpath::NetworkPolicy::when_offline(self.lock.policy().offline(self.offline)),
             jals_classpath::RetrySchedule::new(self.network_retry),
         );
+        // The compile half follows `[build] backend` exactly as `jals build` does, and the JVM
+        // runner is the only half that spawns `java`. A wasm lowering reaches no JDK at all: its
+        // backend is the in-process one and its engine is compiled into this binary. `--no-run`
+        // still compiles, so only the runtime half stands down under it.
+        toolchain::Toolchain::ensure(
+            &manifest,
+            &root,
+            &fetcher,
+            session,
+            toolchain::Needs {
+                compiler: matches!(manifest.build.backend, jals_config::BackendKind::Javac {}),
+                runtime: matches!(lowering, Lowering::Test) && !self.no_run,
+            },
+        )
+        .await?;
         let (sources, tree, inputs, discovered_tests) = App::prepare_compile_inputs(
             &mut manifest,
             &root,
@@ -1373,6 +1632,7 @@ impl TestArgs {
             &fetcher,
             jals_project::SourcePublication::Apply,
             lowering,
+            self.lock.policy(),
             session,
         )
         .await?;
@@ -1388,6 +1648,7 @@ impl TestArgs {
             lowering,
             natives.clone(),
             exec,
+            &features,
             session.for_package(App::package_ref(&manifest)),
         )
         .await?;
@@ -1437,9 +1698,34 @@ impl TestArgs {
                     should_fail: test.should_fail,
                 })
                 .collect();
+            let mut linked: Vec<jals_build::WasmLibrary<'_>> = plan
+                .libraries
+                .iter()
+                .zip(&plan.library_bytes)
+                .map(|(library, bytes)| jals_build::WasmLibrary {
+                    name: &library.name,
+                    bytes,
+                })
+                .collect();
+            linked.extend(
+                natives
+                    .libraries()
+                    .map(|(name, bytes)| jals_build::WasmLibrary { name, bytes }),
+            );
+            let foreign: Vec<jals_build::WasmForeignModule<'_>> = plan
+                .foreign
+                .iter()
+                .map(|(name, bytes)| jals_build::WasmForeignModule { name, bytes })
+                .collect();
             Launcher::Wasm(
-                jals_build::WasmTestLauncher::resolve(module, entries, natives.bindings())
-                    .map_err(|e| anyhow!("{e}"))?,
+                jals_build::WasmTestLauncher::resolve(
+                    module,
+                    entries,
+                    natives.bindings(),
+                    &linked,
+                    &foreign,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             )
         } else {
             // The frontend generates no harness for a project that declares no test, so there is
@@ -1462,6 +1748,7 @@ impl TestArgs {
                 main_class: jals_frontend::HARNESS_CLASS,
                 program_args: &[],
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 run_env: &inputs.run_env,
             };
             Launcher::Jvm(
@@ -1723,9 +2010,10 @@ impl CleanArgs {
         }
         let (manifest, root) = App::resolve_manifest(self.manifest_path.as_deref()).await?;
         session.note_project(&root, manifest.package.name.as_deref());
-        let storage = NativeStorage::for_project_scoped(
+        let storage = NativeStorage::for_project_scoped_excluding(
             &root,
             [NativeScope::all(RelativePath::ROOT)],
+            App::toolchain_exclusion(),
             exec.clone(),
         )
         .await
@@ -1902,12 +2190,9 @@ impl LintProject {
         manifest: &Manifest,
     ) -> Vec<jals_editor::PackageSource> {
         match natives::Natives::select(shell, manifest) {
-            Ok(selection) => selection
-                .sources()
-                .map(|(_, source)| jals_editor::PackageSource {
-                    path: source.path.to_owned(),
-                    text: source.text.to_owned(),
-                })
+            Ok(selection) => jals_build::JalsBackend::native_package_sources(&selection)
+                .into_iter()
+                .map(|(path, text)| jals_editor::PackageSource { path, text })
                 .collect(),
             Err(error) => {
                 shell.warn(format_args!("{error:#}"));
@@ -1920,6 +2205,7 @@ impl LintProject {
         start_dir: &Path,
         exec: &Exec,
         selection: &FeatureArgs,
+        lock: LockArgs,
         session: &Session,
     ) -> Result<Self> {
         let shell = session.shell();
@@ -1986,7 +2272,7 @@ impl LintProject {
             DependencyScope::Test,
             jals_classpath::ProjectInputOptions::Analysis,
             // Lint analyses what is already on disk; opening a project to report diagnostics must
-            // not execute an unreviewed `build.rhai`.
+            // not execute an unreviewed `build.java`.
             RootScript::skipped(),
             &RootScriptInputs {
                 environment: &environment,
@@ -2000,6 +2286,7 @@ impl LintProject {
                 // Nothing to retry: the refusal comes before an attempt is made.
                 jals_classpath::RetrySchedule::none(),
             ),
+            lock.policy(),
             session,
         )
         .await
@@ -2033,6 +2320,7 @@ impl LintProject {
                         feature_set: manifest.feature_set(),
                         build_features: features.into_features(),
                         native_sources: Self::native_layout_sources(shell, &manifest),
+                        source_filters: manifest.source_filters(),
                         ..jals_editor::ProjectLayout::new(source_roots)
                     },
                 });
@@ -2044,6 +2332,7 @@ impl LintProject {
             source_roots: inputs.source_roots,
             feature_set: inputs.feature_set,
             native_sources: Self::native_layout_sources(shell, &manifest),
+            source_filters: manifest.source_filters(),
             // What each project file's `#[cfg(feature = "…")]` evaluates against, read only when
             // `feature_set` enables the `attributes` dialect — so an attribute-free project's lint
             // output is independent of `--features`.
@@ -2199,6 +2488,18 @@ impl App {
             .map_or_else(|| "default".to_owned(), |release| format!("java{release}"))
     }
 
+    /// The project-local toolchain store, as a native-snapshot exclusion.
+    ///
+    /// A `[toolchain] compiler` distribution is resolved to one of these directories, so a
+    /// `target/jdk` JDK is a build input the manifest names — and still not a project file to
+    /// capture: it is tens to hundreds of megabytes of vendored runtime, and a `jals toolchain
+    /// link` entry is a symlink out of the root that a root-wide snapshot would diagnose on every
+    /// build. The two root-scoped snapshots (`clean`'s and the build script's) exclude it.
+    fn toolchain_exclusion() -> [RelativePath; 1] {
+        [RelativePath::parse(jals_config::MANAGED_TOOLCHAIN_ROOT)
+            .expect("the toolchain root is a portable path")]
+    }
+
     /// How a project is named wherever this run mentions one: cargo's `name v0.1.0`.
     ///
     /// One rule, because the name a status line shows and the name a progress event is attributed
@@ -2219,6 +2520,10 @@ impl App {
 #[derive(Default)]
 struct HostProjectInputs {
     extra_classpath: Vec<PathBuf>,
+    /// Resolved `[build] module-path` entries, plus any dependency jars an `auto`/`module-path`
+    /// selection moved here. Kept apart from `extra_classpath` because the two javac options are
+    /// different namespaces: a jar on the wrong one is a `module not found` error.
+    extra_module_path: Vec<PathBuf>,
     /// Every cached archive the compiled classes are reobfuscated against: the resolved
     /// `[dependencies]` jars, then the archives the build tasks put on the classpath.
     ///
@@ -2269,7 +2574,35 @@ impl HostProjectInputs {
             .retain(|entry| seen_classpath.insert(root.join(entry)));
         self.extra_classpath
             .retain(|entry| seen_classpath.insert(entry.clone()));
+
+        let mut seen_module_path = HashSet::new();
+        self.extra_module_path
+            .retain(|entry| seen_module_path.insert(entry.clone()));
     }
+}
+
+/// One `wasm` dependency, resolved: the module's bytes and the ABI it published.
+///
+/// Two halves with two destinations and one source: the compile reads the ABI (and the Java it
+/// carries), and the run needs the bytes. Resolving once keeps the two from disagreeing about
+/// which file was meant.
+struct ResolvedWasmLibrary {
+    /// The module's bytes.
+    bytes: Vec<u8>,
+    /// The decoded `jals.library` section, with the name the entry declared.
+    library: jals_build::BackendLibrary,
+}
+
+/// A scope's `wasm` dependencies, split by kind.
+///
+/// Two halves with two destinations and one source: the compile links the libraries, and the run
+/// instantiates both — the libraries by their ABI and the foreign modules by the canonical keys
+/// their exports carry. A foreign module has no ABI to decode, so it travels as the pair of its
+/// dependency name and its bytes.
+#[derive(Default)]
+struct WasmLibraries {
+    libraries: Vec<ResolvedWasmLibrary>,
+    foreign: Vec<(String, Vec<u8>)>,
 }
 
 /// The compile step, selected and ready to run.
@@ -2280,6 +2613,16 @@ impl HostProjectInputs {
 struct CompilePlan {
     backend: Box<dyn jals_build::Backend>,
     tree: Vec<jals_build::BackendSource>,
+    /// The `wasm` dependencies this compile links — the active ones in the lowering's scope,
+    /// ordered by their dependency key — as the request borrows them.
+    libraries: Vec<jals_build::BackendLibrary>,
+    /// The same libraries' bytes, aligned with [`libraries`](Self::libraries), for the run step —
+    /// which needs the module the compile only described.
+    library_bytes: Vec<Vec<u8>>,
+    /// The foreign modules this run satisfies `native` imports from, as `(dependency name, bytes)`:
+    /// no ABI, no compile input, and only the run consumes them. See
+    /// [`jals_build::WasmForeignModule`].
+    foreign: Vec<(String, Vec<u8>)>,
     options: jals_build::BackendOptions,
     /// Attributed to the package being compiled, so an in-process backend's per-file counting lands
     /// under the same name the `Compiling` line carries.
@@ -2305,6 +2648,7 @@ impl CompilePlan {
         lowering: Lowering,
         natives: jals_native::NativePackageSet,
         exec: &Exec,
+        features: &ResolvedBuildFeatures,
         progress: jals_progress::Progress,
     ) -> Result<Self> {
         let selection = jals_build::BackendSelection::for_host(
@@ -2316,6 +2660,7 @@ impl CompilePlan {
             &jals_build::HostCompileInputs {
                 extra_sources: &inputs.extra_sources,
                 extra_classpath: &inputs.extra_classpath,
+                module_path: &inputs.extra_module_path,
                 extra_javac_args: &inputs.javac_args,
                 compile_env: &inputs.compile_env,
             },
@@ -2332,12 +2677,24 @@ impl CompilePlan {
         )
         .await;
         match selection {
-            jals_build::BackendSelection::Available(backend) => Ok(Self {
-                backend,
-                tree,
-                options: jals_build::BackendOptions::from_manifest(manifest),
-                progress,
-            }),
+            jals_build::BackendSelection::Available(backend) => {
+                let resolved =
+                    Self::wasm_libraries(root, manifest, features, lowering.dependency_scope())?;
+                let (libraries, library_bytes) = resolved
+                    .libraries
+                    .into_iter()
+                    .map(|library| (library.library, library.bytes))
+                    .unzip();
+                Ok(Self {
+                    backend,
+                    tree,
+                    libraries,
+                    library_bytes,
+                    foreign: resolved.foreign,
+                    options: jals_build::BackendOptions::from_manifest(manifest),
+                    progress,
+                })
+            }
             jals_build::BackendSelection::Absent { id, reason } => {
                 bail!("`[build] backend` selects `{id}`, but {reason}")
             }
@@ -2354,8 +2711,61 @@ impl CompilePlan {
             // against them. The `javac` adapter takes the real classpath as a host input instead,
             // because its entries are paths and this request is portable.
             classpath: &[],
+            libraries: &self.libraries,
             options: &self.options,
         }
+    }
+
+    /// Every active `wasm` dependency of `manifest` in `scope`, read and split by kind.
+    ///
+    /// A dependency whose module carries no `jals.library` section is refused here, with the path
+    /// that was read: it is the wrong kind of module, and a link failure at run time would say so
+    /// in the engine's vocabulary rather than the project's. A `foreign = true` entry is the
+    /// exception and the reason the check exists: it declares up front that its module was not
+    /// emitted by this backend and has no ABI to read, so it comes back as foreign bytes instead.
+    ///
+    /// The slice comes out in the manifest's own order, which is the dependency-key order of its
+    /// map — not the order the author wrote the tables in. Nothing depends on it today: library
+    /// modules cannot import one another (`CompileWasm::library` takes no linked list), so a
+    /// library-to-library call would need an ordering *edge*, not a slice order. A foreign module
+    /// can import from an earlier one, though: the engine links each under its dependency key, so
+    /// the key order is what decides which pairs can be spelled.
+    fn wasm_libraries(
+        root: &Path,
+        manifest: &Manifest,
+        features: &ResolvedBuildFeatures,
+        scope: DependencyScope,
+    ) -> Result<WasmLibraries> {
+        let mut resolved = WasmLibraries::default();
+        for (name, dependency) in manifest.active_dependencies(scope, features) {
+            let Dependency::Wasm(wasm) = dependency else {
+                continue;
+            };
+            let path = root.join(&wasm.wasm);
+            let bytes = std::fs::read(&path).with_context(|| {
+                format!("reading wasm dependency `{name}` at `{}`", path.display())
+            })?;
+            // A foreign module has no ABI to read: the project's own `native` declarations are
+            // its API, and its exports are matched to them by canonical key at run time.
+            if wasm.foreign.unwrap_or(false) {
+                resolved.foreign.push((name.clone(), bytes));
+                continue;
+            }
+            let abi = jals_build::LibraryAbi::of_module(&bytes).map_err(|error| {
+                anyhow!(
+                    "`{}` (wasm dependency `{name}`) is not a linked library: {error}",
+                    path.display()
+                )
+            })?;
+            resolved.libraries.push(ResolvedWasmLibrary {
+                bytes,
+                library: jals_build::BackendLibrary {
+                    name: name.clone(),
+                    abi,
+                },
+            });
+        }
+        Ok(resolved)
     }
 }
 
@@ -2363,6 +2773,7 @@ impl CompilePlan {
 struct HostBuildScript {
     generated_sources: Vec<PathBuf>,
     additional_classpath: Vec<PathBuf>,
+    additional_module_path: Vec<PathBuf>,
     javac_args: Vec<String>,
     jvm_args: Vec<String>,
     compile_env: BTreeMap<String, String>,
@@ -2391,6 +2802,7 @@ impl From<HostBuildScript> for HostProjectInputs {
     fn from(script: HostBuildScript) -> Self {
         Self {
             extra_classpath: script.additional_classpath,
+            extra_module_path: script.additional_module_path,
             extra_sources: script.generated_sources,
             javac_args: script.javac_args,
             jvm_args: script.jvm_args,
@@ -2453,15 +2865,88 @@ impl App {
         script: RootScript,
         scripts: &RootScriptInputs<'_>,
         fetcher: &jals_classpath::ReqwestFetcher,
+        policy: LockPolicy,
         session: &Session,
     ) -> Result<HostProjectInputs> {
         let shell = session.shell();
         let mut result = HostProjectInputs::from(script.host);
+        // Classpath-only `path` dependencies are host paths the compiler needs. The plans lower
+        // them for analysis (a project key or a published artifact), but a compile consumes the
+        // directory/jar itself, exactly as it does an authored `[build] classpath` entry.
+        for (_, dependency) in manifest.active_dependencies(scope, scripts.features) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                let entry = Path::new(&entry);
+                result.extra_classpath.push(if entry.is_absolute() {
+                    entry.to_path_buf()
+                } else {
+                    root.join(entry)
+                });
+            }
+        }
         let exec = storage.exec().clone();
         // The graph's own work is attributed per node, inside the graph: a dependency's script and
         // task plan belong to that dependency, not to whoever is building it.
         let progress = session.progress().clone();
-        let assembly = script
+        // One lock for the whole workspace. When a workspace root exists, its members are resolved
+        // together (one version per name across all of them) and the lock is written once, at the
+        // root; this member's classpath pass then pins against the result without rewriting it.
+        let workspace = match ProjectWorkspace::discover(root) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                shell.warn(format_args!("workspace discovery failed: {error:#}"));
+                None
+            }
+        };
+        if let Some(workspace) = &workspace
+            && workspace
+                .members()
+                .iter()
+                .all(|member| member != &root.join("jals.toml"))
+        {
+            bail!(
+                "{} is a workspace root that is not itself a member; run the command from a \
+                 member directory",
+                root.display()
+            );
+        }
+        let lock_root = workspace.as_ref().map_or_else(
+            || root.to_path_buf(),
+            |workspace| workspace.root().to_path_buf(),
+        );
+        let mut registry = Self::read_registry_lock(&lock_root)?;
+        if let Some(workspace) = &workspace {
+            registry.generate_lock = false;
+            match workspace.manifests().await {
+                Ok(manifests) => {
+                    let members: Vec<&Manifest> = manifests.iter().collect();
+                    match jals_classpath::RegistryResolver::resolve_workspace(
+                        &members,
+                        fetcher,
+                        registry.lock.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(graphs) => {
+                            if let Some(lock) = graphs.lock {
+                                registry.lock = Some(lock.clone());
+                                registry.resolved_lock = Some(lock);
+                            }
+                            // The workspace pass produces the lock; its advisories (a member's
+                            // version fallback) belong on this run's stderr, not dropped.
+                            for message in &graphs.warnings {
+                                shell.warn(format_args!("{message}"));
+                            }
+                        }
+                        Err(error) => shell.warn(format_args!(
+                            "workspace registry dependencies could not be resolved: {error}"
+                        )),
+                    }
+                }
+                Err(error) => shell.warn(format_args!("{error:#}")),
+            }
+        }
+        let resolved = script
             .assembled
             .resolve_native(
                 manifest,
@@ -2480,29 +2965,31 @@ impl App {
                 },
                 scope,
                 options,
+                Some(&mut registry),
             )
-            .await
-            .map_err(|failure| {
-                // Discovery had already found something worth saying about this project before a
-                // later phase failed, and it is usually the half that explains the other: the
-                // dependency preprocessing could not resolve is often the one discovery warned was
-                // unavailable. The assembly orders and grades both; this prints what it produced.
-                //
-                // The script phase is `Skipped` here whichever command is running: whoever ran a
-                // script reports it (`run_build_script`), and `jals lint` runs none at all.
-                Reporter::report_project(
-                    shell,
-                    &jals_project::ProjectDiagnostics::assemble(
-                        jals_project::ScriptOutcome::Skipped,
-                        jals_project::GraphOutcome::Failed(&failure),
-                        None,
-                    ),
+            .await;
+        Self::apply_registry_lock(&lock_root, &registry, policy, shell)?;
+        let assembly = resolved.map_err(|failure| {
+            // Discovery had already found something worth saying about this project before a
+            // later phase failed, and it is usually the half that explains the other: the
+            // dependency preprocessing could not resolve is often the one discovery warned was
+            // unavailable. The assembly orders and grades both; this prints what it produced.
+            //
+            // The script phase is `Skipped` here whichever command is running: whoever ran a
+            // script reports it (`run_build_script`), and `jals lint` runs none at all.
+            Reporter::report_project(
+                shell,
+                &jals_project::ProjectDiagnostics::assemble(
+                    jals_project::ScriptOutcome::Skipped,
+                    jals_project::GraphOutcome::Failed(&failure),
                     None,
-                );
-                // No `.context()` on top: it would restate this sentence, and the detail is in the
-                // diagnostics just reported rather than in the error chain.
-                anyhow!("the project dependency graph could not be resolved")
-            })?;
+                ),
+                None,
+            );
+            // No `.context()` on top: it would restate this sentence, and the detail is in the
+            // diagnostics just reported rather than in the error chain.
+            anyhow!("the project dependency graph could not be resolved")
+        })?;
 
         let reported = jals_project::ProjectDiagnostics::assemble(
             jals_project::ScriptOutcome::Skipped,
@@ -2515,6 +3002,19 @@ impl App {
             // No outer phrase and no restated detail: every failure has just been reported in full,
             // and repeating one here would print it twice under two different leads.
             return Err(anyhow!("the project could not be assembled"));
+        }
+
+        // One line about what each declared dependency form contributed, before the compile
+        // starts. `Compile` only: an analysis pass resolves the same inputs for a reader rather
+        // than a compiler, where "not on the compile classpath" is the expected state.
+        if options == jals_classpath::ProjectInputOptions::Compile {
+            Self::report_dependency_status(
+                shell,
+                manifest,
+                scope,
+                scripts.features,
+                &assembly.inputs.registry_status,
+            );
         }
 
         // The two halves are in hand here and nowhere else: `ProjectInputs` single-sources the
@@ -2565,6 +3065,44 @@ impl App {
             };
             result.extra_classpath.push(path);
         }
+        // `[build] module-path` has two spellings: a literal host path, and a
+        // `${dependency.<name>}` reference that only the resolver can answer. Both become one
+        // resolved entry, because `javac` takes one option and has no way to look a name up.
+        for entry in manifest
+            .build
+            .module_path_entries()
+            .expect("Manifest::validate rejected an invalid module-path")
+        {
+            match entry {
+                jals_config::ModulePathEntry::Path(path) => {
+                    result.extra_module_path.push(root.join(path));
+                }
+                jals_config::ModulePathEntry::Dependency(name) => {
+                    let key = jals_storage::Name::new(name)
+                        .ok()
+                        .and_then(|name| assembly.inputs.named_dependency_jars.get(&name));
+                    let Some(key) = key else {
+                        shell.warn(format_args!(
+                            "module-path dependency `{name}` has no resolved jar (it is not a \
+                             registry or jar dependency)"
+                        ));
+                        continue;
+                    };
+                    let logical = jals_storage::FileKey::parse(&format!("dependencies/{name}.jar"))
+                        .expect("a dependency name is a portable file name");
+                    match storage
+                        .artifacts()
+                        .materialize_file(key, logical.path())
+                        .await
+                    {
+                        Ok(path) => result.extra_module_path.push(path),
+                        Err(error) => shell.warn(format_args!(
+                            "materializing module-path dependency `{name}` failed: {error:?}"
+                        )),
+                    }
+                }
+            }
+        }
         // Kept beside the materialized host paths below rather than derived from them: a host that
         // indexes these mounts them into its own project revision, and a materialized artifact is
         // a path under `target/jals/cache`, which that revision does not capture.
@@ -2596,7 +3134,133 @@ impl App {
         Ok(result)
     }
 
+    /// One status line about what each declared dependency form contributed to this compile.
+    ///
+    /// The forms answer different questions — `registry` and `jar` entries reach the compile
+    /// classpath, `git`/`path` entries contribute sources, and a registry artifact whose POM named
+    /// a non-jar `<type>` is fetched and locked but is not a classpath entry — so the line says
+    /// what happened per form instead of leaving a reader to infer it from warnings. Declared forms
+    /// come from the manifest (`jar`/`git`/`path` entries are graph nodes, so only the manifest has
+    /// their count); the registry half is what resolution answered. A project that declared none
+    /// prints nothing; the line is quiet-safe narration on stderr.
+    fn report_dependency_status(
+        shell: &Shell,
+        manifest: &Manifest,
+        scope: DependencyScope,
+        features: &ResolvedBuildFeatures,
+        registry: &jals_classpath::RegistryStatus,
+    ) {
+        let plural = |count: usize, singular: &str| {
+            if count == 1 {
+                singular.to_owned()
+            } else {
+                format!("{singular}s")
+            }
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if registry.jars > 0 {
+            parts.push(format!(
+                "{} registry on the compile classpath",
+                registry.jars
+            ));
+        }
+        if registry.artifacts > 0 {
+            parts.push(format!(
+                "{} registry {} not on the compile classpath",
+                registry.artifacts,
+                plural(registry.artifacts, "artifact")
+            ));
+        }
+        let (mut jars, mut git_sources, mut path_sources) = (0usize, 0usize, 0usize);
+        for (_, dependency) in manifest.active_dependencies(scope, features) {
+            match dependency {
+                Dependency::Jar(_) => jars += 1,
+                Dependency::Git(_) => git_sources += 1,
+                Dependency::Path(_) => path_sources += 1,
+                Dependency::Wasm(_) | Dependency::Registry(_) | Dependency::RegistryVersion(_) => {}
+            }
+        }
+        if jars > 0 {
+            parts.push(format!("{jars} jar on the compile classpath"));
+        }
+        if git_sources > 0 {
+            parts.push(format!(
+                "{git_sources} git {}",
+                plural(git_sources, "source")
+            ));
+        }
+        if path_sources > 0 {
+            parts.push(format!(
+                "{path_sources} path {}",
+                plural(path_sources, "source")
+            ));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        shell.status(
+            Verb::Resolving,
+            format_args!("dependencies: {}", parts.join(", ")),
+        );
+    }
+
+    /// Read `jals.lock` beside the root manifest, when the host has one.
+    ///
+    /// A malformed lock is an error: silently resolving past one would rewrite a file the user
+    /// may have hand-edited, hiding the mistake that produced it.
+    fn read_registry_lock(root: &Path) -> Result<jals_classpath::RegistryResolution> {
+        let path = root.join("jals.lock");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => jals_classpath::RegistryResolution::from_lock_text(Some(&text))
+                .map_err(|error| anyhow!("{}: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(jals_classpath::RegistryResolution::default())
+            }
+            Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
+        }
+    }
+
+    /// Apply the resolved lock under the command's policy.
+    ///
+    /// A policy that locks the file refuses any change; otherwise the file is written only when
+    /// the rendered bytes differ, so a run that changed nothing leaves its timestamp alone.
+    fn apply_registry_lock(
+        root: &Path,
+        registry: &jals_classpath::RegistryResolution,
+        policy: LockPolicy,
+        shell: &Shell,
+    ) -> Result<()> {
+        let Some(text) = registry.resolved_text() else {
+            return Ok(());
+        };
+        let path = root.join("jals.lock");
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+            return Ok(());
+        }
+        if policy.locked {
+            bail!(
+                "{} needs to be updated, but the command was run with {}",
+                path.display(),
+                if policy.frozen {
+                    "--frozen"
+                } else {
+                    "--locked"
+                }
+            );
+        }
+        std::fs::write(&path, &text)
+            .map_err(|error| anyhow!("cannot write {}: {error}", path.display()))?;
+        shell.verbose_status(
+            Verb::Resolving,
+            format_args!("{} dependencies", registry.packages.len()),
+        );
+        Ok(())
+    }
+
     /// Prepare the root and transitive compile inputs shared by `build` and `run`.
+    // As `project_inputs`: every parameter is a distinct input — the project, the selection, the
+    // fetch capability, the publication policy, the lowering, the lock policy, and the reporter.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_compile_inputs(
         manifest: &mut Manifest,
         root: &Path,
@@ -2604,6 +3268,7 @@ impl App {
         fetcher: &jals_classpath::ReqwestFetcher,
         publications: jals_project::SourcePublication,
         lowering: Lowering,
+        policy: LockPolicy,
         session: &Session,
     ) -> Result<(
         jals_build::StagedTree,
@@ -2623,12 +3288,56 @@ impl App {
             session,
         )
         .await?;
+        // Keep the authored spelling for the module-path promotion below: a glob must reach
+        // `--module-path` as the entries it names, not as the already-expanded classpath list.
+        let authored_classpath = manifest.build.classpath.clone();
+        // A `[build] classpath` glob is a host filesystem question, so it is resolved here, once,
+        // before invocation planning. The native plan expands again for hosts that reach it
+        // directly (the LSP); expanded entries fall through unchanged.
+        for (entry, message) in
+            jals_classpath::NativeProjectPlan::expand_build_classpath(manifest, root)
+        {
+            session
+                .shell()
+                .warn(format_args!("classpath entry `{entry}`: {message}"));
+        }
         let sources = Self::discover_sources(
             manifest,
             root,
             !script.host.generated_sources.is_empty(),
             lowering,
         )?;
+        // A module declaration is a property of the source set this compile was handed, not of the
+        // manifest bytes alone: an excluded `module-info.java` (M2.1) must not flip the selection,
+        // and a generated one must.
+        let has_module_info = sources
+            .iter()
+            .chain(&script.host.generated_sources)
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "module-info.java")
+            });
+        let uses_module_path = manifest.build.modular.uses_module_path(has_module_info);
+        if has_module_info && !uses_module_path {
+            session.shell().warn(format_args!(
+                "`module-info.java` is compiled with everything on the classpath; set \
+                 `[build] modular = \"auto\"` (or \"module-path\") to put resolved dependencies on \
+                 `--module-path`"
+            ));
+        }
+        if uses_module_path {
+            // `[build] classpath` entries are jars a JPMS project usually needs on the module path
+            // instead. They stay in `classpath` too, so `jals run` and a non-modular consumer keep
+            // their existing reading.
+            for entry in &authored_classpath {
+                if !manifest.build.module_path.contains(entry) {
+                    manifest.build.module_path.push(entry.clone());
+                }
+            }
+        }
+        manifest.build.module_path =
+            jals_classpath::NativeProjectPlan::expanded_module_path_entries(manifest, root);
         // The root build script's output is root project source, so it goes through the root
         // frontend alongside the authored files. Dependency-contributed sources, which land in
         // `extra_sources` further down, deliberately do not: a dependency is lowered under its
@@ -2649,10 +3358,46 @@ impl App {
                 features,
             },
             fetcher,
+            policy,
             session,
         )
         .await?;
+        if uses_module_path {
+            // Every resolved dependency jar the compile classpath carries is a module candidate.
+            // Copies are appended rather than moved: the run classpath still needs them when the
+            // program is launched by main class.
+            inputs
+                .extra_module_path
+                .extend(inputs.extra_classpath.iter().cloned());
+        }
         inputs.deduplicate(manifest, root, &sources);
+        if uses_module_path {
+            // JPMS refuses two modules that export one package. Reading the jars here is the only
+            // point where the module path is already materialized; javac would otherwise be the
+            // first to say so, in a message that names the package but not the two jars.
+            let jars: Vec<PathBuf> = inputs
+                .extra_module_path
+                .iter()
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+                })
+                .cloned()
+                .collect();
+            let split = jals_exec::tokio_rt::on_blocking_pool(move || {
+                jals_classpath::NativeProjectPlan::split_packages(&jars)
+            })
+            .await;
+            for (package, jars) in split {
+                session.shell().warn(format_args!(
+                    "split package `{package}` is declared by more than one module-path jar: {}",
+                    jars.join(", ")
+                ));
+            }
+        }
         // Deduplication compares against the *authored* paths, so it must happen before lowering
         // replaces them with staged ones.
         // A build script may register a file that is *also* an authored source (`add_source` on
@@ -2693,7 +3438,7 @@ impl App {
     /// Only `JALS_`-prefixed host variables cross the boundary. The rest of the host environment
     /// stays out: a build script can forward anything it reads into a task fetch URL, so
     /// inheriting wholesale would expose every credential on the machine to an unreviewed
-    /// `build.rhai` — including a dependency's. See [`BuildScriptEnvironment::HOST_PREFIX`].
+    /// `build.java` — including a dependency's. See [`BuildScriptEnvironment::HOST_PREFIX`].
     ///
     /// Only the **root project's** own queryable half of `features` is installed here. A dependency
     /// node's script is given its own resolved set by the graph's preprocessing pass, from the
@@ -2710,7 +3455,7 @@ impl App {
         .for_project(manifest, features.features().clone())
     }
 
-    /// Execute the manifest's optional Rhai pre-build phase against a project snapshot. The host
+    /// Execute the manifest's optional Java pre-build phase against a project snapshot. The host
     /// supplies environment values as plain data; scripts only read and publish through typed
     /// `jals-storage` keys.
     async fn run_build_script(
@@ -2725,22 +3470,23 @@ impl App {
         let shell = session.shell();
         // The root's own script and task plan are the root package's work.
         let progress = session.for_package(Self::package_ref(manifest));
-        let mut storage = NativeStorage::for_project_scoped(
+        let mut storage = NativeStorage::for_project_scoped_excluding(
             root,
             [NativeScope::all(RelativePath::ROOT)],
+            Self::toolchain_exclusion(),
             exec.clone(),
         )
         .await
         .context("opening project storage for the build script")?;
         let mut session = BuildScriptSession::new();
-        // The configured script's key and text, so a failure that carries a Rhai position can be
+        // The configured script's key and text, so a failure that carries a script position can be
         // pointed at the offending line rather than reported without a location.
         let script_key = manifest
             .build
             .script
             .as_ref()
             .and_then(|script| match script {
-                jals_config::BuildScript::Rhai { file } => FileKey::parse(file).ok(),
+                jals_config::BuildScript::Java { file } => FileKey::parse(file).ok(),
             });
         let script_text = script_key
             .as_ref()
@@ -2829,6 +3575,11 @@ impl App {
                         .map(|key| key.path().to_host_path(root))
                         .collect(),
                     additional_classpath,
+                    additional_module_path: output
+                        .additional_module_path
+                        .iter()
+                        .map(|key| key.path().to_host_path(root))
+                        .collect(),
                     javac_args: output.javac_args.clone(),
                     jvm_args: output.jvm_args.clone(),
                     compile_env: output.compile_env.clone(),
@@ -2836,6 +3587,73 @@ impl App {
                 }
             });
         Ok(RootScript { assembled, host })
+    }
+
+    /// Resolve the manifest a command targets, optionally selecting one workspace member by
+    /// `[package] name`.
+    ///
+    /// `-p` is a selection, not a second project layout: it finds the enclosing workspace, loads
+    /// every member under the same inheritance pass, and then hands the selected member to the
+    /// ordinary path so nothing downstream knows the difference.
+    async fn resolve_manifest_for(
+        explicit: Option<&Path>,
+        package: Option<&str>,
+    ) -> Result<(Manifest, PathBuf)> {
+        let Some(package) = package else {
+            return Self::resolve_manifest(explicit).await;
+        };
+        let start = match explicit {
+            Some(path) => {
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .context("getting current dir")?
+                        .join(path)
+                };
+                path.parent().map(Path::to_path_buf).unwrap_or(path)
+            }
+            None => std::env::current_dir().context("getting current dir")?,
+        };
+        let workspace = ProjectWorkspace::discover(&start)
+            .context("discovering the workspace for `-p`")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "`-p {package}` requires a workspace: no enclosing jals.toml declares [workspace]"
+                )
+            })?;
+        let members = workspace.manifests().await?;
+        if members.len() != workspace.members().len() {
+            bail!(
+                "workspace `{}` returned {} manifests for {} members",
+                workspace.root().display(),
+                members.len(),
+                workspace.members().len()
+            );
+        }
+        let mut available = Vec::with_capacity(members.len());
+        for (path, manifest) in workspace.members().iter().zip(members) {
+            let directory_matches = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(package);
+            if manifest.package.name.as_deref() == Some(package) || directory_matches {
+                // Return the manifest inheritance already produced. Re-reading the file through
+                // `resolve_manifest` would use `Manifest::from_file`, whose parse has no workspace
+                // attached and would silently drop every inherited value for the selected member.
+                let root = path.parent().unwrap_or_else(|| Path::new("."));
+                return Ok((manifest, root.to_path_buf()));
+            }
+            if let Some(name) = manifest.package.name {
+                available.push(name);
+            }
+        }
+        bail!(
+            "workspace member `{package}` was not found in {} (available: {})",
+            workspace.root().display(),
+            available.join(", ")
+        )
     }
 
     /// Resolves the manifest from an explicit path or by discovering `jals.toml` upward from the cwd,
@@ -2874,11 +3692,28 @@ impl App {
         has_generated_sources: bool,
         lowering: Lowering,
     ) -> Result<Vec<PathBuf>> {
-        let source_roots = match lowering {
-            Lowering::Build => manifest.source_roots(root),
-            Lowering::Test | Lowering::TestOnWasm => manifest.test_source_roots(root),
-        };
-        for dir in &source_roots {
+        let build_filter = manifest
+            .build
+            .source_filter()
+            .map_err(|error| anyhow!("invalid `[build]` source filter: {error}"))?;
+        let mut source_roots: Vec<(PathBuf, SourceFilter)> = manifest
+            .source_roots(root)
+            .into_iter()
+            .map(|path| (path, build_filter.clone()))
+            .collect();
+        if matches!(lowering, Lowering::Test | Lowering::TestOnWasm) {
+            let test_filter = manifest
+                .test
+                .source_filter()
+                .map_err(|error| anyhow!("invalid `[test]` source filter: {error}"))?;
+            for dir in &manifest.test.source_dirs {
+                let path = root.join(dir);
+                if !source_roots.iter().any(|(declared, _)| declared == &path) {
+                    source_roots.push((path, test_filter.clone()));
+                }
+            }
+        }
+        for (dir, _) in &source_roots {
             // A declared `[test] source-dirs` that does not exist is not an error the way a
             // missing `[build] source-dirs` is: a project may keep tests in the main tree and
             // still name a test root it has not created yet.
@@ -2896,11 +3731,11 @@ impl App {
                 return Err(anyhow!("source directory {} does not exist", dir.display()));
             }
         }
-        let existing_roots: Vec<PathBuf> = source_roots
+        let existing_roots: Vec<(PathBuf, SourceFilter)> = source_roots
             .into_iter()
-            .filter(|root| root.is_dir())
+            .filter(|(root, _)| root.is_dir())
             .collect();
-        let sources = Self::collect_java_files(&existing_roots)?;
+        let sources = Self::collect_selected_java_files(&existing_roots)?;
         if sources.is_empty() && !has_generated_sources {
             return Err(anyhow!(
                 "no .java files found under {:?}",
@@ -2908,6 +3743,54 @@ impl App {
             ));
         }
         Ok(sources)
+    }
+
+    /// Collect `.java` files under each `(source root, filter)` pair.
+    ///
+    /// A filter sees the file's path *below* its own root, so the same manifest reads identically
+    /// whether a root is `src/main/java` or an absolute directory. A host path that cannot be
+    /// expressed as a portable [`RelativePath`] is kept: the filter is an authored selection, not
+    /// a way to make a legal source disappear.
+    fn collect_selected_java_files(roots: &[(PathBuf, SourceFilter)]) -> Result<Vec<PathBuf>> {
+        fn walk(
+            dir: &Path,
+            base: &Path,
+            filter: &SourceFilter,
+            out: &mut Vec<PathBuf>,
+        ) -> Result<()> {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<_, _>>()?;
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, base, filter, out)?;
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("java"))
+                {
+                    let selected = RelativePath::from_host_path(base, &path)
+                        .is_none_or(|relative| filter.accepts(&relative));
+                    if selected {
+                        out.push(path);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut out = Vec::new();
+        for (root, filter) in roots {
+            walk(root, root, filter, &mut out)
+                .with_context(|| format!("scanning directory {}", root.display()))?;
+        }
+        // A test root nested under a build root is reached twice — once per pair — and the two
+        // passes can select or exclude different files. One path in the result is what downstream
+        // deduplication assumes, so collapse the duplicate here, at the one place that walked it.
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// Run the project's frontend over the discovered sources and stage the result on disk.
@@ -3419,5 +4302,94 @@ mod tests {
             vec![root.join("libs/z.jar"), root.join("libs/a.jar")]
         );
         assert_eq!(manifest.build.classpath, vec!["libs/base.jar"]);
+    }
+
+    /// A `[dev-dependencies] wasm` entry resolves under the test lowering, and nowhere else.
+    ///
+    /// The walk and the snapshot scope the entry under both scopes, but the compile gathered
+    /// libraries under `DependencyScope::Build` whatever the lowering was — so `jals test`
+    /// resolved the library's Java in the index and then linked nothing. The missing file is the
+    /// assertion: a scope that never looks at the entry has nothing to read. Built from TOML
+    /// because the dependency's fields are the manifest's to own, not the CLI's to spell.
+    #[test]
+    fn wasm_dependencies_resolve_in_the_lowerings_scope() {
+        let manifest: Manifest = concat!(
+            "[build]\n",
+            "backend = { type = \"jals-wasm\" }\n",
+            "\n[dev-dependencies]\n",
+            "test-lib = { wasm = \"lib.wasm\" }\n",
+        )
+        .parse()
+        .expect("the manifest parses and validates");
+        let features = ResolvedBuildFeatures::default();
+        let root = Path::new("/project");
+        let resolved =
+            CompilePlan::wasm_libraries(root, &manifest, &features, DependencyScope::Build)
+                .expect("the build scope resolves no wasm dependency");
+        assert!(resolved.libraries.is_empty());
+        assert!(resolved.foreign.is_empty(), "{:?}", resolved.foreign);
+        let error = CompilePlan::wasm_libraries(root, &manifest, &features, DependencyScope::Test)
+            .err()
+            .expect("the test scope reads the development dependency");
+        assert!(
+            error.to_string().contains("test-lib"),
+            "the report names the dependency: {error}"
+        );
+    }
+
+    /// `foreign = true` is what routes a `wasm` dependency to the runner without an ABI read.
+    ///
+    /// The file is not a module at all, which is the point: the foreign route only reads it, so
+    /// the flag — and not the module's content — is what has to decide the split. The same entry
+    /// without the flag goes down the library route and is refused by the ABI decode, which is
+    /// what makes the flag load-bearing rather than cosmetic.
+    #[test]
+    fn a_foreign_wasm_dependency_is_routed_past_the_abi() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(directory.path().join("core.wasm"), b"not a wasm module")
+            .expect("the file writes");
+        let features = ResolvedBuildFeatures::default();
+
+        let manifest: Manifest = concat!(
+            "[build]\n",
+            "backend = { type = \"jals-wasm\" }\n",
+            "\n[dependencies]\n",
+            "core = { wasm = \"core.wasm\", foreign = true }\n",
+        )
+        .parse()
+        .expect("the manifest parses and validates");
+        let resolved = CompilePlan::wasm_libraries(
+            directory.path(),
+            &manifest,
+            &features,
+            DependencyScope::Build,
+        )
+        .expect("a foreign module is read, not decoded");
+        assert!(resolved.libraries.is_empty(), "it is not a linked library");
+        assert_eq!(
+            resolved.foreign,
+            vec![("core".to_owned(), b"not a wasm module".to_vec())]
+        );
+
+        let plain: Manifest = concat!(
+            "[build]\n",
+            "backend = { type = \"jals-wasm\" }\n",
+            "\n[dependencies]\n",
+            "core = { wasm = \"core.wasm\" }\n",
+        )
+        .parse()
+        .expect("the manifest parses and validates");
+        let error = CompilePlan::wasm_libraries(
+            directory.path(),
+            &plain,
+            &features,
+            DependencyScope::Build,
+        )
+        .err()
+        .expect("without the flag the ABI is what decides");
+        assert!(
+            error.to_string().contains("not a linked library"),
+            "the refusal is the ABI's: {error}"
+        );
     }
 }

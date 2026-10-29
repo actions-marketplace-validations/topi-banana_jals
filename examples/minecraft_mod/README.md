@@ -1,6 +1,6 @@
-# A Minecraft mixin mod, built for every release from 1.14.4 to 26.2
+# A Minecraft mixin mod, built for every release from 1.14.4 to 26.3
 
-One mixin, one resource, one jar — and **one source tree** for all 43 releases
+One mixin, one resource, one jar — and **one source tree** for all 44 releases
 [`examples/minecraft`](../minecraft) knows. It prints a line naming the running game as the
 dedicated server object finishes construction:
 
@@ -22,7 +22,7 @@ Six declarations in `jals.toml` carry the whole thing:
 - **`[package] features = ["attributes"]`** — the jals dialect's `#[cfg(...)]`. Mojang renamed one
   API this mixin uses, so the source carries both spellings as live branches instead of the project
   carrying two source trees.
-- **`[build] script`** — a Rhai script deriving the class-file level `javac` compiles at, which is
+- **`[build] script`** — a Java script deriving the class-file level `javac` compiles at, which is
   one of the two things that vary with the release and are not names.
 - **`[build.resources] template`** — the other one: the `compatibilityLevel` the mixin configuration
   declares, rendered into the resource on its way into the jar.
@@ -30,7 +30,7 @@ Six declarations in `jals.toml` carry the whole thing:
 **Building the jar is the deliverable.** Loading it needs a Mixin-capable launcher, which jals is
 not and this example does not ship — see [Running it](#running-it).
 
-## One source tree, 43 releases
+## One source tree, 44 releases
 
 The mixin asks the game what version it is. That call has three shapes across the range, and only
 one of the two differences between them is one the source has to spell out:
@@ -72,12 +72,12 @@ The predicate is a **threshold feature**, not a version. `jals.toml` declares tw
   for every release from 1.18 up without any of the thirty-odd releases above it listing more than
   one name.
 
-There are five thresholds rather than forty-three, because a threshold exists only where something
+There are five thresholds rather than forty-four, because a threshold exists only where something
 branches on it:
 
 | threshold      | what branches on it                                          |
 | -------------- | ------------------------------------------------------------ |
-| `since-1.14.4` | `build.rhai`: was a release named at all?                     |
+| `since-1.14.4` | `build.java`: was a release named at all?                    |
 | `since-1.17`   | `--release 16`, `compatibilityLevel: JAVA_16`                 |
 | `since-1.18`   | `--release 17`, `compatibilityLevel: JAVA_17`                 |
 | `since-1.20.5` | `--release 21`, `compatibilityLevel: JAVA_21`                 |
@@ -91,11 +91,11 @@ which exists so that "no release named" stays distinguishable from "the oldest r
 `[dependencies] minecraft` leaves `default-features` at its `true` and the SDK falls back to its own
 newest release. That is no longer a build this project can do: the SDK would fall back while every
 threshold here stayed off, and the source would take its oldest branch against the newest game. So
-`build.rhai` says so instead of letting `javac` say it:
+`build.java` says so instead of letting `javac` say it:
 
 ```
 $ cargo run -p jals-cli -- build --manifest-path examples/minecraft_mod/jals.toml
-error[build-script]: select a Minecraft version feature, e.g. `--features 26.2`. There is
+error[build-script]: select a Minecraft version feature, e.g. `--features 26.3`. There is
 deliberately no default: a release chooses the game jar, the mapping set and every `#[cfg]` branch
 at once, and this project cannot see which release the SDK fell back to.
 error: the build script failed
@@ -125,7 +125,7 @@ Five selections, one source tree, and every column below read back off the packa
 Three separate mechanisms are visible in that table, and it is worth naming which is which.
 
 The first three columns of the 26.2 row are the point of the mappings design rather than a hole in
-it: those four releases ship deobfuscated and declare no mappings download, so no alternative names
+it: those five releases ship deobfuscated and declare no mappings download, so no alternative names
 them and `[build] remap` packages without rewriting — which is exactly the right jar, because the
 names already in it are the ones that runtime loads. "This selection ships no mappings" says *do not
 rewrite the names*, not *produce nothing*.
@@ -149,7 +149,7 @@ $ unzip -l target/jals/remap/hellomod-0.1.0.jar
   mixins.hellomod.json
 ```
 
-CI builds **all 43**, one cell per release, and merges the jars into a single `hellomod-jars`
+CI builds **all 44**, one cell per release, and merges the jars into a single `hellomod-jars`
 artifact attached to the run — so the five rows above are a sample of what a run produces rather
 than a claim about the releases someone remembered to check. Two of them, `1.20.1` and `1.21.11`,
 one on each side of the `since-1.21.6` branch, are additionally run through `jals fmt --check` and
@@ -196,8 +196,8 @@ address and the bytes. `max-bytes` is the published size rounded up to the next 
 what guarantees the content, so pinning an exact byte count would only ever break on a re-serve of
 identical text.
 
-To refresh the table: for each catalog entry in [`../minecraft/build.rhai`](../minecraft/build.rhai)
-whose `obfuscated?` flag is true, fetch
+To refresh the table: for each catalog entry in [`../minecraft/build.java`](../minecraft/build.java)
+whose `obfuscated` flag is true, fetch
 `https://piston-meta.mojang.com/v1/packages/<metadata sha1>/<version>.json` and project
 `downloads.server_mappings.{url, sha1, size}`.
 
@@ -246,23 +246,23 @@ appear in the mappings at all before 1.16. See the table in
 
 ## The build script
 
-`build.rhai` derives what `javac` needs that varies with the release, and it holds **no table of
-releases**. `jals.toml` already routes 43 version features into the SDK, and the SDK's own build
+`build.java` derives what `javac` needs that varies with the release, and it holds **no table of
+releases**. `jals.toml` already routes 44 version features into the SDK, and the SDK's own build
 script is what rejects a second one; a catalog here would be a second copy of that rule and the
 first of the two to drift. So the script reads the threshold chain instead — which is also why a
 release added to `jals.toml` needs nothing here at all:
 
-```rhai
-let release = 8;
-if build.feature("since-1.20.5") {
+```java
+int release = 8;
+if (Build.feature("since-1.20.5")) {
     release = 21;
-} else if build.feature("since-1.18") {
+} else if (Build.feature("since-1.18")) {
     release = 17;
-} else if build.feature("since-1.17") {
+} else if (Build.feature("since-1.17")) {
     release = 16;
 }
-build.add_javac_arg("--release");
-build.add_javac_arg("" + release);
+Build.addJavacArg("--release");
+Build.addJavacArg("" + release);
 ```
 
 `--release` rather than `source`/`target`, because only `--release` also pins the platform API the
@@ -310,7 +310,7 @@ One field of that file is per-release, so it is **rendered rather than copied**:
 }
 ```
 
-`compatibilityLevel` must be at least the class-file version `javac` produced, and `build.rhai`
+`compatibilityLevel` must be at least the class-file version `javac` produced, and `build.java`
 produces one of four. The two derivations read the same threshold chain in their own vocabularies —
 `--release 17` there, `JAVA_17` here — which is one table rather than two: the chain is in
 `jals.toml`, and neither site has a list of releases in it.
@@ -339,8 +339,8 @@ output and never receives them.
 
 ## Features
 
-The 43 version features, the five thresholds and the four SDK axes are all declared here; the two
-kinds and what reads them are [above](#one-source-tree-43-releases). Two things about the table are
+The 44 version features, the five thresholds and the four SDK axes are all declared here; the two
+kinds and what reads them are [above](#one-source-tree-44-releases). Two things about the table are
 worth adding on their own.
 
 ```toml
@@ -353,7 +353,7 @@ Declaring the version names locally is what lets `[[mappings.mojmap]]` gate on t
 `minecraft/…` entry is pure routing and is never queryable in this project.
 
 **Version exclusivity is not restated here.** The forwarded selection reaches the SDK's own build
-script, whose `build.error` rejects a second version before any download:
+script, whose `Build.error` rejects a second version before any download:
 
 ```
 $ cargo run -p jals-cli -- build --manifest-path examples/minecraft_mod/jals.toml --features 1.20.1,1.19.4
@@ -363,7 +363,7 @@ and `1.19.4`
 ```
 
 `--all-features` fails identically, for the same reason, and always will. A second copy of that
-43-row rule in this manifest would be a second thing to keep in sync.
+44-row rule in this manifest would be a second thing to keep in sync.
 
 The sentence is the SDK's own, reported where it was hit: the attribution names which dependency
 failed and the body is that dependency's diagnostic, so there is nothing to go and reproduce
@@ -372,7 +372,7 @@ snapshot this project does not own.
 
 ## JDK requirement
 
-`build.rhai` decides what the mod is compiled *to*; your JDK still decides what can be compiled *at
+`build.java` decides what the mod is compiled *to*; your JDK still decides what can be compiled *at
 all*, and the two are separate constraints. `--release 17` cannot relax the binding one: to compile
 against the SDK's classpath `javac` must be able to **read** the game's class files, and a JDK 21
 `javac` rejects a Java 25 class outright. So your JDK must be at least:
@@ -396,7 +396,7 @@ building them here.
 
 A newer JDK is always fine — `javac` accepts any `--release` between the oldest it still supports (8
 today) and its own version, and reads a *classpath* class newer than that release without complaint
-— so one JDK 25 builds all 43. CI installs exactly that one.
+— so one JDK 25 builds all 44. CI installs exactly that one.
 
 ## Running it
 
@@ -417,7 +417,7 @@ raise it.
 ## Booting the game from a test
 
 `src/test/java` holds three `#[test]` methods that start a **real Minecraft client in the test JVM**
-and assert against it — no Mixin, no java agent, no launcher, and on any of the 43 releases. What
+and assert against it — no Mixin, no java agent, no launcher, and on any of the 44 releases. What
 starts it is not here: the harness is a project of its own, `../minecraft_client_test`, and this
 project reaches it in one line.
 
@@ -438,7 +438,7 @@ cd examples/minecraft_mod
 cargo run -p jals-cli -- test --features 1.21.11,client-test -j 1
 ```
 
-Any of the 43 releases goes in place of `1.21.11` — the harness carries the `#[cfg]` branches for
+Any of the 44 releases goes in place of `1.21.11` — the harness carries the `#[cfg]` branches for
 all of them, so nothing under `src/test/java` names a release. What does vary is the JVM the client
 boots on; see [JDK requirement](#jdk-requirement).
 
@@ -479,15 +479,15 @@ Three things, and each is here because it cannot live on the other side of the e
   cells unchanged. It says nothing about the harness: the harness has no presence switch, because
   being named in `[dev-dependencies]` is already the statement that these tests boot a client.
 - **The second route on every version feature.** A feature reaches a dependency only through the
-  manifest that declares the edge, so each of the 43 rows carries its own
+  manifest that declares the edge, so each of the 44 rows carries its own
   `mc-client-test/<release>` beside its `minecraft/<release>` — the release reaches the harness by
   the route it already took to the same SDK node. It is one line per row and it is the whole of
   what this project tells the harness.
-- **`-Xmx2G`.** `build.add_jvm_arg` reaches a test JVM only from the *root* project's script, so a
-  dependency cannot contribute it. `build.rhai` writes the line; without it the boot dies inside the
+- **`-Xmx2G`.** `Build.addJvmArg` reaches a test JVM only from the *root* project's script, so a
+  dependency cannot contribute it. `build.java` writes the line; without it the boot dies inside the
   resource reload with an `OutOfMemoryError`.
 
-Everything else — the harness class and its fourteen thresholds, the 2287 pinned runtime libraries,
+Everything else — the harness class and its fourteen thresholds, the 2352 pinned runtime libraries,
 the `Executor` hinge, the daemon-thread and watchdog dance `jals test` forces, and why there is no
 native directory and no asset store — is documented in [`../minecraft_client_test/README.md`](../minecraft_client_test/README.md).
 

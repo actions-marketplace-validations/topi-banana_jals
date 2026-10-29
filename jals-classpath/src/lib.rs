@@ -20,7 +20,11 @@ mod load;
 #[cfg(feature = "archive")]
 mod manifest;
 #[cfg(feature = "archive")]
+mod mapping_text;
+#[cfg(feature = "archive")]
 mod mappings;
+#[cfg(feature = "native")]
+mod maven;
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "archive")]
@@ -30,7 +34,7 @@ mod remap;
 #[cfg(feature = "archive")]
 mod zip;
 
-pub use io::{FetchError, Fetcher, NetworkPolicy, RetrySchedule};
+pub use io::{Fetch, FetchError, Fetcher, NetworkPolicy, RetrySchedule};
 pub use resolve::{
     DependencyLocation, DependencyResolver, DependencySpec, ExpectedDigest,
     ExternalArtifactResolver, ExternalArtifactSpec, ExternalLocator, MappingLocation,
@@ -45,11 +49,17 @@ pub use load::{
     CachedJar, ClasspathCoverage, ClasspathEntry, ClasspathLoad, JarExtraction, SourceTree,
     SourceTreeExtraction, SourceTreeLimits,
 };
+#[cfg(feature = "archive")]
+pub use mapping_text::MappingText;
 #[cfg(feature = "native")]
-pub use native::{NativeProjectPlan, ReqwestFetcher};
+pub use native::{
+    LockMode, NativeProjectPlan, RegistryGraphs, RegistryResolution, RegistryResolver,
+    ReqwestFetcher,
+};
 #[cfg(feature = "archive")]
 pub use project::{
-    MemoryProjectPlan, ProjectInputOptions, ProjectInputPlan, ProjectInputs, SourceFile,
+    MemoryProjectPlan, ProjectInputOptions, ProjectInputPlan, ProjectInputs, RegistryStatus,
+    SourceFile,
 };
 #[cfg(feature = "archive")]
 pub use remap::{JarMerge, JarRemap, JarTransforms, NestedJar, RemapRequest};

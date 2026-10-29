@@ -164,6 +164,11 @@ impl Execute {
             // The implementations of every `native` method the module imports. Empty for a project
             // that selected no package, which is what a module with no import section needs.
             natives: &natives.bindings(),
+            // The browser playground has no filesystem to resolve a `wasm` dependency from, so a
+            // project that links one is a host-only arrangement for now.
+            libraries: &[],
+            foreign: &[],
+            fuel: None,
             progress: &jals_progress::Progress::SILENT,
         };
         let outcome = WasmRunner::run(&request).map_err(|error| error.to_string())?;
@@ -243,6 +248,7 @@ impl Compile {
             // from the classpath, so resolved dependency jars do not participate — the same `&[]`
             // `jals-cli` passes.
             classpath: &[],
+            libraries: &[],
             options: &options,
         };
         let outcome = backend
@@ -320,7 +326,7 @@ impl Compile {
         // The `[build.frontend]` decision — and the dialect features that override it — belongs to
         // `jals-frontend`, which is why this reads like the CLI's call rather than mirroring its
         // body. No command line in a browser, so `#[cfg(feature = "…")]` sees the manifest's own
-        // `default` list: the same selection the Rhai build script ran under. A malformed
+        // `default` list: the same selection the Java build script ran under. A malformed
         // `[features]` table degrades to the empty set here rather than failing the compile — the
         // manifest editor is live, and the build script already ran under the same fallback.
         let build_features = manifest
@@ -418,14 +424,14 @@ mod tests {
         ]
     }
 
-    /// The seed Rhai script generates a `public static final String MESSAGE = …` class, and every
+    /// The seed Java script generates a `public static final String MESSAGE = …` class, and every
     /// compile sees it — the build script runs on page load and its output joins the index. A
     /// `String`-typed `static` field must therefore be inert on *both* backends, or flipping
     /// `[build] backend` to `jals-wasm` would fail on a file the user never wrote.
     #[test]
     fn a_generated_static_string_field_does_not_block_either_backend() {
         let generated = (
-            "target/jals/build/rhai/out/com/example/BuildInfo.java".to_owned(),
+            "target/jals/build/script/out/com/example/BuildInfo.java".to_owned(),
             "package com.example;\n\
              public final class BuildInfo {\n\
              public static final String MESSAGE = \"Generated in the browser\";\n\

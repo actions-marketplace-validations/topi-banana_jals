@@ -12,14 +12,15 @@
 //! needs the whole project's types resolved. Compiling file-by-file would mean each file seeing an
 //! index that does not contain its siblings.
 
+use alloc::borrow::ToOwned as _;
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 
 use jals_hir::{FileAnalysis, FileId, FileSemantics, ProjectIndex, TypedFile};
 use jals_javac::lower::Compile;
-use jals_javac::wasm::CompileWasm;
+use jals_javac::wasm::{CompileWasm, WasmError};
 use jals_progress::{Activity, Outcome};
 use jals_storage::{ContentDigest, ProvenanceFold, RelativePath};
 use jals_syntax::{Parse, SyntaxNode};
@@ -74,6 +75,85 @@ impl JalsBackend {
         u16::try_from(release)
             .unwrap_or(u16::MAX)
             .saturating_add(44)
+    }
+
+    /// A wasm compile failure as a host reports it: `path:line:column: reason` when the lowering
+    /// knew where it happened, and the reason alone when it did not.
+    ///
+    /// A class-file backend prints that shape itself — `javac` writes `path:line: error: …` and
+    /// this backend passes its output through — while the wasm compiler is in-process and its
+    /// positions are formatted here. The file id numbers what the host handed over: the project's
+    /// sources first, then the selected packages' Java, then each linked library's, so resolving
+    /// one is walking those same lists in the same order.
+    fn wasm_failure(
+        error: &WasmError,
+        request: &BackendRequest<'_>,
+        natives: &NativePackageSet,
+        linked: &[jals_javac::wasm::LinkedLibrary<'_>],
+    ) -> String {
+        let Some((file, range)) = error.location() else {
+            return format!("{error}");
+        };
+        let Some((path, text)) = Self::wasm_source(file, request, natives, linked) else {
+            return format!("{error}");
+        };
+        let (line, column) = Self::line_column(text, range.start);
+        format!("{path}:{line}:{column}: {error}")
+    }
+
+    /// The path and text of the file a wasm compile failure happened in, when it was one of the
+    /// sources the compile was handed.
+    fn wasm_source<'a>(
+        file: FileId,
+        request: &'a BackendRequest<'_>,
+        natives: &'a NativePackageSet,
+        linked: &'a [jals_javac::wasm::LinkedLibrary<'_>],
+    ) -> Option<(String, &'a str)> {
+        let mut remaining = usize::try_from(file.0).ok()?;
+        if let Some(source) = request.tree.get(remaining) {
+            return core::str::from_utf8(&source.bytes)
+                .ok()
+                .map(|text| (source.path.to_string(), text));
+        }
+        remaining -= request.tree.len();
+        for (_, source) in natives.lowered_sources() {
+            if remaining == 0 {
+                return Some((source.path.to_owned(), source.text));
+            }
+            remaining -= 1;
+        }
+        for library in linked {
+            for source in &library.abi.sources {
+                if remaining == 0 {
+                    return Some((source.path.clone(), source.text.as_str()));
+                }
+                remaining -= 1;
+            }
+        }
+        None
+    }
+
+    /// The 1-based line and character column a byte offset falls on.
+    ///
+    /// Characters rather than bytes for the column: what a person points at is what is drawn, and a
+    /// multi-byte character before the failure would otherwise push the column past the mark.
+    fn line_column(text: &str, offset: usize) -> (usize, usize) {
+        let offset = offset.min(text.len());
+        let mut line = 1;
+        let mut start = 0;
+        for (index, character) in text.char_indices() {
+            if index >= offset {
+                break;
+            }
+            if character == '\n' {
+                line += 1;
+                start = index + 1;
+            }
+        }
+        let column = text
+            .get(start..offset)
+            .map_or(1, |rest| rest.chars().count() + 1);
+        (line, column)
     }
 
     /// A backend emitting class files for `release` (`--release N`), defaulting to Java 25 when the
@@ -141,9 +221,55 @@ impl JalsBackend {
         // module's exported surface, which is why it travels as a second list all the way into
         // `CompileWasm::project` rather than being appended here.
         let project_files = roots.len();
-        for (offset, (_, source)) in self.natives.sources().enumerate() {
+        for (offset, (_, source)) in self.natives.lowered_sources().enumerate() {
             let file = FileId(u32::try_from(project_files + offset).unwrap_or(u32::MAX));
             roots.push((file, Parse::parse(source.text).await.syntax()));
+        }
+        // Every linked library — a `wasm` dependency or a selected package that shipped a module
+        // instead of sources — decoded from the ABI its own section carries. Decoding once is also
+        // the check: a module that is not a linked library fails here, under the name it was
+        // selected by, rather than at instantiation in the engine's vocabulary.
+        let mut linked: Vec<(String, jals_javac::wasm::LibraryAbi)> = Vec::new();
+        for (name, bytes) in self.natives.libraries() {
+            match jals_javac::wasm::LibraryAbi::of_module(bytes) {
+                Ok(abi) => linked.push((name.to_owned(), abi)),
+                Err(error) => messages.push(format!("native package `{name}`: {error}")),
+            }
+        }
+        for library in request.libraries {
+            // One link name is one module: the engine registers an import module per name, so a
+            // second module under it would resolve the first's imports while its own went to the
+            // wrong code — or fail in the engine's vocabulary, far from either declaration. A
+            // `wasm` dependency and a selected native package are the two ways a name can arrive,
+            // and this is the one place both halves are in hand.
+            if self
+                .natives
+                .libraries()
+                .any(|(name, _)| name == library.name)
+            {
+                messages.push(format!(
+                    "`{}` is both a `wasm` dependency and a selected native package: a link \
+                     name must identify one module",
+                    library.name
+                ));
+            }
+            linked.push((library.name.clone(), library.abi.clone()));
+        }
+        if !messages.is_empty() {
+            report.finish(Outcome::Failed);
+            return BackendOutcome::failed(messages);
+        }
+        // A linked library's published Java, indexed but never lowered: the code is already in the
+        // library's own module, and what the project needs from the text is resolution. The text
+        // is the same Java the library compiled, so the API the index reads and the code that runs
+        // cannot drift.
+        let mut library_roots: Vec<(FileId, SyntaxNode)> = Vec::new();
+        for (_, abi) in &linked {
+            for source in &abi.sources {
+                let file =
+                    FileId(u32::try_from(roots.len() + library_roots.len()).unwrap_or(u32::MAX));
+                library_roots.push((file, Parse::parse(&source.text).await.syntax()));
+            }
         }
 
         // Each file's own analysis first: it needs no index, so it is the half that could be
@@ -153,14 +279,15 @@ impl JalsBackend {
             analyses.push(FileAnalysis::of(root).await);
         }
 
-        // The stdlib stubs stand in for `java.base`: the JVM supplies the implementations at run
-        // time, so a compile only ever needs the signatures. A native package's Java is the
-        // opposite case and is folded in as its own origin: it *is* compiled into the artifact, so
-        // what it does not declare the program does not have, and it outranks a stub of the same
-        // name.
+        // The stdlib stubs stand in for the JDK types a compile does not implement: on the JVM the
+        // implementations are supplied at run time, so a compile only ever needs the signatures —
+        // and on this target, where the implementations are linked in as a package, a package's Java
+        // outranks the stub of the same name. A native package's Java is that opposite case: it *is*
+        // compiled into the artifact, so what it does not declare the program does not have.
         let (project_roots, native_roots) = roots.split_at(project_files);
         let index = ProjectIndex::builder(project_roots)
             .with_native_packages(native_roots)
+            .with_source_deps(&library_roots)
             .with_stdlib()
             .build()
             .await;
@@ -186,15 +313,32 @@ impl JalsBackend {
                 // The whole project is one module, so this arm *is* the wasm compile — and it
                 // returns past the `finish` below. Ending the unit here is what keeps a green
                 // wasm build from reporting `Abandoned`, which says the emitter has a hole in it.
-                let options = jals_javac::wasm::WasmOptions { assertions };
-                let outcome =
-                    match CompileWasm::project(typed_project, typed_natives, &index, options) {
-                        Ok(module) => match RelativePath::parse(Self::WASM_MODULE) {
-                            Ok(path) => BackendOutcome::compiled(alloc::vec![(path, module)]),
-                            Err(error) => BackendOutcome::failed(alloc::vec![format!("{error:?}")]),
-                        },
-                        Err(error) => BackendOutcome::failed(alloc::vec![format!("{error}")]),
-                    };
+                let options = jals_javac::wasm::WasmOptions {
+                    assertions,
+                    ..jals_javac::wasm::WasmOptions::default()
+                };
+                let linked: Vec<jals_javac::wasm::LinkedLibrary<'_>> = linked
+                    .iter()
+                    .map(|(name, abi)| jals_javac::wasm::LinkedLibrary { name, abi })
+                    .collect();
+                let outcome = match CompileWasm::project_linked(
+                    typed_project,
+                    typed_natives,
+                    &linked,
+                    &index,
+                    options,
+                ) {
+                    Ok(module) => match RelativePath::parse(Self::WASM_MODULE) {
+                        Ok(path) => BackendOutcome::compiled(alloc::vec![(path, module)]),
+                        Err(error) => BackendOutcome::failed(alloc::vec![format!("{error:?}")]),
+                    },
+                    Err(error) => BackendOutcome::failed(alloc::vec![Self::wasm_failure(
+                        &error,
+                        request,
+                        &self.natives,
+                        &linked,
+                    )]),
+                };
                 report.finish(if outcome.success() {
                     Outcome::Completed
                 } else {
@@ -230,6 +374,37 @@ impl JalsBackend {
             report.finish(Outcome::Failed);
             BackendOutcome::failed(messages)
         }
+    }
+
+    /// Every Java compilation unit a selected native package publishes for the **index**, as
+    /// `(path, text)`.
+    ///
+    /// A source package contributes the Java it declares; a package that ships a precompiled
+    /// module contributes the Java its module's `jals.library` section publishes — the same text
+    /// the library compiled against, so the declarations a reader resolves and the code that runs
+    /// cannot drift. This is the half an editor or a linter wants; what the consumer *lowers* is
+    /// [`lowered_sources`](jals_native::NativePackageSet::lowered_sources), which a
+    /// library-shipping package contributes nothing to.
+    ///
+    /// A module the ABI cannot be read from yields nothing here: the compile is where its bytes
+    /// are reported, under the package name it was selected by, and a host that only indexes has
+    /// no better answer than to leave it out — the same way an unresolved classpath entry
+    /// degrades the analysis instead of stopping it.
+    pub fn native_package_sources(selection: &NativePackageSet) -> Vec<(String, String)> {
+        let mut sources = Vec::new();
+        for (_, source) in selection.lowered_sources() {
+            sources.push((source.path.to_owned(), source.text.to_owned()));
+        }
+        for (_, bytes) in selection.libraries() {
+            if let Ok(abi) = jals_javac::wasm::LibraryAbi::of_module(bytes) {
+                sources.extend(
+                    abi.sources
+                        .iter()
+                        .map(|source| (source.path.clone(), source.text.clone())),
+                );
+            }
+        }
+        sources
     }
 }
 
@@ -269,6 +444,13 @@ impl Backend for JalsBackend {
             // nothing can observe one — which is why a package carries an author-set version and
             // that version is in here.
             .bytes(&self.natives.provenance());
+        // A linked library is an input like a source file: its published API, its types, and the
+        // module it will run from. The ABI's own encoding is deterministic, so folding it is
+        // folding exactly what the compile read.
+        for library in request.libraries {
+            fold.bytes(library.name.as_bytes())
+                .bytes(&library.abi.write());
+        }
         fold.finish()
     }
 
@@ -328,6 +510,7 @@ mod tests {
             progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
+            libraries: &[],
             options: &options,
         };
 
@@ -363,6 +546,7 @@ mod tests {
             progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
+            libraries: &[],
             options: &options,
         };
 
@@ -375,6 +559,40 @@ mod tests {
                 .iter()
                 .any(|m| m.starts_with("Arrays.java")),
             "expected a message naming the file, got {:?}",
+            outcome.messages
+        );
+    }
+
+    /// A wasm compile failure names the source position it happened on.
+    ///
+    /// The lowering records the innermost expression or statement whose lowering failed — see
+    /// `WasmError::location` — and this is the host side of it: the file id resolved back to the
+    /// path the request carried, the byte range into a line and a character column, and the reason
+    /// last.
+    #[test]
+    fn a_wasm_compile_failure_names_the_source_position() {
+        let tree = [source(
+            "Arrays.java",
+            "public class Arrays {\n    public static void m(int[] a) {\n        a.length = 1;\n    }\n}\n",
+        )];
+        let options = BackendOptions::default();
+        let request = BackendRequest {
+            progress: &jals_progress::Progress::SILENT,
+            tree: &tree,
+            classpath: &[],
+            libraries: &[],
+            options: &options,
+        };
+
+        let backend = JalsBackend::wasm(crate::Assertions::Disabled, NativePackageSet::empty());
+        let outcome = jals_exec::block_on_inline(backend.compile(&request)).expect("compile");
+        assert!(!outcome.success());
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|message| message.starts_with("Arrays.java:3:9:")),
+            "expected the failing line and column in front of the reason, got {:?}",
             outcome.messages
         );
     }
@@ -403,6 +621,7 @@ mod tests {
             progress: &jals_progress::Progress::SILENT,
             tree: &tree,
             classpath: &[],
+            libraries: &[],
             options: &options,
         };
         assert_ne!(

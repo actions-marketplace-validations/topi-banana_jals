@@ -207,6 +207,13 @@ pub enum Instr {
     Unreachable,
     Return,
     Call(u32),
+    /// `call_ref $type` — call the function reference on the stack.
+    ///
+    /// The operand is a *type* index, not a function one: the reference's own type has to be a
+    /// subtype of it, which is how two modules that replayed the same recursive group agree on a
+    /// dispatch slot without exchanging function indices. Arguments are pushed first, the reference
+    /// last.
+    CallRef(u32),
     Drop,
 
     // --- locals and globals -------------------------------------------------
@@ -276,6 +283,11 @@ pub enum Instr {
     I32Extend16S,
 
     // --- garbage-collected heap ---------------------------------------------
+    /// Allocate a struct from the field values already on the stack, first field deepest.
+    ///
+    /// The non-default form exists for fields a default cannot spell — a funcref slot is the one
+    /// this backend has, since `ref.null func` is not what a dispatch table should hold.
+    StructNew(u32),
     /// Allocate a struct with every field at its type's default. This is Java's `new`, and the
     /// host's collector owns the result from here on.
     StructNewDefault(u32),
@@ -287,6 +299,15 @@ pub enum Instr {
     /// Allocate an array from the values already on the stack, first element deepest — Java's
     /// `{1, 2, 3}`, where the elements are written rather than defaulted.
     ArrayNewFixed(u32, u32),
+    /// `array.new_data` — allocate an array whose elements are copied from a passive data segment,
+    /// taking a byte offset into the segment and an element count, in that order, on the stack.
+    ///
+    /// The elements are read whole: one element per `size(t)` bytes in the element type's own
+    /// little-endian representation. This is how a Java string literal materialises — one
+    /// instruction for the whole `char[]` rather than an `i32.const` / `array.set` pair per
+    /// character — and `Module::finish` writes the data count section that makes the data index
+    /// nameable.
+    ArrayNewData(u32, u32),
     ArrayGet(u32),
     ArraySet(u32),
     ArrayLen,
@@ -294,6 +315,13 @@ pub enum Instr {
     // --- references ---------------------------------------------------------
     /// `ref.null` — Java's `null`, which has no type of its own.
     RefNull(HeapType),
+    /// `ref.func $index` — the function at that index as a first-class value.
+    ///
+    /// A function reference is what a linked dispatch slot holds: the module that defines the
+    /// method makes one, the module that calls through the slot receives it, and `call_ref` names
+    /// the function type both sides replayed. The function has to be *declared* for this to
+    /// validate, which [`Module::finish`](super::Module::finish) collects from the bodies.
+    RefFunc(u32),
     /// `ref.is_null`, which is how `x == null` is asked without a second operand.
     RefIsNull,
     /// `ref.eq` — reference identity, which is what Java's `==` means over two references.
@@ -405,6 +433,9 @@ impl Instr {
             Self::Call(func) => {
                 out.byte(0x10).u32(*func);
             }
+            Self::CallRef(ty) => {
+                out.byte(0x14).u32(*ty);
+            }
             Self::Drop => {
                 out.byte(0x1A);
             }
@@ -501,6 +532,9 @@ impl Instr {
             }
 
             // --- garbage-collected heap ---
+            Self::StructNew(ty) => {
+                Self::gc(out, 0x00).u32(*ty);
+            }
             Self::StructNewDefault(ty) => {
                 Self::gc(out, 0x01).u32(*ty);
             }
@@ -516,6 +550,9 @@ impl Instr {
             Self::ArrayNewFixed(ty, count) => {
                 Self::gc(out, 0x08).u32(*ty).u32(*count);
             }
+            Self::ArrayNewData(ty, data) => {
+                Self::gc(out, 0x09).u32(*ty).u32(*data);
+            }
             Self::ArrayGet(ty) => {
                 Self::gc(out, 0x0B).u32(*ty);
             }
@@ -530,6 +567,9 @@ impl Instr {
             Self::RefNull(heap) => {
                 out.byte(0xD0);
                 heap.write_to(out);
+            }
+            Self::RefFunc(index) => {
+                out.byte(0xD2).u32(*index);
             }
             Self::RefIsNull => {
                 out.byte(0xD1);
@@ -690,6 +730,15 @@ impl Insn {
         self.push(Instr::Call(func))
     }
 
+    /// `call_ref $ty` — call the function reference that is on top of the stack, above whatever
+    /// arguments the callee takes.
+    ///
+    /// The operand names the function type both modules replayed, not a function: a linked
+    /// dispatch slot carries no index into the other module's function space.
+    pub fn call_ref(&mut self, ty: u32) -> &mut Self {
+        self.push(Instr::CallRef(ty))
+    }
+
     pub fn drop(&mut self) -> &mut Self {
         self.push(Instr::Drop)
     }
@@ -807,6 +856,12 @@ impl Insn {
         self.push(Instr::StructNewDefault(ty))
     }
 
+    /// Allocate a struct of type `ty` from one value per field already on the stack, first field
+    /// deepest. The form a linked dispatch table needs: a funcref field has no default to take.
+    pub fn struct_new(&mut self, ty: u32) -> &mut Self {
+        self.push(Instr::StructNew(ty))
+    }
+
     pub fn struct_get(&mut self, ty: u32, field: u32) -> &mut Self {
         self.push(Instr::StructGet(ty, field))
     }
@@ -827,6 +882,15 @@ impl Insn {
         self.push(Instr::ArrayNewFixed(ty, count))
     }
 
+    /// Allocate an array of type `ty` with its elements copied from data segment `data`, taking a
+    /// byte offset into the segment and an element count on the stack, offset deepest. The offset
+    /// and the count are in different units — bytes in, elements out — and the validator checks
+    /// that `offset + count * size(t)` stays inside the segment, so a mismatch is refused before
+    /// anything runs it.
+    pub fn array_new_data(&mut self, ty: u32, data: u32) -> &mut Self {
+        self.push(Instr::ArrayNewData(ty, data))
+    }
+
     pub fn array_get(&mut self, ty: u32) -> &mut Self {
         self.push(Instr::ArrayGet(ty))
     }
@@ -844,6 +908,11 @@ impl Insn {
     /// `ref.null` of a concrete type — Java's `null`, which has no type of its own.
     pub fn ref_null(&mut self, heap: HeapType) -> &mut Self {
         self.push(Instr::RefNull(heap))
+    }
+
+    /// `ref.func $index` — the function as a value, for a slot another module will call.
+    pub fn ref_func(&mut self, index: u32) -> &mut Self {
+        self.push(Instr::RefFunc(index))
     }
 
     /// `ref.is_null`, which is how `x == null` is asked without a second operand.

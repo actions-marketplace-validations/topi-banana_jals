@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -20,6 +21,11 @@ use jals_config::{
 };
 use jals_exec::tokio_rt::{on_blocking_pool, sleep_millis};
 use jals_progress::{Progress, Task};
+use jals_resolve::id::{PackageId, PackageName, RegistryId, SourceId};
+use jals_resolve::lock::Lockfile;
+use jals_resolve::resolve::{ResolveGraph, Resolver};
+use jals_resolve::summary::{RootRequest, SourceRequest};
+use jals_resolve::version::Version;
 use jals_storage::{
     CacheKey, CacheNamespace, ContentDigest, DirKey, EntryRef, FileKey, MemoryCache, Name,
     NativeScope, NativeSource, NativeStorage, ProjectStorage, ProjectView, ProvenanceFold,
@@ -27,11 +33,451 @@ use jals_storage::{
 };
 
 use crate::io::Fetch;
+use crate::maven::{ArtifactType, Coordinate, MavenProvider};
 use crate::{
-    ClasspathEntry, DependencyLocation, ExternalLocator, FetchError, Fetcher, LibrarySource,
-    NetworkPolicy, ProjectInputOptions, ProjectInputPlan, ProjectInputs, RetrySchedule, Warning,
-    WarningOrigin,
+    ClasspathEntry, DependencyLocation, DependencySpec, ExternalLocator, FetchError, Fetcher,
+    LibrarySource, NetworkPolicy, ProjectInputOptions, ProjectInputPlan, ProjectInputs,
+    RegistryStatus, RetrySchedule, Warning, WarningOrigin,
 };
+
+/// The lock a host reads before registry resolution and receives back afterwards.
+///
+/// The host owns persistence: this crate performs the resolution and hands back the lock it
+/// produced, because writing a file beside the manifest is a host concern (`jals-cli` reads and
+/// writes `jals.lock` next to the project root; the language server passes `None` and drops the
+/// result).
+#[derive(Debug, Clone)]
+pub struct RegistryResolution {
+    /// The previous `jals.lock`, when the host has one. Pins survive resolution.
+    pub lock: Option<Lockfile>,
+    /// Whether the classpath pass also generates the lock. A host that already resolved a
+    /// workspace-wide lock (because one file covers every member) clears this, so the
+    /// member-scoped pass pins against the lock without shrinking it.
+    pub generate_lock: bool,
+    /// The lock this resolution produced, when at least one registry dependency was resolved.
+    pub resolved_lock: Option<Lockfile>,
+    /// The external packages that were resolved, id-sorted, for hosts that render a tree.
+    pub packages: Vec<PackageName>,
+    /// Warnings resolution produced without failing.
+    warnings: Vec<String>,
+}
+
+impl Default for RegistryResolution {
+    fn default() -> Self {
+        Self {
+            lock: None,
+            generate_lock: true,
+            resolved_lock: None,
+            packages: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl RegistryResolution {
+    /// A resolution with no lock preference and no outcome yet.
+    fn new(lock: Option<Lockfile>) -> Self {
+        Self {
+            lock,
+            ..Self::default()
+        }
+    }
+
+    /// Parse a host's `jals.lock` text, when there is one.
+    ///
+    /// # Errors
+    /// [`jals_resolve::lock::LockError`] for a malformed or unsupported lock. A host decides
+    /// whether that is fatal (it is for `jals build`) or ignorable.
+    pub fn from_lock_text(text: Option<&str>) -> Result<Self, jals_resolve::lock::LockError> {
+        match text {
+            Some(text) => Ok(Self::new(Some(Lockfile::parse(text)?))),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// The lockfile spelling of the outcome, for a host that compares before writing.
+    pub fn resolved_text(&self) -> Option<String> {
+        self.resolved_lock.as_ref().map(Lockfile::render)
+    }
+}
+
+/// Which lock pass a registry resolution performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Also resolve with every registry entry (and every dev entry) active, so the lock is the
+    /// same whatever `--features` selects.
+    Generate,
+    /// Resolve only the selection's graph and produce no lock. The language server's case: it
+    /// needs the classpath, not the file.
+    Skip,
+}
+
+/// One manifest's registry resolution: the classpath specs for the selection and the lock over
+/// everything it declares.
+#[derive(Debug, Default)]
+pub struct RegistryGraphs {
+    /// External dependency specs for the selected classpath, in resolver order.
+    pub specs: Vec<DependencySpec>,
+    /// Artifact specs that are fetched into the verified cache but are not classpath entries: a
+    /// `tar.gz` native bundle, a `war`, a classified `-sources` jar. The lock records the package
+    /// either way; only a jar can be a classpath entry.
+    ///
+    /// Private: the only reader is `NativeProjectPlan`, in this module, which folds these into
+    /// the plan's auxiliary half. Nothing outside `jals_classpath` sees this field, and
+    /// `RegistryGraphs` is not constructible outside it either (`warnings` is private), so any
+    /// wider visibility would be a wider surface than anything can reach.
+    artifacts: Vec<DependencySpec>,
+    /// The feature-independent lock, when one was generated *and* carries at least one package.
+    /// An empty lock is not a lock: a project with no registry dependency has nothing to pin, and
+    /// writing `version = 1` alone would make `--locked` demand a file nothing resolves against.
+    pub lock: Option<Lockfile>,
+    /// Names in the lock (or the selected graph when no lock was generated), id-sorted.
+    pub packages: Vec<PackageName>,
+    /// Non-fatal messages from either pass: a `[package] version` fallback, or an advisory the
+    /// resolver itself produced.
+    pub warnings: Vec<String>,
+}
+
+/// Registry resolution as a standalone step.
+///
+/// `jals-classpath`'s classpath phase and `jals-cli`'s `jals update` share this: one resolves the
+/// selected graph and generates the lock alongside it; the other generates the lock alone. Both
+/// go through one [`MavenProvider`], so a two-pass resolution (selection + full lock) fetches
+/// each POM once.
+pub struct RegistryResolver;
+
+impl RegistryResolver {
+    /// Resolve `manifest`'s registry dependencies.
+    ///
+    /// # Errors
+    /// A lowering error, or any resolver failure (no matching version, conflicting requirements,
+    /// provider I/O). The caller decides whether that is fatal (`jals update`) or a warning
+    /// (a classpath phase that would otherwise compile with a silently short classpath).
+    pub async fn resolve<F: Fetcher>(
+        manifest: &Manifest,
+        scope: DependencyScope,
+        features: &ResolvedBuildFeatures,
+        fetcher: &F,
+        lock: Option<&Lockfile>,
+        mode: LockMode,
+    ) -> Result<RegistryGraphs, String> {
+        let registries = Self::registry_urls(manifest);
+        let mut provider = MavenProvider::new(fetcher, registries.clone());
+        let mut warnings: Vec<String> = Vec::new();
+        let selected_root = Self::root_request(manifest, features, scope, false, &mut warnings)?;
+        let selected = Resolver::new(&mut provider)
+            .resolve(&[selected_root], lock)
+            .await
+            .map_err(|error| error.to_string())?;
+        warnings.extend(selected.warnings.iter().map(ToString::to_string));
+        // The lock must not move with the feature selection: a run that activates an optional
+        // entry would otherwise rewrite it and every other selection would rewrite it back. So
+        // the lock is generated from a second pass with every registry entry (dev included)
+        // forced active, and the shared provider makes its extra POM reads cache hits.
+        let lockfile = if mode == LockMode::Generate {
+            if Self::needs_full_pass(manifest, scope) {
+                let full_root = Self::root_request(manifest, features, scope, true, &mut warnings)?;
+                let full = Resolver::new(&mut provider)
+                    .resolve(&[full_root], lock)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                warnings.extend(full.warnings.iter().map(ToString::to_string));
+                Some(full.lockfile())
+            } else {
+                Some(selected.lockfile())
+            }
+        } else {
+            None
+        };
+        // An empty lock is not a lock. `RegistryGraphs::lock` gates a host's write, so a manifest
+        // with no registry package must hand back `None` rather than `version = 1` alone: a
+        // `--locked` build of such a project must not demand a file nothing resolves against.
+        let lockfile = lockfile.filter(|lock| !lock.packages.is_empty());
+        let (specs, artifacts) = Self::specs(&selected, &registries, provider.artifact_types());
+        let packages = match &lockfile {
+            Some(lock) => lock
+                .packages
+                .iter()
+                .map(|package| package.id.name.clone())
+                .collect(),
+            None => selected
+                .packages
+                .iter()
+                .map(|package| package.id.name.clone())
+                .collect(),
+        };
+        Ok(RegistryGraphs {
+            specs,
+            artifacts,
+            lock: lockfile,
+            packages,
+            warnings,
+        })
+    }
+
+    /// Whether the lock pass differs from the selected pass: an optional registry entry the
+    /// selection may not activate (in either table), or a dev entry a build-scope selection
+    /// excludes.
+    fn needs_full_pass(manifest: &Manifest, scope: DependencyScope) -> bool {
+        let optional = manifest
+            .dependencies
+            .values()
+            .chain(manifest.dev_dependencies.values())
+            .any(|entry| entry.registry_version().is_some() && entry.is_optional());
+        let dev = manifest
+            .dev_dependencies
+            .values()
+            .any(|entry| entry.registry_version().is_some());
+        optional || (dev && scope != DependencyScope::Test)
+    }
+
+    /// Resolve every workspace member into **one** lock.
+    ///
+    /// Each member is a root, so a transitive package two members share is one package — the
+    /// resolver's one-version-per-name rule makes the workspace's classpaths agree. `specs` is
+    /// empty: a workspace lock says what the members resolve to, and each member's own classpath
+    /// phase then resolves its selection against the written lock.
+    ///
+    /// # Errors
+    /// Two members with one package name, two declarations of one registry name with different
+    /// URLs, a lowering failure, or any resolver failure.
+    pub async fn resolve_workspace<F: Fetcher>(
+        members: &[&Manifest],
+        fetcher: &F,
+        lock: Option<&Lockfile>,
+    ) -> Result<RegistryGraphs, String> {
+        let registries = Self::merged_registries(members)?;
+        let mut provider = MavenProvider::new(fetcher, registries);
+        let defaults = ResolvedBuildFeatures::default();
+        let mut roots = Vec::with_capacity(members.len());
+        let mut names = BTreeSet::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for manifest in members {
+            let root = Self::root_request(
+                manifest,
+                &defaults,
+                DependencyScope::Test,
+                true,
+                &mut warnings,
+            )?;
+            let name = root.summary.id.name.to_string();
+            if !names.insert(name.clone()) {
+                return Err(format!(
+                    "two workspace members are named `{name}`; member names must be unique"
+                ));
+            }
+            roots.push(root);
+        }
+        let graph = Resolver::new(&mut provider)
+            .resolve(&roots, lock)
+            .await
+            .map_err(|error| error.to_string())?;
+        warnings.extend(graph.warnings.iter().map(ToString::to_string));
+        let packages: Vec<PackageName> = graph
+            .packages
+            .iter()
+            .map(|package| package.id.name.clone())
+            .collect();
+        Ok(RegistryGraphs {
+            specs: Vec::new(),
+            // A workspace pass produces the lock alone; each member's own pass builds specs.
+            artifacts: Vec::new(),
+            // An empty lock is not a lock, exactly as in `resolve`: a workspace with no registry
+            // package must not make its host write `version = 1` (nor fail `--locked` against it).
+            lock: (!packages.is_empty()).then(|| graph.lockfile()),
+            packages,
+            warnings,
+        })
+    }
+
+    /// Push a root-request warning once: the lock pass asks the same manifest the same question
+    /// and would otherwise restate the same complaint in the same run.
+    fn warn_once(warnings: &mut Vec<String>, message: String) {
+        if !warnings.contains(&message) {
+            warnings.push(message);
+        }
+    }
+
+    /// The version resolution uses when a manifest names no version or one that does not parse.
+    /// The root is not a lock entry; its version matters only to a requirement naming the root
+    /// package, so the fallback is harmless — being silent about it was not.
+    fn fallback_version() -> Version {
+        Version::parse("0.0.0").expect("`0.0.0` parses")
+    }
+
+    /// Union of every member's `[registries]`, rejecting one name with two URLs.
+    fn merged_registries(members: &[&Manifest]) -> Result<BTreeMap<String, String>, String> {
+        let mut merged: BTreeMap<String, String> = BTreeMap::new();
+        for manifest in members {
+            for (name, registry) in &manifest.registries {
+                match merged.get(name) {
+                    Some(url) if url != &registry.url => {
+                        return Err(format!(
+                            "registry `{name}` is declared with two different URLs (`{url}` and \
+                             `{}`)",
+                            registry.url
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        merged.insert(name.clone(), registry.url.clone());
+                    }
+                }
+            }
+        }
+        merged
+            .entry(RegistryId::MAVEN_CENTRAL.to_owned())
+            .or_insert_with(|| "https://repo1.maven.org/maven2".to_owned());
+        Ok(merged)
+    }
+
+    /// The registry name → base URL map, with the implicit `maven-central` default.
+    fn registry_urls(manifest: &Manifest) -> BTreeMap<String, String> {
+        let mut registries: BTreeMap<String, String> = manifest
+            .registries
+            .iter()
+            .map(|(name, registry)| (name.clone(), registry.url.clone()))
+            .collect();
+        registries
+            .entry(RegistryId::MAVEN_CENTRAL.to_owned())
+            .or_insert_with(|| "https://repo1.maven.org/maven2".to_owned());
+        registries
+    }
+
+    /// The root request for one pass.
+    ///
+    /// `force_all` clears `optional` on every retained registry edge and includes the dev table,
+    /// which is what makes the lock feature-independent.
+    ///
+    /// A `[package] version` that does not parse is not silently replaced: resolution still uses
+    /// `0.0.0` — the root is not a lock entry and its version only matters to a requirement naming
+    /// the root package — but the fallback is *said* through `warnings` rather than inferred by
+    /// whoever wonders why a template or a resolver error shows `0.0.0`.
+    fn root_request(
+        manifest: &Manifest,
+        features: &ResolvedBuildFeatures,
+        scope: DependencyScope,
+        force_all: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<RootRequest, String> {
+        let root_name = manifest
+            .package
+            .name
+            .clone()
+            .unwrap_or_else(|| "jals-root".to_owned());
+        let name = PackageName::new(root_name.clone()).map_err(|error| {
+            format!("project name `{root_name}` is not a package name: {error}")
+        })?;
+        // No version at all is a stated absence, not a failed parse: `[package] version` is
+        // optional, and a project that omits it resolves as `0.0.0` without a word. A version the
+        // Maven-style parser rejects (whitespace, or an empty string) is the silent fallback the
+        // reports named, and it is reported once per manifest even though the lock pass asks the
+        // same question twice.
+        let version =
+            manifest
+                .package
+                .version
+                .as_deref()
+                .map_or_else(Self::fallback_version, |text| match Version::parse(text) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        Self::warn_once(
+                            warnings,
+                            format!(
+                                "`{root_name}`: [package] version `{text}` is not a version \
+                                 ({error}); resolution uses `0.0.0`"
+                            ),
+                        );
+                        Self::fallback_version()
+                    }
+                });
+        let id = PackageId::new(
+            name,
+            version,
+            SourceId::Workspace(jals_resolve::id::WorkspaceSource { member: root_name }),
+        );
+        let mut summary = manifest
+            .resolver_summary(id)
+            .map_err(|error| error.to_string())?;
+        // Only registry edges are this resolver's business; `git`/`path` entries are graph nodes
+        // whose provider lives in `jals-project`.
+        summary
+            .dependencies
+            .retain(|request| matches!(request.source, SourceRequest::Registry { .. }));
+        if force_all {
+            for dependency in &mut summary.dependencies {
+                dependency.optional = false;
+            }
+        }
+        Ok(RootRequest {
+            summary,
+            // The resolved selection already expanded `default`; re-asking would double-expand.
+            features: if force_all {
+                BTreeSet::default()
+            } else {
+                features.features().clone()
+            },
+            default_features: false,
+            include_dev: force_all || scope == DependencyScope::Test,
+        })
+    }
+
+    /// Map a resolved graph's packages onto external artifact specs, split into the jars a
+    /// classpath can carry and the artifacts that are only fetched and locked.
+    fn specs(
+        graph: &ResolveGraph,
+        registries: &BTreeMap<String, String>,
+        artifacts_by_package: &BTreeMap<(PackageName, Version), ArtifactType>,
+    ) -> (Vec<DependencySpec>, Vec<DependencySpec>) {
+        let mut specs = Vec::new();
+        let mut artifacts = Vec::new();
+        for package in &graph.packages {
+            let SourceId::Registry(registry_name) = &package.id.source else {
+                continue;
+            };
+            let Some(coordinate) = Coordinate::parse(&package.id.name) else {
+                continue;
+            };
+            let Some(base) = registries.get(registry_name.as_str()) else {
+                continue;
+            };
+            // The POM that pulled this package in said `<type>`/`<classifier>`; a package with no
+            // recorded artifact (a manifest dependency, a range edge) is Maven's default jar.
+            let artifact = artifacts_by_package
+                .get(&(package.id.name.clone(), package.id.version.clone()))
+                .cloned()
+                .unwrap_or_else(ArtifactType::jar);
+            let url = coordinate.artifact_url(base, &package.id.version, &artifact);
+            // A `Name` is a portable path component: a coordinate's `:` is a Windows-reserved
+            // character, so the diagnostic label folds it to `-`. Nothing keys on this name
+            // except progress and warning text (`remap` is never set here).
+            let Ok(name) = Name::new(package.id.name.as_str().replace(':', "-")) else {
+                continue;
+            };
+            let spec = DependencySpec {
+                name,
+                location: DependencyLocation::External {
+                    locator: ExternalLocator::new(url),
+                    // The verified cache is SHA-256 addressed; a SHA-1 sidecar checksum is kept
+                    // in the lock but cannot pin this location's cache key.
+                    expected: package.checksum.as_ref().and_then(|checksum| {
+                        (checksum.algorithm() == jals_resolve::id::ChecksumAlgorithm::Sha256)
+                            .then(|| ContentDigest::from_hex(checksum.hex()))
+                            .flatten()
+                    }),
+                },
+                remap: None,
+                recursive: false,
+            };
+            if artifact.is_classpath() {
+                specs.push(spec);
+            } else {
+                artifacts.push(spec);
+            }
+        }
+        (specs, artifacts)
+    }
+}
 
 /// A fetcher backed by `reqwest`'s async client.
 pub struct ReqwestFetcher {
@@ -168,11 +614,11 @@ impl Fetcher for ReqwestFetcher {
         report: &Task,
     ) -> Result<Vec<u8>, FetchError> {
         if let Some(path) = locator.strip_prefix("file://") {
-            return Self::read_file_bounded(PathBuf::from(path), max_bytes).await;
+            return Self::read_file_bounded(PathBuf::from(path), max_bytes, report).await;
         }
         if !ExternalLocator::is_url(locator) {
             let path = self.project_root.join(locator);
-            return Self::read_file_bounded(path, max_bytes).await;
+            return Self::read_file_bounded(path, max_bytes, report).await;
         }
         let response = self
             .client
@@ -246,8 +692,12 @@ impl ReqwestFetcher {
         Ok(bytes)
     }
 
-    async fn read_file_bounded(path: PathBuf, max_bytes: usize) -> Result<Vec<u8>, FetchError> {
-        on_blocking_pool(move || {
+    async fn read_file_bounded(
+        path: PathBuf,
+        max_bytes: usize,
+        report: &Task,
+    ) -> Result<Vec<u8>, FetchError> {
+        let bytes = on_blocking_pool(move || {
             let file = fs::File::open(&path).map_err(|error| {
                 FetchError::permanent(format!("opening {}: {error}", path.display()))
             })?;
@@ -266,7 +716,12 @@ impl ReqwestFetcher {
             }
             Ok(bytes)
         })
-        .await
+        .await?;
+        // A local file has its length in hand before it is read, so unlike a streamed response it
+        // reports a completed transfer rather than a fetch that moved nothing.
+        report.set_total(bytes.len() as u64);
+        report.set_done(bytes.len() as u64);
+        Ok(bytes)
     }
 }
 
@@ -276,15 +731,300 @@ pub struct NativeProjectPlan {
     pub plan: ProjectInputPlan,
     pub source_roots: Vec<DirKey>,
     pub warnings: Vec<Warning>,
+    /// Failures a `Compile` lowering could not recover from, which the assembled
+    /// [`ProjectInputs`] carries out as errors. Empty for `Analysis`/`Editor`, where a missing
+    /// input is reported as a warning: a diagnostics pass and an editor are expected to keep
+    /// working over a project whose dependencies cannot resolve, offline included.
+    errors: Vec<Warning>,
+    /// What this lowering declared per dependency form and what resolution answered, for the
+    /// assembled inputs to report.
+    registry_status: RegistryStatus,
     git_dependencies: Vec<(Name, GitDependency)>,
     /// `path` dependencies outside the project root, resolved against the host filesystem by
     /// [`materialize_path_sources`](Self::materialize_path_sources).
     path_dependencies: Vec<(Name, PathDependency)>,
+    /// Maven registry entries, resolved into classpath specs by
+    /// [`resolve_registry`](Self::resolve_registry) before the plan executes. They are not
+    /// project-graph nodes: a registry package contributes a jar, never `.java` a build script
+    /// could read. The manifest summary is the resolver's input, so the collected value carries
+    /// no name.
+    registry_dependencies: Vec<Dependency>,
     external_source_roots: Vec<PathBuf>,
     external_classpath: Vec<PathBuf>,
 }
 
 impl NativeProjectPlan {
+    /// Packages declared by more than one jar, each with the jars that declare it.
+    ///
+    /// JPMS refuses a module path where two modules export the same package. The list is sorted
+    /// by package name and each jar list keeps the input order, so a diagnostic built from it is
+    /// stable.
+    pub fn split_packages(jars: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
+        /// The packages one jar carries.
+        ///
+        /// A jar's module name is not read: an automatic module derives it from the file name, and
+        /// the question this answers is only "do two entries declare the same package".
+        /// `META-INF/` is skipped — a multi-release jar repeats a package under
+        /// `META-INF/versions/<n>/`, which is one module, not a split.
+        fn jar_packages(path: &Path) -> Result<Vec<String>, String> {
+            let bytes = std::fs::read(path).map_err(|error| {
+                format!(
+                    "module-path jar `{}` cannot be read: {error}",
+                    path.display()
+                )
+            })?;
+            let mut cursor = jals_storage::io::Cursor::new(bytes);
+            let directory =
+                jals_exec::block_on_inline(crate::zip::CentralDirectory::parse(&mut cursor))?;
+            let mut packages: Vec<String> = directory
+                .members
+                .iter()
+                .filter_map(|member| {
+                    if member.is_dir || member.name.starts_with("META-INF/") {
+                        return None;
+                    }
+                    let extension = Path::new(&member.name).extension()?;
+                    if !extension.eq_ignore_ascii_case("class") {
+                        return None;
+                    }
+                    let (package, _) = member.name.rsplit_once('/')?;
+                    (!package.is_empty()).then(|| package.replace('/', "."))
+                })
+                .collect();
+            packages.sort();
+            packages.dedup();
+            Ok(packages)
+        }
+
+        let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for jar in jars {
+            let Ok(packages) = jar_packages(jar) else {
+                continue;
+            };
+            let name = jar.display().to_string();
+            for package in packages {
+                owners.entry(package).or_default().push(name.clone());
+            }
+        }
+        owners.retain(|_, jars| jars.len() > 1);
+        owners
+    }
+
+    /// Expand one `[build] classpath` entry into the entries it names.
+    ///
+    /// Three spellings are accepted: a glob (`libs/*.jar`, `libs/**/*.jar`) matched below the
+    /// directory before its first wildcard; a directory containing jars, expanded to those jars in
+    /// sorted order; and anything else, returned unchanged. Matches are sorted by their
+    /// project-relative spelling (or host path outside the project), so the same input produces the
+    /// same argument vector on every walk.
+    fn expand_classpath_entry(project_root: &Path, raw: &str) -> Result<Vec<String>, String> {
+        /// A hard ceiling even for `**`: a junction/bind mount is not a symlink, so the walk
+        /// still needs a finite bound of its own.
+        const MAX_DEPTH: usize = 64;
+
+        fn portable_path(project_root: &Path, path: &Path) -> String {
+            RelativePath::from_host_path(project_root, path).map_or_else(
+                || path.display().to_string(),
+                |relative| relative.to_string(),
+            )
+        }
+
+        fn relative_path(path: &Path) -> Option<RelativePath> {
+            let mut segments = Vec::new();
+            for component in path.components() {
+                segments.push(Name::new(component.as_os_str().to_str()?).ok()?);
+            }
+            Some(RelativePath::new(segments))
+        }
+
+        fn collect(
+            base: &Path,
+            dir: &Path,
+            depth: usize,
+            max_depth: Option<usize>,
+            pattern: &jals_config::ResourcePattern,
+            project_root: &Path,
+            matches: &mut Vec<String>,
+        ) -> Result<(), String> {
+            let entries = std::fs::read_dir(dir).map_err(|error| {
+                format!(
+                    "classpath glob base `{}` cannot be read: {error}",
+                    dir.display()
+                )
+            })?;
+            let paths: Vec<PathBuf> = entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    format!(
+                        "classpath glob base `{}` cannot be read: {error}",
+                        dir.display()
+                    )
+                })?;
+            for path in paths {
+                let symlink = std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
+                if path.is_dir() {
+                    // A symlinked directory can point at an ancestor; following it is how a
+                    // glob walks forever. A bounded pattern also stops descending once no
+                    // remaining segment can match.
+                    if symlink
+                        || depth + 1 >= MAX_DEPTH
+                        || max_depth.is_some_and(|limit| depth + 1 >= limit)
+                    {
+                        continue;
+                    }
+                    collect(
+                        base,
+                        &path,
+                        depth + 1,
+                        max_depth,
+                        pattern,
+                        project_root,
+                        matches,
+                    )?;
+                } else if let Ok(relative) = path.strip_prefix(base)
+                    && let Some(relative) = relative_path(relative)
+                    && pattern.matches(&relative)
+                {
+                    matches.push(portable_path(project_root, &path));
+                }
+            }
+            Ok(())
+        }
+
+        if !raw.contains(['*', '?']) {
+            let host = Self::resolve_host_path(project_root, raw);
+            if host.is_dir() {
+                let mut jars = Vec::new();
+                let entries = std::fs::read_dir(&host).map_err(|error| {
+                    format!("classpath directory `{raw}` cannot be read: {error}")
+                })?;
+                for entry in entries {
+                    let path = entry
+                        .map_err(|error| {
+                            format!("classpath directory `{raw}` cannot be read: {error}")
+                        })?
+                        .path();
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+                    {
+                        jars.push(portable_path(project_root, &path));
+                    }
+                }
+                if !jars.is_empty() {
+                    jars.sort();
+                    jars.dedup();
+                    // Keep the directory as well: a directory that holds jars may also be a
+                    // classes directory (or carry resources), and replacing it with only its
+                    // jars would silently drop everything else javac used to see.
+                    let mut expanded = vec![raw.to_owned()];
+                    expanded.extend(jars);
+                    return Ok(expanded);
+                }
+            }
+            return Ok(vec![raw.to_owned()]);
+        }
+
+        let host = Self::resolve_host_path(project_root, raw);
+        let mut base = PathBuf::new();
+        let mut pattern = Vec::new();
+        let mut wildcard = false;
+        for component in host.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if wildcard {
+                pattern.push(text.into_owned());
+            } else if text.contains(['*', '?']) {
+                wildcard = true;
+                pattern.push(text.into_owned());
+            } else {
+                base.push(component);
+            }
+        }
+        if !wildcard {
+            return Ok(vec![raw.to_owned()]);
+        }
+        let pattern_text = pattern.join("/");
+        let pattern = jals_config::ResourcePattern::parse(&pattern_text)
+            .map_err(|error| format!("classpath glob `{raw}` is invalid: {error}"))?;
+        let max_depth = (!pattern_text.split('/').any(|segment| segment == "**"))
+            .then(|| pattern_text.split('/').count());
+        let mut matches = Vec::new();
+        collect(
+            &base,
+            &base,
+            0,
+            max_depth,
+            &pattern,
+            project_root,
+            &mut matches,
+        )?;
+        // Sort the portable spellings, not the host paths visited on the way: on Windows the
+        // latter compare case-insensitively and would disagree with the documented order.
+        matches.sort();
+        matches.dedup();
+        Ok(matches)
+    }
+
+    fn expanded_classpath_entries(manifest: &Manifest, project_root: &Path) -> Vec<String> {
+        let mut expanded = Vec::with_capacity(manifest.build.classpath.len());
+        for entry in &manifest.build.classpath {
+            match Self::expand_classpath_entry(project_root, entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                _ => expanded.push(entry.clone()),
+            }
+        }
+        expanded
+    }
+
+    /// Replace every `[build] classpath` entry with the entries it expands to.
+    ///
+    /// The CLI calls this before invocation planning so a `javac --dry-run` shows the jars a glob
+    /// actually selected. Running it twice is stable while the directory contents are unchanged;
+    /// expanded file entries fall through, a directory re-expands to the same jars.
+    pub fn expand_build_classpath(
+        manifest: &mut Manifest,
+        project_root: &Path,
+    ) -> Vec<(String, String)> {
+        let mut expanded = Vec::with_capacity(manifest.build.classpath.len());
+        let mut warnings = Vec::new();
+        for entry in core::mem::take(&mut manifest.build.classpath) {
+            match Self::expand_classpath_entry(project_root, &entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                Ok(_) => {
+                    warnings.push((entry.clone(), "classpath glob matched no files".to_owned()));
+                    expanded.push(entry);
+                }
+                Err(message) => {
+                    warnings.push((entry.clone(), message));
+                    expanded.push(entry);
+                }
+            }
+        }
+        manifest.build.classpath = expanded;
+        warnings
+    }
+
+    /// The `[build] module-path` entries of `manifest`, with globs and jar directories expanded.
+    pub fn expanded_module_path_entries(manifest: &Manifest, project_root: &Path) -> Vec<String> {
+        let mut expanded = Vec::with_capacity(manifest.build.module_path.len());
+        for entry in &manifest.build.module_path {
+            // A dependency reference is not a path, even if a directory with that literal name
+            // exists; only literal entries expand.
+            if entry.starts_with("${") {
+                expanded.push(entry.clone());
+                continue;
+            }
+            match Self::expand_classpath_entry(project_root, entry) {
+                Ok(paths) if !paths.is_empty() => expanded.extend(paths),
+                _ => expanded.push(entry.clone()),
+            }
+        }
+        expanded
+    }
+
     /// Lower `manifest` and execute the whole native input assembly against one aggregate:
     /// materialize Git sources, fetch and resolve dependencies over async HTTP, and merge the
     /// lowering warnings into the result's. Fan-out and blocking host work run on the storage's
@@ -308,6 +1048,7 @@ impl NativeProjectPlan {
         fetcher: &F,
         options: ProjectInputOptions,
         progress: &Progress,
+        registry: Option<&mut RegistryResolution>,
     ) -> (ProjectInputs, Vec<DirKey>) {
         let mut native =
             Self::from_manifest(manifest, scope, features, project_root, &storage.view());
@@ -319,20 +1060,131 @@ impl NativeProjectPlan {
             .materialize_git_sources(project_root, storage, fetcher)
             .await;
         native.materialize_path_sources(project_root, storage).await;
+        // Registry resolution runs after host materialization and before execution: its specs go
+        // through the same dependency resolver as explicit jars, so POM traversal is one batch of
+        // metadata/POM fetches and the jars download in parallel through the verified cache.
+        if let Some(specs) = native
+            .resolve_registry(manifest, scope, features, fetcher, registry, options)
+            .await
+        {
+            native.plan.dependencies.extend(specs);
+        }
         let mut inputs =
             ProjectInputs::assemble(fetcher, storage, &native.plan, options, progress).await;
         native.warnings.append(&mut inputs.warnings);
         inputs.warnings = native.warnings;
+        inputs.errors = native.errors;
+        inputs.registry_status = native.registry_status;
         (inputs, native.source_roots)
+    }
+
+    /// Resolve every registry entry into `DependencySpec`s and record the lock.
+    ///
+    /// Thin wrapper over [`RegistryResolver::resolve`]. Failure becomes an error for a `Compile`
+    /// lowering and a warning for anything else: a build whose classpath is missing a library
+    /// fails at `javac` with a mountain of missing symbols, which is worse than the resolver's own
+    /// message and arrives much later; a diagnostics pass or an editor is expected to keep working
+    /// over a project whose dependencies cannot resolve, offline included.
+    async fn resolve_registry<F: Fetcher>(
+        &mut self,
+        manifest: &Manifest,
+        scope: DependencyScope,
+        features: &ResolvedBuildFeatures,
+        fetcher: &F,
+        registry: Option<&mut RegistryResolution>,
+        options: ProjectInputOptions,
+    ) -> Option<Vec<DependencySpec>> {
+        // A host without lock persistence (the language server) still gets resolution; it just
+        // has nowhere to store the outcome, and no full-lock pass to pay for. A host that already
+        // resolved the workspace lock (`generate_lock == false`) pins against it without
+        // generating it again.
+        let host_has_lock = registry.is_some();
+        let mut scratch = RegistryResolution::default();
+        let registry = registry.map_or(&mut scratch, |registry| registry);
+        let generate_lock = host_has_lock && registry.generate_lock;
+        // A selection with no active registry entry can still have work: `needs_full_pass` exists
+        // because the lock must cover the optional and dev entries a selection skips, and the
+        // full pass is the only place they resolve. Only a lock-generating host is asked to pay
+        // for that, so a classpath-only pass (the language server, a workspace member) still
+        // returns early when the selection itself is empty.
+        if self.registry_dependencies.is_empty()
+            && !(generate_lock && RegistryResolver::needs_full_pass(manifest, scope))
+        {
+            return None;
+        }
+        let graphs = match RegistryResolver::resolve(
+            manifest,
+            scope,
+            features,
+            fetcher,
+            registry.lock.as_ref(),
+            if generate_lock {
+                LockMode::Generate
+            } else {
+                LockMode::Skip
+            },
+        )
+        .await
+        {
+            Ok(graphs) => graphs,
+            Err(error) => {
+                let count = self.registry_dependencies.len();
+                let message = if count == 0 {
+                    format!("registry dependencies could not be resolved: {error}")
+                } else {
+                    format!("{count} registry dependencies could not be resolved: {error}")
+                };
+                let warning = Warning::new(
+                    WarningOrigin::External(ExternalLocator::new("registry")),
+                    message,
+                );
+                // A compile needs the classpath resolution would have produced. Stopping here
+                // names the real failure once, before any compiler ran, instead of letting javac
+                // report the missing library as dozens of `cannot find symbol`s. An analysis pass
+                // and an editor keep the warning: they are the hosts that must stay useful while
+                // the project cannot resolve.
+                if options == ProjectInputOptions::Compile {
+                    self.errors.push(warning);
+                } else {
+                    self.warnings.push(warning);
+                }
+                return None;
+            }
+        };
+        if let Some(lock) = graphs.lock {
+            registry.resolved_lock = Some(lock);
+        }
+        registry.packages = graphs.packages;
+        // Resolution's own advisories and the manifest fallbacks reach the caller as classpath
+        // diagnostics: the lock carries no channel for them, and dropping them here is what made
+        // a `0.0.0` fallback invisible.
+        for message in &graphs.warnings {
+            self.warnings.push(Warning::new(
+                WarningOrigin::External(ExternalLocator::new("registry")),
+                message.clone(),
+            ));
+        }
+        registry.warnings.extend(graphs.warnings);
+        // What the resolver answered for the selection: jars the compile classpath can carry and
+        // artifacts (`tar.gz` native bundles) it cannot. Declared counts are the manifest's and
+        // are gathered by the host that reports the line.
+        self.registry_status.jars = graphs.specs.len();
+        self.registry_status.artifacts = graphs.artifacts.len();
+        // Non-jar artifacts (a `tar.gz` native bundle) are acquired through the same verified
+        // path as the jars but never become classpath entries; they ride the plan's auxiliary
+        // half, which `ProjectInputs::assemble` downloads beside the dependencies.
+        self.plan.auxiliary_artifacts.extend(graphs.artifacts);
+        Some(graphs.specs)
     }
 
     /// Lower the source roots, the `[build] classpath`, and the dependency entries `scope`
     /// declares into the portable plan.
     ///
     /// `scope` is the host's, never inferred: the two callers ask different questions. The
-    /// projection path hands over a manifest whose dependency tables `ProjectScript::root_only`
-    /// already emptied — every declared entry is a graph node there — so only `jals lint`'s
-    /// graph-less fallback reaches this with entries still in place.
+    /// projection path hands over a manifest whose non-registry tables `ProjectScript::root_only`
+    /// already emptied — every such entry is a graph node there — so the registry entries it kept
+    /// are lowered under the caller's own selection, and only `jals lint`'s graph-less fallback
+    /// reaches this with the other forms still in place.
     pub fn from_manifest(
         manifest: &Manifest,
         scope: DependencyScope,
@@ -347,8 +1199,11 @@ impl NativeProjectPlan {
             },
             source_roots: Vec::new(),
             warnings: Vec::new(),
+            errors: Vec::new(),
+            registry_status: RegistryStatus::default(),
             git_dependencies: Vec::new(),
             path_dependencies: Vec::new(),
+            registry_dependencies: Vec::new(),
             external_source_roots: Vec::new(),
             external_classpath: Vec::new(),
         };
@@ -378,7 +1233,34 @@ impl NativeProjectPlan {
                     .push(Self::resolve_host_path(project_root, source)),
             }
         }
-        for classpath in &manifest.build.classpath {
+        // Authored `[build] classpath` entries expand; a classpath-only `path` dependency is
+        // already an explicit output address and is kept verbatim (its `dir` may itself be a
+        // classes directory that happens to contain a jar).
+        let mut classpath_entries = Vec::with_capacity(manifest.build.classpath.len());
+        for spelling in &manifest.build.classpath {
+            match Self::expand_classpath_entry(project_root, spelling) {
+                Ok(paths) if !paths.is_empty() => classpath_entries.extend(paths),
+                Ok(_) => {
+                    result.warn_path(spelling, "classpath glob matched no files".to_owned());
+                    classpath_entries.push(spelling.clone());
+                }
+                Err(message) => {
+                    result.warn_path(spelling, message);
+                    classpath_entries.push(spelling.clone());
+                }
+            }
+        }
+        let mut classpath_only = Vec::new();
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                let entry = path.classpath_path();
+                if !manifest.build.classpath.contains(&entry) && !classpath_only.contains(&entry) {
+                    classpath_only.push(entry);
+                }
+            }
+        }
+        classpath_entries.extend(classpath_only);
+        for classpath in &classpath_entries {
             let Some(path) = Self::project_relative(project_root, classpath) else {
                 result
                     .external_classpath
@@ -427,6 +1309,17 @@ impl NativeProjectPlan {
             if matches!(dependency, Dependency::Jar(_)) {
                 continue;
             }
+            // Registry entries come first: their coordinate keys (`group:artifact`) are not
+            // portable `Name`s, and they are not lowered as graph input either way — the
+            // resolver reads them from the manifest summary, so the collected value carries no
+            // name.
+            if matches!(
+                dependency,
+                Dependency::Registry(_) | Dependency::RegistryVersion(_)
+            ) {
+                result.registry_dependencies.push(dependency.clone());
+                continue;
+            }
             let name = match Name::new(raw_name) {
                 Ok(name) => name,
                 Err(error) => {
@@ -438,8 +1331,15 @@ impl NativeProjectPlan {
                 }
             };
             match dependency {
-                // Lowered by `add_jar_dependencies` above.
-                Dependency::Jar(_) => {}
+                // Lowered by `add_jar_dependencies` above. A precompiled module contributes no
+                // classpath entry and no `.java` source either: what it needs is a link at
+                // instantiation, which is the compile's and the runner's business, not the
+                // resolver's.
+                Dependency::Jar(_)
+                | Dependency::Wasm(_)
+                | Dependency::Registry(_)
+                | Dependency::RegistryVersion(_) => {}
+                Dependency::Path(path) if path.is_classpath() => {}
                 Dependency::Path(path) => match Self::project_path_root(path, project_root, view) {
                     Ok(Some(key)) => result.plan.source_dependency_roots.push(key),
                     // Outside the project root: scanned from the host filesystem by
@@ -483,8 +1383,8 @@ impl NativeProjectPlan {
                 scopes.push(NativeScope::all(path));
             }
         }
-        for classpath in &manifest.build.classpath {
-            if let Some(path) = Self::project_relative(project_root, classpath) {
+        for classpath in Self::expanded_classpath_entries(manifest, project_root) {
+            if let Some(path) = Self::project_relative(project_root, &classpath) {
                 let host = path.to_host_path(project_root);
                 scopes.push(if host.is_dir() {
                     NativeScope::extension(path, "class")
@@ -523,6 +1423,23 @@ impl NativeProjectPlan {
                     }
                 }
                 Dependency::Path(path) => {
+                    if path.is_classpath() {
+                        let raw = path.classpath_path();
+                        for spelling in Self::expand_classpath_entry(project_root, &raw)
+                            .unwrap_or_else(|_| vec![raw.clone()])
+                        {
+                            if let Some(relative) = Self::project_relative(project_root, &spelling)
+                            {
+                                let host = relative.to_host_path(project_root);
+                                scopes.push(if host.is_dir() {
+                                    NativeScope::extension(relative, "class")
+                                } else {
+                                    NativeScope::all(relative)
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     let base = Self::resolve_host_path(project_root, &path.path);
                     if let Ok(source) = Self::host_source_root(&base, path.dir.as_deref())
                         && let Some(relative) = Self::relative_to_project(project_root, &source)
@@ -530,7 +1447,17 @@ impl NativeProjectPlan {
                         scopes.push(NativeScope::extension(relative, "java"));
                     }
                 }
-                Dependency::Git(_) => {}
+                // A precompiled module is a build input exactly as a jar is: the compile reads its
+                // bytes and its `jals.library` section decides what the project resolves against.
+                // Captured under both scopes, for the same reason the tables are not filtered.
+                Dependency::Wasm(wasm) => {
+                    if let Some(path) = Self::project_relative(project_root, &wasm.wasm) {
+                        scopes.push(NativeScope::all(path));
+                    }
+                }
+                // Registry packages have no local bytes to snapshot; their POM and jar live in the
+                // repository, and the artifact cache captures the jar when it is downloaded.
+                Dependency::Git(_) | Dependency::Registry(_) | Dependency::RegistryVersion(_) => {}
             }
         }
         scopes

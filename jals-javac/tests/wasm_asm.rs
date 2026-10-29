@@ -13,8 +13,8 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use jals_javac::wasm::{
-    CompType, ExportKind, FieldType, Func, Global, HeapType, Insn, Instr, Module, NumOp, Numeric,
-    RefType, StorageType, SubType, ValType,
+    CompType, ExportKind, FieldType, Func, Global, HeapType, ImportKind, Insn, Instr, Module,
+    NumOp, Numeric, RefType, StorageType, SubType, ValType,
 };
 
 /// Whether a tool that understands WebAssembly 3.0 is on this host. Like the JVM-backed tests, a
@@ -58,6 +58,32 @@ fn validate(bytes: &[u8]) {
         "wasm-tools rejected the module:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Run `function` in `bytes` and return what it returned, or `None` when no engine is installed.
+///
+/// `wasm-tools` says the module is well-formed; only an engine says it computes what was meant.
+/// A data segment read is exactly the kind of thing that validates and is still wrong — a byte
+/// order or an offset off by one is a different integer, not a malformed module — so the tests
+/// that care what the bytes *mean* run rather than only validate.
+fn invoke(bytes: &[u8], function: &str) -> Option<String> {
+    if !tool("wasmtime") {
+        return None;
+    }
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("module.wasm");
+    std::fs::write(&path, bytes).expect("write module");
+    let output = Command::new("wasmtime")
+        .args(["run", "--invoke", function])
+        .arg(&path)
+        .output()
+        .expect("run wasmtime");
+    assert!(
+        output.status.success(),
+        "wasmtime rejected the module:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// A module whose types form a two-level hierarchy, plus a function that allocates the subtype and
@@ -371,6 +397,56 @@ fn a_hand_built_array_module_validates() {
     );
 }
 
+/// The bytes of a string literal become a `char[]` in one instruction: `array.new_data` copies
+/// from a byte offset in the segment an element count's worth of elements, each in the element
+/// type's own little-endian representation.
+///
+/// The values are chosen so a byte-order mistake is a different *answer* rather than a
+/// differently-shaped module: `0x00010203` read little-endian is 66051, and big-endian 50462976.
+fn data_module() -> Module {
+    let mut module = Module::new();
+    let element = FieldType {
+        storage: StorageType::Val(ValType::I32),
+        mutable: true,
+    };
+    let array = module.add_type(SubType::plain(CompType::Array(element)));
+    let ty = signature(&mut module, Vec::new(), vec![ValType::I32]);
+
+    let mut bytes = Vec::new();
+    for value in [0x0001_0203_i32, 4] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let data = module.add_data(bytes);
+
+    let mut body = Insn::new();
+    body.i32_const(0)
+        .i32_const(2)
+        .array_new_data(array, data)
+        .local_set(0);
+    body.local_get(0).i32_const(0).array_get(array);
+    body.local_get(0).i32_const(1).array_get(array);
+    body.numeric(NumOp::Add, ValType::I32).expect("i32.add");
+
+    module.funcs.push(Func {
+        type_index: ty,
+        locals: vec![ValType::Ref(RefType::nullable(HeapType::Concrete(array)))],
+        body: body.into_body(),
+    });
+    export(&mut module, "read", 0);
+    module
+}
+
+#[test]
+fn a_hand_built_data_module_validates_and_reads_its_segment() {
+    let bytes = data_module()
+        .finish()
+        .expect("a module whose lengths all fit");
+    validate(&bytes);
+    if let Some(output) = invoke(&bytes, "read") {
+        assert_eq!(output, "66055");
+    }
+}
+
 /// The reference instructions, and the one place a *non-nullable* reference type is written out:
 /// `struct.new_default` produces one, so a function may declare it as its result.
 fn reference_module() -> Module {
@@ -646,6 +722,65 @@ fn a_module_that_imports_a_host_function_validates() {
     );
 }
 
+/// A `begin_group` before any type must not make the type section declare an entry it never writes.
+///
+/// The boundary has nothing after it, so it is not a group; a section that counted it would say two
+/// entries and write one — the import's singleton type — and `wasm-tools` rejects exactly that with
+/// `unexpected end-of-file`. The assertion is byte equality with the same module built without the
+/// call, because the claim is about the encoding, not only about the validator's verdict.
+#[test]
+fn a_group_opened_before_any_type_is_not_a_group() {
+    let mut opened = Module::new();
+    opened.begin_group();
+    let import = opened.add_import(
+        "test/host/Host".to_owned(),
+        "answer(I)I".to_owned(),
+        vec![ValType::I32],
+        vec![ValType::I32],
+    );
+    assert_eq!(import, 0, "an import takes the first function index");
+
+    let mut plain = Module::new();
+    plain.add_import(
+        "test/host/Host".to_owned(),
+        "answer(I)I".to_owned(),
+        vec![ValType::I32],
+        vec![ValType::I32],
+    );
+
+    let bytes = opened.finish().expect("a module whose lengths all fit");
+    assert_eq!(
+        bytes,
+        plain.finish().expect("a module whose lengths all fit"),
+        "the leading boundary is not an entry"
+    );
+    validate(&bytes);
+}
+
+/// A `begin_group` after the last type is a boundary with nothing after it, and must not encode an
+/// empty `rec` group.
+///
+/// The doc promises it, and a library built from the `wasm_linking` fixture ends with exactly this
+/// call, so every module built that way would otherwise carry a trailing empty group. Again the
+/// bytes have to match the module without the call.
+#[test]
+fn a_group_opened_after_the_last_type_is_not_a_group() {
+    let mut opened = Module::new();
+    opened.add_type(SubType::plain(CompType::Struct(Vec::new())));
+    opened.begin_group();
+
+    let mut plain = Module::new();
+    plain.add_type(SubType::plain(CompType::Struct(Vec::new())));
+
+    let bytes = opened.finish().expect("a module whose lengths all fit");
+    assert_eq!(
+        bytes,
+        plain.finish().expect("a module whose lengths all fit"),
+        "the trailing boundary is not an entry"
+    );
+    validate(&bytes);
+}
+
 /// The two names an import is spelled with reach the encoded module verbatim.
 ///
 /// They are the *link symbol*: a host registers its implementation under exactly these strings, so
@@ -663,6 +798,179 @@ fn an_import_carries_both_of_its_names_into_the_bytes() {
     );
     assert!(text.contains("answer(I)I"), "the field name is encoded");
     assert_eq!(module.imports.len(), 1);
-    assert_eq!(module.imports[0].params, vec![ValType::I32]);
-    assert_eq!(module.imports[0].results, vec![ValType::I32]);
+    let ImportKind::Function { params, results } = &module.imports[0].kind else {
+        panic!("a host function import: {:?}", module.imports[0].kind);
+    };
+    assert_eq!(params, &vec![ValType::I32]);
+    assert_eq!(results, &vec![ValType::I32]);
+}
+
+/// A module that imports a **library's** function, global, and tag, and declares the shared type
+/// group they are all expressed in.
+///
+/// The shape a project module linked against a precompiled `java.base` has. Two things about it are
+/// only decidable by a validator: a shared import's type index names a declared type rather than
+/// the singleton entry a host import gets, and a global or tag import occupies *its own* index
+/// space — so a `call` still names a function index while a `global.get` names a global one. The
+/// engine's side of the arrangement is pinned by `jals-build`'s `wasm_linking` test; this one pins
+/// the encoding.
+fn linked_module() -> Module {
+    let mut module = Module::new();
+    // The group both modules declare identically: a struct, the tag's payload, and the function
+    // types the imports name.
+    let point = module.add_type(SubType::plain(CompType::Struct(vec![FieldType {
+        storage: StorageType::Val(ValType::I32),
+        mutable: true,
+    }])));
+    let payload = signature(&mut module, vec![ValType::I32], Vec::new());
+    let make = signature(
+        &mut module,
+        vec![ValType::I32],
+        vec![ValType::Ref(RefType::nullable(HeapType::Concrete(point)))],
+    );
+    module.begin_group();
+    let gives_i32 = signature(&mut module, Vec::new(), vec![ValType::I32]);
+
+    let make_index = module.add_shared_import("java.base".to_owned(), "make".to_owned(), make);
+    let counter = module.add_global_import(
+        "java.base".to_owned(),
+        "counter".to_owned(),
+        ValType::I32,
+        true,
+    );
+    let boom = module.add_tag_import("java.base".to_owned(), "boom".to_owned(), payload);
+    assert_eq!(
+        (make_index, counter, boom),
+        (0, 0, 0),
+        "each import takes the first index of its own space"
+    );
+    assert_eq!(module.func_index(0), 1, "one function import precedes it");
+
+    // `use()` calls the shared function, drops the reference, and reads the imported global.
+    let mut use_ = Insn::new();
+    use_.i32_const(3)
+        .call(make_index)
+        .drop()
+        .global_get(counter);
+    module.funcs.push(Func {
+        type_index: gives_i32,
+        locals: Vec::new(),
+        body: use_.into_body(),
+    });
+    // `raise()` throws through the imported tag, with its payload on the stack.
+    let mut raise = Insn::new();
+    raise.i32_const(1).throw(boom);
+    module.funcs.push(Func {
+        type_index: payload,
+        locals: Vec::new(),
+        body: raise.into_body(),
+    });
+
+    export(&mut module, "use", 0);
+    export(&mut module, "raise", 1);
+    module
+}
+
+#[test]
+fn a_module_that_imports_library_values_validates() {
+    validate(
+        &linked_module()
+            .finish()
+            .expect("a module whose lengths all fit"),
+    );
+}
+
+/// A module that fills a dispatch slot with `ref.func`, reads it back out of the struct, and calls
+/// through it with `call_ref` — the encoding half of the linked-dispatcher arrangement.
+///
+/// Two things here are only decidable by a validator: a struct field may hold a `funcref`, and a
+/// function named by `ref.func` has to be *declared* in a declarative element segment. The engine's
+/// side — the same reference crossing a module boundary — is pinned by `jals-build`'s
+/// `wasm_linking` test.
+fn dispatching_module() -> Module {
+    let mut module = Module::new();
+    // The group a library and its consumer declare identically: the slot's function type and the
+    // struct that holds one.
+    let slot_ty = signature(&mut module, vec![ValType::I32], vec![ValType::I32]);
+    let table = module.add_type(SubType::plain(CompType::Struct(vec![FieldType {
+        // The field names the *concrete* function type, not `funcref`: `call_ref` checks the
+        // reference's static type against the type it is given, and the abstract `func` is not a
+        // subtype of any declared one. One field per slot, each with its own signature, is what a
+        // realm struct is.
+        storage: StorageType::Val(ValType::Ref(RefType::nullable(HeapType::Concrete(slot_ty)))),
+        mutable: false,
+    }])));
+    module.begin_group();
+
+    // `double(i32) -> i32`, the function a slot will hold. Its type *is* the shared slot type, so
+    // the reference the project makes and the call the library emits name one canonicalisation.
+    let mut double = Insn::new();
+    double
+        .local_get(0)
+        .i32_const(2)
+        .numeric(NumOp::Mul, ValType::I32)
+        .expect("i32.mul");
+    module.funcs.push(Func {
+        type_index: slot_ty,
+        locals: Vec::new(),
+        body: double.into_body(),
+    });
+    let double_index = module.func_index(0);
+
+    // `build()` returns a table holding `double`.
+    let build_ty = signature(
+        &mut module,
+        Vec::new(),
+        vec![ValType::Ref(RefType::nullable(HeapType::Concrete(table)))],
+    );
+    let mut build = Insn::new();
+    build.ref_func(double_index).struct_new(table);
+    module.funcs.push(Func {
+        type_index: build_ty,
+        locals: Vec::new(),
+        body: build.into_body(),
+    });
+
+    // `run()` builds the same table and calls through its slot. The reference goes on top of the
+    // arguments: `call_ref` reads it off the stack last, not first.
+    let mut run = Insn::new();
+    run.ref_func(double_index)
+        .struct_new(table)
+        .struct_get(table, 0)
+        .local_set(1)
+        .i32_const(21)
+        .local_get(1)
+        .call_ref(slot_ty);
+    module.funcs.push(Func {
+        type_index: slot_ty,
+        locals: vec![ValType::Ref(RefType::nullable(HeapType::Concrete(slot_ty)))],
+        body: run.into_body(),
+    });
+
+    export(&mut module, "build", 1);
+    export(&mut module, "run", 2);
+    module
+}
+
+#[test]
+fn a_module_that_calls_through_a_function_reference_validates() {
+    validate(
+        &dispatching_module()
+            .finish()
+            .expect("a module whose lengths all fit"),
+    );
+}
+
+/// A custom section reaches the bytes under the name a reader looks it up by — the one artifact a
+/// linked library carries its ABI in.
+#[test]
+fn a_custom_section_travels_with_its_name() {
+    let mut module = Module::new();
+    module.add_custom_section("jals.library".to_owned(), vec![1, 2, 3]);
+    let bytes = module.finish().expect("a module whose lengths all fit");
+    validate(&bytes);
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("jals.library"),
+        "the section name is encoded"
+    );
 }

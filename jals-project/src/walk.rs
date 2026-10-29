@@ -273,8 +273,36 @@ impl<H: GraphHost> GraphWalk<'_, H> {
                             .await;
                         continue;
                     }
+                    Dependency::Path(path) if path.is_classpath() => {
+                        // Consumed as compiled classes. The root plan lowers it directly into
+                        // the classpath; a dependency's own plan appends it in
+                        // `capture_manifest_classpath`. There is no project graph below it.
+                        continue;
+                    }
                     Dependency::Path(path) => self.host.acquire_path(declaring, path).await,
                     Dependency::Git(git) => self.host.acquire_git(declaring, name, git).await,
+                    // A precompiled module is a leaf like a jar: it has no project of its own to
+                    // preprocess, and its bytes are a build input the snapshot has to capture.
+                    Dependency::Wasm(wasm) => {
+                        let optional = dependency.is_optional();
+                        if let Err(message) = self
+                            .visit_binary(
+                                parent.clone(),
+                                declaring,
+                                name,
+                                &wasm.wasm,
+                                DeclaredBinaryEdge::classes(false, None, optional),
+                            )
+                            .await
+                        {
+                            self.warn_declared(parent.as_ref(), name, message);
+                        }
+                        continue;
+                    }
+                    // A registry entry is not a graph node: it has no project to walk and no
+                    // build script to run. `jals-classpath` resolves the whole POM graph in one
+                    // place (`RegistryResolution`) and projects jars straight onto the classpath.
+                    Dependency::Registry(_) | Dependency::RegistryVersion(_) => continue,
                 };
                 match acquired {
                     Ok(acquired) => {
@@ -622,6 +650,13 @@ impl<H: GraphHost> GraphWalk<'_, H> {
         manifest: &Manifest,
     ) -> Vec<CapturedFile> {
         // Deduplicates overlapping `source-dirs` and imposes one deterministic order.
+        let filter = match manifest.build.source_filter() {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.warn_entry(location, "include/exclude", error.to_string());
+                jals_config::SourceFilter::default()
+            }
+        };
         let mut files = BTreeMap::new();
         for (index, source) in manifest.build.source_dirs.iter().enumerate() {
             let mut notes = Vec::new();
@@ -649,7 +684,9 @@ impl<H: GraphHost> GraphWalk<'_, H> {
             {
                 let member =
                     RelativePath::new(file.key().path().segments().skip(prefix_len).cloned());
-                files.insert(prefix.concat(&member), file.bytes().to_vec());
+                if filter.accepts(&member) {
+                    files.insert(prefix.concat(&member), file.bytes().to_vec());
+                }
             }
         }
         files
@@ -681,8 +718,17 @@ impl<H: GraphHost> GraphWalk<'_, H> {
         location: &str,
         manifest: &Manifest,
     ) -> Vec<CapturedClasspathEntry> {
+        let mut declared_entries = manifest.build.classpath.clone();
+        // Classpath-only `path` dependencies are classpath entries with a different spelling.
+        // Their root plan never becomes a node, so this is where a dependency's own consumers
+        // learn about them.
+        for (_, dependency) in manifest.declared_dependencies(DependencyScope::Test) {
+            if let Some(path) = dependency.classpath_only_path() {
+                declared_entries.push(path.classpath_path());
+            }
+        }
         let mut entries = Vec::new();
-        for (index, entry) in manifest.build.classpath.iter().enumerate() {
+        for (index, entry) in declared_entries.iter().enumerate() {
             let mut notes = Vec::new();
             let resolved = self
                 .host

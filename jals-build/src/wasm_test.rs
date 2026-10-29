@@ -49,7 +49,9 @@ use jals_progress::Progress;
 
 use crate::test_plan::TestCase;
 use crate::test_runner::{Permits, RunOptions, TestEvent, TestOutcome, TestVerdict};
-use crate::wasm_run::{ParsedModule, WasmRunError, WasmRunOutcome, WasmRunner};
+use crate::wasm_run::{
+    ParsedModule, WasmForeignModule, WasmLibrary, WasmRunError, WasmRunOutcome, WasmRunner,
+};
 
 /// One test, as this runner addresses it.
 ///
@@ -85,6 +87,11 @@ pub struct WasmTestLauncher {
     /// Empty for a project that selected no package, which is what makes the fan-out below the
     /// ordinary path rather than a special case — see [`run`](Self::run).
     bindings: NativeBindings,
+    /// The precompiled libraries the module imports from, decoded once beside it.
+    libraries: Vec<(String, ParsedModule)>,
+    /// The foreign modules that may satisfy its `native` imports, decoded once beside it, each
+    /// with the name it was declared by.
+    foreign: Vec<(String, ParsedModule)>,
 }
 
 impl WasmTestLauncher {
@@ -98,11 +105,15 @@ impl WasmTestLauncher {
         module: &[u8],
         entries: Vec<WasmTestEntry>,
         bindings: NativeBindings,
+        libraries: &[WasmLibrary<'_>],
+        foreign: &[WasmForeignModule<'_>],
     ) -> Result<Self, WasmRunError> {
         Ok(Self {
             module: WasmRunner::parse(module)?,
             entries,
             bindings,
+            libraries: WasmRunner::parse_libraries(libraries)?,
+            foreign: WasmRunner::parse_foreign(foreign)?,
         })
     }
 
@@ -140,9 +151,19 @@ impl WasmTestLauncher {
         observe: Arc<dyn Fn(TestEvent) + Send + Sync>,
         exec: &Exec,
     ) -> Result<Vec<TestOutcome>, WasmRunError> {
-        WasmRunner::run_parsed(&self.module, None, &[], &self.bindings, &Progress::SILENT)?;
+        WasmRunner::run_parsed(
+            &self.module,
+            &self.libraries,
+            &self.foreign,
+            None,
+            &[],
+            &self.bindings,
+            &Progress::SILENT,
+        )?;
         let shared = Arc::new(SharedWasmRun {
             module: self.module.clone(),
+            libraries: self.libraries.clone(),
+            foreign: self.foreign.clone(),
             exports: self
                 .entries
                 .iter()
@@ -180,6 +201,11 @@ impl WasmTestLauncher {
 /// What every worker shares for one run.
 struct SharedWasmRun {
     module: ParsedModule,
+    /// The libraries, cloned into every worker: each test instantiates its own store, so each
+    /// test links its own instances of them.
+    libraries: Vec<(String, ParsedModule)>,
+    /// The foreign modules, cloned for the same reason: every test gets fresh instances.
+    foreign: Vec<(String, ParsedModule)>,
     /// Test id to the export that runs it. A `Vec` rather than a map: a suite is small enough that
     /// the scan is free, and it keeps the frontend's order visible.
     exports: Vec<(String, String)>,
@@ -251,8 +277,15 @@ impl SharedWasmRun {
         // Silent: a test run reports through `observe`, which is what the reporter draws from, and
         // a second `Run` event per test would put the engine's own activity beside it saying the
         // same thing in another vocabulary.
-        let result =
-            WasmRunner::run_parsed(&self.module, Some(export), &[], bindings, &Progress::SILENT);
+        let result = WasmRunner::run_parsed(
+            &self.module,
+            &self.libraries,
+            &self.foreign,
+            Some(export),
+            &[],
+            bindings,
+            &Progress::SILENT,
+        );
         match result {
             Ok(WasmRunOutcome::Returned(_) | WasmRunOutcome::Instantiated) => {
                 if case.should_fail() {
@@ -322,6 +355,7 @@ mod tests {
         let request = BackendRequest {
             tree: &tree,
             classpath: &[],
+            libraries: &[],
             options: &options,
             progress: &Progress::SILENT,
         };
@@ -353,7 +387,7 @@ mod tests {
         module: &[u8],
         entries: Vec<WasmTestEntry>,
     ) -> Vec<(String, TestVerdict, Option<String>)> {
-        let launcher = WasmTestLauncher::resolve(module, entries, NativeBindings::new())
+        let launcher = WasmTestLauncher::resolve(module, entries, NativeBindings::new(), &[], &[])
             .expect("the module parses");
         let cases = launcher.list();
         let outcomes = jals_exec::block_on_inline(launcher.run(
@@ -495,6 +529,8 @@ mod tests {
             &module,
             alloc::vec![entry("T#t", "JalsTest$T$t", true)],
             NativeBindings::new(),
+            &[],
+            &[],
         )
         .expect("the module parses");
         let cases = launcher.list();

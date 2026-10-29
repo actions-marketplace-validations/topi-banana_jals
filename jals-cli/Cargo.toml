@@ -33,7 +33,11 @@ clap.workspace = true
 indicatif.workspace = true
 # `native` for the host toolchain (`SubprocessToolchain`): the CLI is the consumer that actually
 # spawns `javac`/`java`. The workspace default is the pure core (`default-features = false`).
-jals-build = { workspace = true, features = ["native", "rhai", "wasm-run"] }
+jals-build = { workspace = true, features = [
+  "native",
+  "build-script",
+  "wasm-run",
+] }
 jals-classfile.workspace = true
 jals-classpath.workspace = true
 jals-config.workspace = true
@@ -51,12 +55,21 @@ jals-exec = { workspace = true, features = ["tokio"] }
 # and an exported XML profile is the usual way a team shares one. The workspace default is the
 # portable core, so the wasm playground still resolves without `quick-xml`.
 jals-fmt = { workspace = true, features = ["std"] }
+# `jals toolchain` decodes the JDK archives it downloads: gzip+tar on Linux/macOS, zip on Windows
+# (and whichever a provider offers). Host-only, like every other installer step.
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
 jals-frontend.workspace = true
 jals-storage = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 # The native packages this binary offers: a Java package whose `native` methods are implemented
 # in Rust. `[build] native-packages` selects out of the set `natives.rs` registers.
 jals-native.workspace = true
+# The real `java.base`, shipped as a precompiled module. It is registered beside `jals.io` rather
+# than because a manifest asks: a project that names `java.base` links the bytes a binary carries,
+# and the class it prints through is the host console the two packages share.
+jals-platform.workspace = true
 jals-lsp.workspace = true
 jals-progress.workspace = true
 jals-project = { workspace = true, features = ["native"] }
@@ -64,7 +77,6 @@ similar.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-zip.workspace = true
 
 [lints]
 workspace = true

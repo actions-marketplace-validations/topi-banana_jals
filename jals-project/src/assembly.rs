@@ -19,7 +19,7 @@ use core::fmt;
 use jals_build::build_script::{BuildScriptOutput, BuildScriptSession};
 use jals_classpath::{
     ClasspathEntry, Fetcher, MemoryProjectPlan, ProjectInputOptions, ProjectInputPlan,
-    ProjectInputs,
+    ProjectInputs, Warning, WarningOrigin,
 };
 use jals_config::{DependencyScope, Manifest};
 use jals_exec::Exec;
@@ -78,7 +78,7 @@ impl ProjectScript {
     /// The graph-phase entry for a host that deliberately runs no script.
     ///
     /// `jals lint` analyses what is already on disk: opening a folder must not execute an unreviewed
-    /// `build.rhai`, so it enters the graph phase with nothing published and no task classpath.
+    /// `build.java`, so it enters the graph phase with nothing published and no task classpath.
     pub const fn skipped() -> Self {
         Self {
             output: None,
@@ -233,8 +233,8 @@ impl ProjectScript {
         // hierarchy of what it reobfuscates against these, and a member inherited from a jar that is
         // missing keeps its original name in an otherwise remapped archive. Concatenated and not
         // deduplicated here — the set a host finally hands to the remap also carries the resolved
-        // `[dependencies]` jars, which never pass through this function, so the one place all of it
-        // is in hand is the host, and that is where the duplicates are dropped.
+        // `[dependencies]` jars, which are not part of either group here, so the one place all of
+        // it is in hand is the host, and that is where the duplicates are dropped.
         let mut task_classpath = self.task_classpath.clone();
         task_classpath.extend(graph_assembly.task_classpath.iter().cloned());
 
@@ -251,25 +251,32 @@ impl ProjectScript {
             .filter(|node| matches!(node.body, NodeBody::Binary(_)))
             .map(|node| node.id.clone())
             .collect();
-        let mut compile_classpath = graph_assembly.compile_classpath;
+        // The root plan's own resolved jars lead the graph's. A registry dependency is not a graph
+        // node, so `graph_assembly` never carries one and `root_inputs.dependency_jars` is their
+        // only carrier into what a host materializes for `javac`: `inputs` feeds the analysis
+        // index, and a compile classpath that stopped there would let the project lint clean and
+        // fail to compile. They take the position the root's authored `[build] classpath` and task
+        // terminals already hold relative to the graph's entries.
+        let mut compile_classpath: Vec<CompileClasspathEntry> = root_inputs
+            .dependency_jars
+            .iter()
+            .map(Self::resolved_jar_entry)
+            .collect();
+        compile_classpath.append(&mut graph_assembly.compile_classpath);
         compile_classpath
             .retain(|entry| entry.node().is_none_or(|node| !binary_nodes.contains(node)));
-        for key in &graph_inputs.dependency_jars {
-            let path = RelativePath::new([
-                Name::new("dependencies").expect("constant is portable"),
-                Name::new("resolved").expect("constant is portable"),
-                Name::new(format!("{}.jar", key.content().to_hex()))
-                    .expect("digest-derived file name is portable"),
-            ]);
-            compile_classpath.push(CompileClasspathEntry::File(CompileClasspathFile {
-                node: None,
-                path,
-                key: key.clone(),
-            }));
-        }
+        compile_classpath.extend(
+            graph_inputs
+                .dependency_jars
+                .iter()
+                .map(Self::resolved_jar_entry),
+        );
 
         let mut inputs = root_inputs;
         inputs.dependency_jars.extend(graph_inputs.dependency_jars);
+        inputs
+            .named_dependency_jars
+            .extend(graph_inputs.named_dependency_jars);
         inputs
             .classpath_classes
             .extend(graph_inputs.classpath_classes);
@@ -278,6 +285,22 @@ impl ProjectScript {
             .source_dep_sources
             .extend(graph_inputs.source_dep_sources);
         inputs.warnings.extend(graph_inputs.warnings);
+
+        // The two lists one resolved jar can fall between: `inputs` is what an analysis host
+        // indexes, `compile_classpath` is what a compiler is handed. They come out of one projection
+        // and must agree — a jar in the first and not the second lints clean and fails to compile,
+        // which is exactly how every resolved registry jar used to behave — so a deviation is
+        // stated here, where both lists are still attributable, rather than left to `javac`.
+        let gaps = Self::compile_classpath_gaps(&inputs.dependency_jars, &compile_classpath);
+        for key in &gaps {
+            inputs
+                .warnings
+                .push(Self::missing_compile_classpath_entry(key));
+        }
+        debug_assert!(
+            gaps.is_empty(),
+            "resolved dependency jars are missing from the compile classpath: {gaps:?}"
+        );
 
         MemoryProjectAssembly {
             graph: graph_assembly.graph,
@@ -289,6 +312,73 @@ impl ProjectScript {
             warnings: graph_assembly.warnings,
             errors: graph_assembly.errors,
         }
+    }
+
+    /// The compile-classpath entry for one verified resolved jar.
+    ///
+    /// Digest-derived and shared by every producer of one: the same bytes reached by any route
+    /// publish under the same `dependencies/resolved/<digest>.jar`, so two spellings of one archive
+    /// collide in the materialized classpath instead of duplicating it.
+    fn resolved_jar_entry(key: &CacheKey) -> CompileClasspathEntry {
+        CompileClasspathEntry::File(CompileClasspathFile {
+            node: None,
+            path: RelativePath::new([
+                Name::new("dependencies").expect("constant is portable"),
+                Name::new("resolved").expect("constant is portable"),
+                Name::new(format!("{}.jar", key.content().to_hex()))
+                    .expect("digest-derived file name is portable"),
+            ]),
+            key: key.clone(),
+        })
+    }
+
+    /// The resolved dependency jars no compile-classpath entry carries.
+    ///
+    /// [`ProjectInputs::dependency_jars`] is the analysis half of one projection and the compile
+    /// classpath is the compiler half; both plan halves are mapped into each by
+    /// [`project`](Self::project), so a key reported here is a wiring deviation rather than a class
+    /// of dependency. The check exists because the deviation is *silent*: the jar still resolves,
+    /// still downloads, still reaches the analysis index, and the first symptom is `javac`'s
+    /// `cannot find symbol` — which names no jar and says nothing about why it was absent.
+    fn compile_classpath_gaps<'a>(
+        dependency_jars: &'a [CacheKey],
+        compile_classpath: &[CompileClasspathEntry],
+    ) -> Vec<&'a CacheKey> {
+        // `File` entries only: a resolved jar is an archive and reaches a host as one file, where a
+        // `Tree` is a directory of individual class files — an archive nested in that directory is
+        // not read as one, so counting a tree member would let exactly the un-materialized
+        // placement this exists to catch pass.
+        let carried: BTreeSet<&CacheKey> = compile_classpath
+            .iter()
+            .filter_map(|entry| match entry {
+                CompileClasspathEntry::File(file) => Some(&file.key),
+                CompileClasspathEntry::Tree(_) => None,
+            })
+            .collect();
+        // One report per artifact: a jar reached twice is one missing jar, and the answer is
+        // membership either way — carrying a key twice is as valid as carrying it once.
+        let mut gaps: Vec<&CacheKey> = Vec::new();
+        let mut reported: BTreeSet<&CacheKey> = BTreeSet::new();
+        for key in dependency_jars {
+            if !carried.contains(key) && reported.insert(key) {
+                gaps.push(key);
+            }
+        }
+        gaps
+    }
+
+    /// What one gap is reported as: the artifact by its cache address, which is the only name a
+    /// resolved jar has, and the condition itself.
+    ///
+    /// The sentence deliberately stops at the condition. What a reader does about it is not a
+    /// property of one missing key — and the classpath channel is where a host looks for it: this is
+    /// the same report an unreadable jar produces, so it reaches every host that already publishes
+    /// classpath warnings, before any compile starts.
+    fn missing_compile_classpath_entry(key: &CacheKey) -> Warning {
+        Warning::new(
+            WarningOrigin::Artifact(key.clone()),
+            "resolved dependency jar is missing from the compile classpath",
+        )
     }
 }
 
@@ -336,15 +426,20 @@ pub struct MemoryProjectAssembly {
 impl MemoryProjectAssembly {
     /// Everything this assembly reported, in one value.
     ///
-    /// The three channels are not separately readable. The graph's warnings and errors sit here,
-    /// the classpath's input warnings sit inside `inputs`, and a host that reached for the first
-    /// two alone silently dropped the third — which is how an unreadable jar became something only
-    /// a server's stderr ever mentioned. [`ProjectDiagnostics::assemble`] takes this, so there is
-    /// nothing left to forget.
+    /// The four channels are not separately readable. The graph's warnings and errors sit here,
+    /// the classpath's input warnings and errors sit inside `inputs`, and a host that reached for
+    /// the first two alone silently dropped the third — which is how an unreadable jar became
+    /// something only a server's stderr ever mentioned. [`ProjectDiagnostics::assemble`] takes
+    /// this, so there is nothing left to forget.
     ///
     /// [`ProjectDiagnostics::assemble`]: crate::ProjectDiagnostics::assemble
     pub fn report(&self) -> ProjectReport<'_> {
-        ProjectReport::new(&self.warnings, &self.errors, &self.inputs.warnings)
+        ProjectReport::new(
+            &self.warnings,
+            &self.errors,
+            &self.inputs.warnings,
+            &self.inputs.errors,
+        )
     }
 }
 
@@ -912,12 +1007,20 @@ mod tests {
                 Entry::File(
                     FileKey::parse("deps/child/jals.toml").expect("portable key"),
                     b"[build]\nsource-dirs = [\"src\"]\n\
-                      script = { type = \"rhai\", file = \"build.rhai\" }\n"
+                      script = { type = \"java\", file = \"build.java\" }\n"
                         .to_vec(),
                 ),
                 Entry::File(
-                    FileKey::parse("deps/child/build.rhai").expect("portable key"),
-                    br#"tasks.add_classpath(tasks.project_jar("vendor/lib.jar"));"#.to_vec(),
+                    FileKey::parse("deps/child/build.java").expect("portable key"),
+                    br#"import jals.build.Tasks;
+
+class build {
+    public static void main() {
+        Tasks.addClasspath(Tasks.projectJar("vendor/lib.jar"));
+    }
+}
+"#
+                    .to_vec(),
                 ),
                 Entry::File(
                     FileKey::parse("deps/child/vendor/lib.jar").expect("portable key"),
@@ -1087,14 +1190,22 @@ mod tests {
     fn script_classpath_directives_land_after_the_authored_entries() {
         block_on_inline(async {
             let manifest: Manifest = "[build]\nclasspath = [\"lib/first.class\"]\n\
-                 script = { type = \"rhai\", file = \"build.rhai\" }\n"
+                 script = { type = \"java\", file = \"build.java\" }\n"
                 .parse()
                 .expect("test manifest is valid");
             let mut storage = MemoryStorage::memory(
                 CodeTree::new([
                     Entry::File(
-                        FileKey::parse("build.rhai").expect("portable key"),
-                        br#"build.add_classpath("lib/second.class");"#.to_vec(),
+                        FileKey::parse("build.java").expect("portable key"),
+                        br#"import jals.build.Build;
+
+class build {
+    public static void main() {
+        Build.addClasspath("lib/second.class");
+    }
+}
+"#
+                        .to_vec(),
                     ),
                     Entry::File(
                         FileKey::parse("lib/first.class").expect("portable key"),
@@ -1137,5 +1248,114 @@ mod tests {
             script.augment_classpath(&mut augmented);
             assert_eq!(augmented.build.classpath.len(), 2);
         });
+    }
+
+    /// A project holding one `jar` dependency, packaged as a real archive so a classpath load under
+    /// `Editor` has something valid to read.
+    fn project_with_jar_dependency() -> MemoryStorage {
+        const BOX_CLASS: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../jals-classpath/tests/fixtures/Box.class"
+        ));
+        let jar = jals_classpath::JarPackage::write(
+            &[(
+                RelativePath::parse("Box.class").expect("portable path"),
+                BOX_CLASS.to_vec(),
+            )],
+            None,
+        )
+        .expect("packaging one class is infallible");
+        MemoryStorage::memory(
+            CodeTree::new([
+                Entry::File(
+                    FileKey::parse("src/Main.java").expect("portable key"),
+                    b"class Main {}".to_vec(),
+                ),
+                Entry::File(FileKey::parse("lib/lib.jar").expect("portable key"), jar),
+            ])
+            .expect("tree is valid"),
+        )
+    }
+
+    /// The mode decides what a host navigates and what it parses, never whether a resolved jar is
+    /// handed to the compiler: `dependency_jars` and the compile classpath are produced together,
+    /// before the options apply. The audit that followed the registry leak — it was `Compile`-shaped
+    /// and mode-independent, so no per-mode test would have caught it — is why all three are here.
+    #[test]
+    fn every_inputs_policy_hands_a_resolved_dependency_jar_to_the_compiler() {
+        block_on_inline(async {
+            let manifest: Manifest = "[build]\nsource-dirs = [\"src\"]\n\
+                 [dependencies]\nlib = { jar = \"lib/lib.jar\" }\n"
+                .parse()
+                .expect("test manifest is valid");
+            for options in [
+                ProjectInputOptions::Editor,
+                ProjectInputOptions::Compile,
+                ProjectInputOptions::Analysis,
+            ] {
+                let mut storage = project_with_jar_dependency();
+                let assembly = ProjectScript::skipped()
+                    .resolve_memory(
+                        &manifest,
+                        &mut storage,
+                        inert!(),
+                        DependencyScope::Build,
+                        options,
+                    )
+                    .await
+                    .expect("a project-file jar resolves offline");
+
+                assert!(
+                    assembly.errors.is_empty(),
+                    "{options:?}: {:?}",
+                    assembly.errors
+                );
+                let [jar] = assembly.inputs.dependency_jars.as_slice() else {
+                    panic!(
+                        "{options:?}: expected exactly one resolved jar, got {:?}",
+                        assembly.inputs.dependency_jars
+                    );
+                };
+                assert_eq!(
+                    assembly.compile_classpath,
+                    vec![ProjectScript::resolved_jar_entry(jar)],
+                    "{options:?}: the resolved jar is the compile classpath"
+                );
+            }
+        });
+    }
+
+    /// The tripwire under the projection, pinned on its own because the projection's own call site
+    /// refuses in debug: a key any entry carries is not a gap, and one no entry carries is.
+    #[test]
+    fn a_dependency_jar_no_compile_entry_carries_is_a_gap() {
+        let carried = CacheKey::new(
+            CacheNamespace::DependencyJar,
+            ProvenanceFold::new(b"consistency-test\0").finish(),
+            ContentDigest::of(b"carried"),
+        );
+        let gap = CacheKey::new(
+            CacheNamespace::DependencyJar,
+            ProvenanceFold::new(b"consistency-gap\0").finish(),
+            ContentDigest::of(b"gap"),
+        );
+        let compile_classpath = vec![ProjectScript::resolved_jar_entry(&carried)];
+
+        // Both keys repeat, in both directions: a jar reached twice is one artifact, whether it is
+        // carried or missing, so the check answers membership and one report per artifact.
+        let resolved = [carried.clone(), gap.clone(), carried, gap.clone()];
+        let gaps = ProjectScript::compile_classpath_gaps(&resolved, &compile_classpath);
+        assert_eq!(gaps, [&gap]);
+
+        // The report names the artifact — the only name a resolved jar has — and the condition.
+        // Rendered whole, because that is what every host publishes.
+        assert_eq!(
+            ProjectScript::missing_compile_classpath_entry(&gap).to_string(),
+            format!(
+                "cached DependencyJar {}: resolved dependency jar is missing from the compile \
+                 classpath",
+                &gap.content().to_hex()[..12]
+            )
+        );
     }
 }

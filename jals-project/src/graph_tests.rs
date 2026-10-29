@@ -112,6 +112,28 @@ fn classpath_contains(entry: &CompileClasspathEntry, suffix: &str) -> bool {
     }
 }
 
+/// Every resolved dependency jar is on the compile classpath a host materializes for `javac`.
+///
+/// The assertion that `inputs.dependency_jars` alone cannot make: that list is what an analysis host
+/// indexes, and the registry leak shipped behind exactly that asymmetry — a jar present there and
+/// absent from the compiler's classpath, so the project linted clean and failed to compile. One
+/// direction only, deliberately: task artifacts and declared `[build] classpath` entries sit on the
+/// compile classpath without being resolved dependency jars.
+fn assert_dependency_jars_reach_the_compile_classpath(assembly: &crate::NativeProjectAssembly) {
+    for key in &assembly.inputs.dependency_jars {
+        assert!(
+            assembly.compile_classpath.iter().any(|entry| match entry {
+                CompileClasspathEntry::File(file) => &file.key == key,
+                // A tree entry is a directory of class files; a resolved jar is an archive by
+                // type and is never materialized as one member of one.
+                CompileClasspathEntry::Tree(_) => false,
+            }),
+            "resolved jar {key:?} is not on the compile classpath: {:?}",
+            assembly.compile_classpath
+        );
+    }
+}
+
 async fn storage(root: &Path, exec: &Exec) -> NativeStorage {
     NativeStorage::native(root, root.join(".cache"), exec.clone())
         .await
@@ -890,6 +912,9 @@ fn native_compile_classpath_keeps_mixed_local_and_remote_order() {
                 ),
                 ProjectInputOptions::Compile,
                 &jals_progress::Progress::SILENT,
+                DependencyScope::Build,
+                &ResolvedBuildFeatures::default(),
+                None,
             )
             .await;
         assert!(assembly.errors.is_empty(), "{:?}", assembly.errors);
@@ -928,21 +953,28 @@ fn every_node_kind_preprocesses_and_scripts_export_only_sources_and_classpath() 
         write(
             project.path(),
             "scripted/jals.toml",
-            "[build]\nsource-dirs = [\"src\"]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+            "[build]\nsource-dirs = [\"src\"]\nscript = { type = \"java\", file = \"build.java\" }\n",
         );
         write(
             project.path(),
-            "scripted/build.rhai",
+            "scripted/build.java",
             r#"
-                let generated = output.write_text("Generated.java", "class Generated {}");
-                let generated_cp = output.write("generated.jar", [1, 2, 3]);
-                build.add_source(generated);
-                build.add_source("src/Existing.java");
-                build.add_classpath(generated_cp);
-                build.add_classpath("lib/existing.jar");
-                build.add_javac_arg("-should-not-propagate");
-                build.add_jvm_arg("-also-not-propagated");
-                build.metadata("private", "value");
+                import jals.build.Build;
+                import jals.build.Output;
+
+                class build {
+                    public static void main() {
+                        String generated = Output.writeText("Generated.java", "class Generated {}");
+                        String generatedCp = Output.write("generated.jar", new byte[] {1, 2, 3});
+                        Build.addSource(generated);
+                        Build.addSource("src/Existing.java");
+                        Build.addClasspath(generatedCp);
+                        Build.addClasspath("lib/existing.jar");
+                        Build.addJavacArg("-should-not-propagate");
+                        Build.addJvmArg("-also-not-propagated");
+                        Build.metadata("private", "value");
+                    }
+                }
             "#,
         );
         write(
@@ -1014,13 +1046,23 @@ fn node_tokens_isolate_identical_script_paths_and_outputs() {
             write(
                 project.path(),
                 &format!("{dependency}/jals.toml"),
-                "[build]\nsource-dirs = [\"src\"]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+                "[build]\nsource-dirs = [\"src\"]\nscript = { type = \"java\", file = \"build.java\" }\n",
             );
             write(
                 project.path(),
-                &format!("{dependency}/build.rhai"),
+                &format!("{dependency}/build.java"),
                 format!(
-                    "let source = output.write_text(\"Same.java\", \"class {class_name} {{}}\"); build.add_source(source);"
+                    "\
+import jals.build.Build;
+import jals.build.Output;
+
+class build {{
+    public static void main() {{
+        String source = Output.writeText(\"Same.java\", \"class {class_name} {{}}\");
+        Build.addSource(source);
+    }}
+}}
+"
                 ),
             );
         }
@@ -1229,6 +1271,9 @@ fn native_projection_returns_watch_paths_and_applies_mode_downstream() {
                 &UnreachableFetcher,
                 ProjectInputOptions::Analysis,
                 &jals_progress::Progress::SILENT,
+                DependencyScope::Build,
+                &ResolvedBuildFeatures::default(),
+                None,
             )
             .await;
         assert_eq!(
@@ -1249,6 +1294,9 @@ fn native_projection_returns_watch_paths_and_applies_mode_downstream() {
                 &UnreachableFetcher,
                 ProjectInputOptions::Editor,
                 &jals_progress::Progress::SILENT,
+                DependencyScope::Build,
+                &ResolvedBuildFeatures::default(),
+                None,
             )
             .await;
         assert_eq!(editor.inputs.source_dep_sources.len(), 1);
@@ -1305,6 +1353,7 @@ fn resolve_native_runs_the_whole_graph_phase_in_one_call() {
                 inert!(),
                 DependencyScope::Build,
                 ProjectInputOptions::Editor,
+                None,
             )
             .await
             .unwrap();
@@ -1338,6 +1387,356 @@ fn resolve_native_runs_the_whole_graph_phase_in_one_call() {
     .unwrap();
 }
 
+/// A registry dependency's activation comes from the root's own selection. Registry entries are
+/// skipped by the graph walk, so `project_native` must lower them under the same `scope`/`features`
+/// the walk resolved: a hardcoded build scope and an empty feature set would drop an optional entry
+/// the root's `default` feature activates (and every dev entry a test run declares).
+#[test]
+fn resolve_native_lowers_registry_dependencies_under_the_roots_selection() {
+    const BASE: &str = "https://repo.test/maven2";
+
+    jals_exec::tokio_rt::run(|exec| async move {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "src/main/java/Root.java", "class Root {}\n");
+        let root = manifest(
+            "[registries.test]\nurl = \"https://repo.test/maven2\"\n\
+             [dependencies]\n\
+             opt = { group = \"com.example\", version = \"1\", registry = \"test\", optional = true }\n\
+             [features]\ndefault = [\"opt\"]\n",
+        );
+        let features = root.resolve_build_features(&[], false, false).unwrap();
+        let mut root_storage = storage(project.path(), &exec).await;
+
+        let metadata = format!("{BASE}/com/example/opt/maven-metadata.xml");
+        let pom = format!("{BASE}/com/example/opt/1.0.0/opt-1.0.0.pom");
+        let jar = format!("{BASE}/com/example/opt/1.0.0/opt-1.0.0.jar");
+        let files: [(&str, &[u8]); 3] = [
+            (
+                metadata.as_str(),
+                br"<metadata><versioning><versions><version>1.0.0</version></versions></versioning></metadata>",
+            ),
+            (
+                pom.as_str(),
+                br"<project><groupId>com.example</groupId><artifactId>opt</artifactId><version>1.0.0</version></project>",
+            ),
+            (jar.as_str(), b"opt-bytes"),
+        ];
+        let fetcher = CountingFetcher::new(&files);
+        let mut registry = jals_classpath::RegistryResolution::default();
+        let assembly = ProjectScript::skipped()
+            .resolve_native(
+                &root,
+                project.path(),
+                &mut root_storage,
+                GraphPreprocess {
+                    progress: &jals_progress::Progress::SILENT,
+                    exec: &Exec::inline(),
+                    fetcher: &fetcher,
+                    environment: &BuildScriptEnvironment::new(),
+                    root_features: &features,
+                    limits: &BuildScriptLimits::default(),
+                },
+                DependencyScope::Build,
+                ProjectInputOptions::Compile,
+                Some(&mut registry),
+            )
+            .await
+            .unwrap();
+
+        assert!(assembly.errors.is_empty(), "{:?}", assembly.errors);
+        // The optional entry `default` activates reached the lock...
+        let lock = registry
+            .resolved_lock
+            .expect("the registry resolution produced a lock");
+        assert!(
+            lock.packages
+                .iter()
+                .any(|package| package.id.name.as_str() == "com.example:opt"),
+            "{:?}",
+            lock.packages
+        );
+        // ...and the same resolution put its jar on the classpath.
+        assert_eq!(
+            assembly.inputs.dependency_jars.len(),
+            1,
+            "fetched: {:?}",
+            fetcher.calls()
+        );
+        // ...and on the *compile* classpath, which is what a host materializes for `javac`. A jar
+        // only in `inputs` feeds the analysis index and is then compiled against nothing: the
+        // project lints clean and fails to compile. This project declares no graph dependency, so
+        // the resolved jar is the whole compile classpath.
+        let [CompileClasspathEntry::File(file)] = assembly.compile_classpath.as_slice() else {
+            panic!(
+                "the registry jar must be on the compile classpath: {:?}",
+                assembly.compile_classpath
+            );
+        };
+        assert_eq!(file.key, assembly.inputs.dependency_jars[0]);
+    })
+    .unwrap();
+}
+
+/// The workspace path: when a root has resolved one lock for every member, a member's own classpath
+/// pass pins against it (`RegistryResolution::generate_lock == false`) instead of generating one.
+///
+/// A lock is a version decision, not a classpath, so what the member still has to do is resolve its
+/// own selection against it and put the result on the compile classpath — the direct packages and
+/// the ones their POMs pull in alike. This is the state `jals-cli`'s workspace block hands over, and
+/// the member pass is the only place those jars can reach `javac`.
+#[test]
+fn a_workspace_member_pins_its_resolved_registry_jars_onto_the_compile_classpath() {
+    const BASE: &str = "https://repo.test/maven2";
+
+    jals_exec::tokio_rt::run(|exec| async move {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "src/main/java/Root.java", "class Root {}\n");
+        let member = manifest(
+            "[package]\nname = \"member\"\n\
+             [registries.test]\nurl = \"https://repo.test/maven2\"\n\
+             [dependencies]\nlib = { group = \"com.example\", version = \"1\", registry = \"test\" }\n",
+        );
+        // A second member, so this is a workspace lock and not one project's own lock beside it.
+        let sibling = manifest("[package]\nname = \"sibling\"\n");
+        let metadata = format!("{BASE}/com/example/lib/maven-metadata.xml");
+        let lib_pom = format!("{BASE}/com/example/lib/1.0.0/lib-1.0.0.pom");
+        let shared_pom = format!("{BASE}/com/example/shared/2.0.0/shared-2.0.0.pom");
+        let lib_jar = format!("{BASE}/com/example/lib/1.0.0/lib-1.0.0.jar");
+        let shared_jar = format!("{BASE}/com/example/shared/2.0.0/shared-2.0.0.jar");
+        let files: [(&str, &[u8]); 5] = [
+            (
+                metadata.as_str(),
+                br"<metadata><versioning><versions><version>1.0.0</version></versions></versioning></metadata>",
+            ),
+            (
+                lib_pom.as_str(),
+                br"<project>
+                      <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0.0</version>
+                      <dependencies>
+                        <dependency><groupId>com.example</groupId><artifactId>shared</artifactId><version>2.0.0</version></dependency>
+                      </dependencies>
+                    </project>",
+            ),
+            (
+                shared_pom.as_str(),
+                br"<project><groupId>com.example</groupId><artifactId>shared</artifactId><version>2.0.0</version></project>",
+            ),
+            (lib_jar.as_str(), b"lib-bytes"),
+            (shared_jar.as_str(), b"shared-bytes"),
+        ];
+        let fetcher = CountingFetcher::new(&files);
+        let workspace = jals_classpath::RegistryResolver::resolve_workspace(
+            &[&member, &sibling],
+            &fetcher,
+            None,
+        )
+        .await
+        .unwrap();
+        let lock_text = workspace
+            .lock
+            .expect("the workspace lock covers both packages")
+            .render();
+
+        let mut root_storage = storage(project.path(), &exec).await;
+        // What `jals-cli` holds after its workspace block: the lock to pin against, and no licence
+        // for the member-scoped pass to generate its own. Parsed back from text because that is how
+        // a host reads one — the lock on disk, not a resolver value handed around in memory.
+        let mut registry = jals_classpath::RegistryResolution::from_lock_text(Some(&lock_text))
+            .expect("the rendered workspace lock parses back");
+        registry.generate_lock = false;
+        let assembly = ProjectScript::skipped()
+            .resolve_native(
+                &member,
+                project.path(),
+                &mut root_storage,
+                GraphPreprocess {
+                    progress: &jals_progress::Progress::SILENT,
+                    exec: &exec,
+                    fetcher: &fetcher,
+                    environment: &BuildScriptEnvironment::new(),
+                    root_features: &ResolvedBuildFeatures::default(),
+                    limits: &BuildScriptLimits::default(),
+                },
+                DependencyScope::Build,
+                ProjectInputOptions::Compile,
+                Some(&mut registry),
+            )
+            .await
+            .unwrap();
+
+        assert!(assembly.errors.is_empty(), "{:?}", assembly.errors);
+        // The member pass pinned without producing a lock: the workspace's is the file the host
+        // writes, and a member-scoped replacement would shrink it to one member.
+        assert!(
+            registry.resolved_lock.is_none(),
+            "{:?}",
+            registry.resolved_lock
+        );
+        // Both the direct package and the one its POM pulls in: a classpath that stopped at the
+        // direct edge would compile against half of what the lock resolved.
+        let packages: Vec<String> = registry.packages.iter().map(ToString::to_string).collect();
+        assert_eq!(packages, ["com.example:lib", "com.example:shared"]);
+        assert_eq!(
+            assembly.inputs.dependency_jars.len(),
+            2,
+            "fetched: {:?}",
+            fetcher.calls()
+        );
+        assert_dependency_jars_reach_the_compile_classpath(&assembly);
+    })
+    .unwrap();
+}
+
+/// `[dev-dependencies]` under a test scope: the dev entry is a classpath input for a test run and
+/// nothing under a build. The lock pass resolves it either way — a lock that moved with the scope
+/// would rewrite itself between `jals build` and `jals test` — so the two must still disagree about
+/// the classpath.
+#[test]
+fn a_dev_registry_dependency_reaches_the_compile_classpath_only_under_the_test_scope() {
+    const BASE: &str = "https://repo.test/maven2";
+
+    jals_exec::tokio_rt::run(|exec| async move {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "src/main/java/Root.java", "class Root {}\n");
+        let root = manifest(
+            "[registries.test]\nurl = \"https://repo.test/maven2\"\n\
+             [dev-dependencies]\nharness = { group = \"com.example\", version = \"4.0.0\", registry = \"test\" }\n",
+        );
+        let pom = format!("{BASE}/com/example/harness/4.0.0/harness-4.0.0.pom");
+        let jar = format!("{BASE}/com/example/harness/4.0.0/harness-4.0.0.jar");
+        let files: [(&str, &[u8]); 2] = [
+            (
+                pom.as_str(),
+                br"<project><groupId>com.example</groupId><artifactId>harness</artifactId><version>4.0.0</version></project>",
+            ),
+            (jar.as_str(), b"harness-bytes"),
+        ];
+        let fetcher = CountingFetcher::new(&files);
+
+        for (scope, expected) in [(DependencyScope::Build, 0), (DependencyScope::Test, 1)] {
+            let mut root_storage = storage(project.path(), &exec).await;
+            let mut registry = jals_classpath::RegistryResolution::default();
+            let assembly = ProjectScript::skipped()
+                .resolve_native(
+                    &root,
+                    project.path(),
+                    &mut root_storage,
+                    GraphPreprocess {
+                        progress: &jals_progress::Progress::SILENT,
+                        exec: &exec,
+                        fetcher: &fetcher,
+                        environment: &BuildScriptEnvironment::new(),
+                        root_features: &ResolvedBuildFeatures::default(),
+                        limits: &BuildScriptLimits::default(),
+                    },
+                    scope,
+                    ProjectInputOptions::Compile,
+                    Some(&mut registry),
+                )
+                .await
+                .unwrap();
+
+            assert!(assembly.errors.is_empty(), "{scope:?}: {:?}", assembly.errors);
+            assert_eq!(
+                assembly.inputs.dependency_jars.len(),
+                expected,
+                "{scope:?} classpath"
+            );
+            assert_dependency_jars_reach_the_compile_classpath(&assembly);
+            // The lock is feature- and scope-independent, so it covers the dev entry even when the
+            // build classpath does not. A classpath that followed the lock would carry it always.
+            let lock = registry
+                .resolved_lock
+                .expect("the lock pass covers the dev table");
+            assert!(
+                lock.packages
+                    .iter()
+                    .any(|package| package.id.name.as_str() == "com.example:harness"),
+                "{scope:?}: {:?}",
+                lock.packages
+            );
+        }
+    })
+    .unwrap();
+}
+
+/// An optional registry entry is on the compile classpath exactly when the selection activates it —
+/// and the lock covers it in both runs, for the reason the dev case states. The pair is the whole
+/// rule: the activation decides the classpath, never the lock.
+#[test]
+fn an_optional_registry_dependency_reaches_the_compile_classpath_only_when_active() {
+    const BASE: &str = "https://repo.test/maven2";
+
+    jals_exec::tokio_rt::run(|exec| async move {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "src/main/java/Root.java", "class Root {}\n");
+        let root = manifest(
+            "[registries.test]\nurl = \"https://repo.test/maven2\"\n\
+             [features]\npick = [\"dep:opt\"]\n\
+             [dependencies]\nopt = { group = \"com.example\", version = \"3.0.0\", registry = \"test\", optional = true }\n",
+        );
+        let pom = format!("{BASE}/com/example/opt/3.0.0/opt-3.0.0.pom");
+        let jar = format!("{BASE}/com/example/opt/3.0.0/opt-3.0.0.jar");
+        let files: [(&str, &[u8]); 2] = [
+            (
+                pom.as_str(),
+                br"<project><groupId>com.example</groupId><artifactId>opt</artifactId><version>3.0.0</version></project>",
+            ),
+            (jar.as_str(), b"opt-bytes"),
+        ];
+        let fetcher = CountingFetcher::new(&files);
+
+        for (selected, expected) in [
+            (Vec::<String>::new(), 0),
+            (vec!["pick".to_owned()], 1),
+        ] {
+            let features = root.resolve_build_features(&selected, false, false).unwrap();
+            let mut root_storage = storage(project.path(), &exec).await;
+            let mut registry = jals_classpath::RegistryResolution::default();
+            let assembly = ProjectScript::skipped()
+                .resolve_native(
+                    &root,
+                    project.path(),
+                    &mut root_storage,
+                    GraphPreprocess {
+                        progress: &jals_progress::Progress::SILENT,
+                        exec: &exec,
+                        fetcher: &fetcher,
+                        environment: &BuildScriptEnvironment::new(),
+                        root_features: &features,
+                        limits: &BuildScriptLimits::default(),
+                    },
+                    DependencyScope::Build,
+                    ProjectInputOptions::Compile,
+                    Some(&mut registry),
+                )
+                .await
+                .unwrap();
+
+            assert!(assembly.errors.is_empty(), "{selected:?}: {:?}", assembly.errors);
+            assert_eq!(
+                assembly.inputs.dependency_jars.len(),
+                expected,
+                "{selected:?} classpath"
+            );
+            assert_dependency_jars_reach_the_compile_classpath(&assembly);
+            // The full lock pass resolves the unactivated entry too, so the lock is not the thing
+            // that decided the classpath in either run.
+            let lock = registry
+                .resolved_lock
+                .expect("the full pass covers the optional entry");
+            assert!(
+                lock.packages
+                    .iter()
+                    .any(|package| package.id.name.as_str() == "com.example:opt"),
+                "{selected:?}: {:?}",
+                lock.packages
+            );
+        }
+    })
+    .unwrap();
+}
+
 #[test]
 fn dependency_snapshots_exclude_git_and_jals_cache_inputs() {
     jals_exec::tokio_rt::run(|exec| async move {
@@ -1345,14 +1744,21 @@ fn dependency_snapshots_exclude_git_and_jals_cache_inputs() {
         write(
             project.path(),
             "dep/jals.toml",
-            "[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+            "[build]\nscript = { type = \"java\", file = \"build.java\" }\n",
         );
         write(
             project.path(),
-            "dep/build.rhai",
+            "dep/build.java",
             r#"
-                if project.exists("target/jals/cache/secret") || project.exists(".git/secret") {
-                    build.error("excluded host state leaked into the dependency snapshot");
+                import jals.build.Build;
+                import jals.build.Project;
+
+                class build {
+                    public static void main() {
+                        if (Project.exists("target/jals/cache/secret") || Project.exists(".git/secret")) {
+                            Build.error("excluded host state leaked into the dependency snapshot");
+                        }
+                    }
                 }
             "#,
         );
@@ -1555,9 +1961,9 @@ fn task_dependency(script: &str, files: &[(&str, &[u8])]) -> (Manifest, MemorySt
     let defaults: [(&str, &[u8]); 3] = [
         (
             "dep/jals.toml",
-            b"[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+            b"[build]\nscript = { type = \"java\", file = \"build.java\" }\n",
         ),
-        ("dep/build.rhai", script.as_bytes()),
+        ("dep/build.java", script.as_bytes()),
         // A source root the dependency actually has, so capturing it emits no warning.
         ("dep/src/main/java/Seed.java", b"class Seed {}"),
     ];
@@ -1660,10 +2066,16 @@ fn publishing_dependency_with(
     let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
     let script = format!(
         r#"
-            let archive = tasks.project_jar("vendor/sources.jar");
-            let tree = tasks.extract_java(archive, "net/example");
-            tasks.publish_tree("api", tree, "src/main/java/net/example", "replace-root", "{intent}");
-            {extra}
+            import jals.build.Tasks;
+
+            class build {{
+                public static void main() {{
+                    int archive = Tasks.projectJar("vendor/sources.jar");
+                    int tree = Tasks.extractJava(archive, "net/example");
+                    Tasks.publishTree("api", tree, "src/main/java/net/example", "{intent}");
+                    {extra}
+                }}
+            }}
         "#
     );
     let mut all: Vec<(&str, &[u8])> = vec![("dep/vendor/sources.jar", &sources)];
@@ -1679,7 +2091,7 @@ fn manifest_with_classpath(entries: &[&str]) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "[build]\nscript = {{ type = \"rhai\", file = \"build.rhai\" }}\nclasspath = [{list}]\n"
+        "[build]\nscript = {{ type = \"java\", file = \"build.java\" }}\nclasspath = [{list}]\n"
     )
     .into_bytes()
 }
@@ -1740,12 +2152,18 @@ fn a_dependency_build_task_puts_its_jar_on_the_consumer_classpath() {
         let game = jar(&[("pkg/Api.class", b"api")]);
         let script = format!(
             r#"
-                let game = tasks.fetch_jar(
-                    tasks.https_url("https://example.invalid/game.jar"),
-                    tasks.sha256("{}"),
-                    tasks.bytes(4096)
-                );
-                tasks.add_classpath(game);
+                import jals.build.Tasks;
+
+                class build {{
+                    public static void main() {{
+                        int game = Tasks.fetchJar(
+                            Tasks.httpsUrl("https://example.invalid/game.jar"),
+                            Tasks.sha256("{}"),
+                            Tasks.bytes(4096)
+                        );
+                        Tasks.addClasspath(game);
+                    }}
+                }}
             "#,
             jals_storage::ContentDigest::of(&game).to_hex()
         );
@@ -1799,13 +2217,19 @@ fn a_dependency_publication_becomes_navigation_source_and_never_touches_the_snap
         let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
         let script = format!(
             r#"
-                let archive = tasks.fetch_jar(
-                    tasks.https_url("https://example.invalid/sources.jar"),
-                    tasks.sha256("{}"),
-                    tasks.bytes(4096)
-                );
-                let tree = tasks.extract_java(archive, "net/example");
-                tasks.publish_tree("api", tree, "src/main/java/net/example", "replace-root", "navigation");
+                import jals.build.Tasks;
+
+                class build {{
+                    public static void main() {{
+                        int archive = Tasks.fetchJar(
+                            Tasks.httpsUrl("https://example.invalid/sources.jar"),
+                            Tasks.sha256("{}"),
+                            Tasks.bytes(4096)
+                        );
+                        int tree = Tasks.extractJava(archive, "net/example");
+                        Tasks.publishTree("api", tree, "src/main/java/net/example", "navigation");
+                    }}
+                }}
             "#,
             jals_storage::ContentDigest::of(&sources).to_hex()
         );
@@ -1872,13 +2296,19 @@ fn a_dependency_publication_outside_a_source_root_is_rejected() {
         let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
         let script = format!(
             r#"
-                let archive = tasks.fetch_jar(
-                    tasks.https_url("https://example.invalid/sources.jar"),
-                    tasks.sha256("{}"),
-                    tasks.bytes(4096)
-                );
-                let tree = tasks.extract_java(archive, "net/example");
-                tasks.publish_tree("api", tree, "generated/net/example", "replace-root", "navigation");
+                import jals.build.Tasks;
+
+                class build {{
+                    public static void main() {{
+                        int archive = Tasks.fetchJar(
+                            Tasks.httpsUrl("https://example.invalid/sources.jar"),
+                            Tasks.sha256("{}"),
+                            Tasks.bytes(4096)
+                        );
+                        int tree = Tasks.extractJava(archive, "net/example");
+                        Tasks.publishTree("api", tree, "generated/net/example", "navigation");
+                    }}
+                }}
             "#,
             jals_storage::ContentDigest::of(&sources).to_hex()
         );
@@ -1924,7 +2354,16 @@ fn a_dependency_build_script_error_reaches_the_consumer_with_its_message() {
         // reader only that something failed, which is why this asserts the sentence and not the
         // shape.
         let (root, view_storage) = task_dependency(
-            r#"build.warning("check the version features"); build.error("select at most one");"#,
+            r#"
+                import jals.build.Build;
+
+                class build {
+                    public static void main() {
+                        Build.warning("check the version features");
+                        Build.error("select at most one");
+                    }
+                }
+            "#,
             &[],
         );
         let mut cache = MemoryStorage::memory(CodeTree::default());
@@ -1973,8 +2412,14 @@ fn a_dependency_task_execution_is_memoized_across_preprocessing() {
         // makes the plan impossible to execute a second time. If the second preprocess still
         // succeeds with the same result, it can only have come from the recorded execution.
         let script = r#"
-            let vendor = tasks.project_jar("vendor/lib.jar");
-            tasks.add_classpath(vendor);
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    int vendor = Tasks.projectJar("vendor/lib.jar");
+                    Tasks.addClasspath(vendor);
+                }
+            }
         "#;
         let library = jar(&[("pkg/Api.class", b"api")]);
         let (root, with_jar) = task_dependency(script, &[("dep/vendor/lib.jar", &library)]);
@@ -2012,9 +2457,16 @@ fn a_memoized_dependency_execution_is_keyed_on_its_build_features() {
         // Two feature selections produce two plans. Sharing one record between them would serve
         // whichever ran first, silently building the wrong thing.
         let script = r#"
-            let name = if build.feature("wide") { "wide" } else { "narrow" };
-            let vendor = tasks.project_jar("vendor/" + name + ".jar");
-            tasks.add_classpath(vendor);
+            import jals.build.Build;
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    String name = Build.feature("wide") ? "wide" : "narrow";
+                    int vendor = Tasks.projectJar("vendor/" + name + ".jar");
+                    Tasks.addClasspath(vendor);
+                }
+            }
         "#;
         let narrow = jar(&[("pkg/Narrow.class", b"narrow")]);
         let wide = jar(&[("pkg/Wide.class", b"wide")]);
@@ -2022,7 +2474,7 @@ fn a_memoized_dependency_execution_is_keyed_on_its_build_features() {
             (
                 "dep/jals.toml",
                 b"[features]\nwide = []\n\
-                  [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+                  [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
             ),
             ("dep/vendor/narrow.jar", &narrow),
             ("dep/vendor/wide.jar", &wide),
@@ -2064,14 +2516,20 @@ fn a_dependency_publication_reaches_the_editor_but_not_the_compiler() {
         let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
         let script = format!(
             r#"
-                let archive = tasks.fetch_jar(
-                    tasks.https_url("https://example.invalid/sources.jar"),
-                    tasks.sha256("{}"),
-                    tasks.bytes(4096)
-                );
-                tasks.add_classpath(archive);
-                let tree = tasks.extract_java(archive, "net/example");
-                tasks.publish_tree("api", tree, "src/main/java/net/example", "replace-root", "navigation");
+                import jals.build.Tasks;
+
+                class build {{
+                    public static void main() {{
+                        int archive = Tasks.fetchJar(
+                            Tasks.httpsUrl("https://example.invalid/sources.jar"),
+                            Tasks.sha256("{}"),
+                            Tasks.bytes(4096)
+                        );
+                        Tasks.addClasspath(archive);
+                        int tree = Tasks.extractJava(archive, "net/example");
+                        Tasks.publishTree("api", tree, "src/main/java/net/example", "navigation");
+                    }}
+                }}
             "#,
             jals_storage::ContentDigest::of(&sources).to_hex()
         );
@@ -2129,7 +2587,11 @@ fn a_dependency_publication_reaches_the_editor_but_not_the_compiler() {
             &jals_progress::Progress::SILENT,
         )
         .await;
-        assert!(compile.library_sources.is_empty());
+        assert!(
+            compile.library_sources.is_empty(),
+            "{:?}",
+            compile.library_sources
+        );
         assert!(
             compile
                 .source_dep_sources
@@ -2319,9 +2781,15 @@ fn a_compile_intent_publication_outside_a_source_root_is_rejected() {
         let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
         let (root, view_storage) = task_dependency(
             r#"
-                let archive = tasks.project_jar("vendor/sources.jar");
-                let tree = tasks.extract_java(archive, "net/example");
-                tasks.publish_tree("api", tree, "generated/net/example", "replace-root", "compile");
+                import jals.build.Tasks;
+
+                class build {
+                    public static void main() {
+                        int archive = Tasks.projectJar("vendor/sources.jar");
+                        int tree = Tasks.extractJava(archive, "net/example");
+                        Tasks.publishTree("api", tree, "generated/net/example", "compile");
+                    }
+                }
             "#,
             &[("dep/vendor/sources.jar", &sources)],
         );
@@ -2401,11 +2869,12 @@ fn a_publication_the_task_classpath_backs_is_silent() {
         let classes = jar(&[("net/example/Api.class", b"class bytes")]);
         let (root, storage) = publishing_dependency_with(
             "navigation",
-            r#"tasks.add_classpath(tasks.project_jar("vendor/lib.jar"));"#,
+            r#"Tasks.addClasspath(Tasks.projectJar("vendor/lib.jar"));"#,
             &[("dep/vendor/lib.jar", &classes)],
         );
 
-        assert!(publication_diagnoses(&root, &storage).await.is_empty());
+        let diagnoses = publication_diagnoses(&root, &storage).await;
+        assert!(diagnoses.is_empty(), "{diagnoses:?}");
     });
 }
 
@@ -2427,7 +2896,8 @@ fn a_build_classpath_jar_backs_a_publication() {
             ],
         );
 
-        assert!(publication_diagnoses(&root, &storage).await.is_empty());
+        let diagnoses = publication_diagnoses(&root, &storage).await;
+        assert!(diagnoses.is_empty(), "{diagnoses:?}");
     });
 }
 
@@ -2447,7 +2917,8 @@ fn a_build_classpath_directory_backs_a_publication() {
             ],
         );
 
-        assert!(publication_diagnoses(&root, &storage).await.is_empty());
+        let diagnoses = publication_diagnoses(&root, &storage).await;
+        assert!(diagnoses.is_empty(), "{diagnoses:?}");
     });
 }
 
@@ -2460,11 +2931,10 @@ fn only_the_unbacked_root_of_a_multi_root_publication_is_diagnosed() {
         let (root, storage) = publishing_dependency_with(
             "navigation",
             r#"
-                tasks.add_classpath(tasks.project_jar("vendor/lib.jar"));
-                let extra = tasks.project_jar("vendor/library.jar");
-                let second = tasks.extract_java(extra, "org/vendor");
-                tasks.publish_tree("tool", second, "src/main/java/org/vendor", "replace-root",
-                                   "navigation");
+                Tasks.addClasspath(Tasks.projectJar("vendor/lib.jar"));
+                int extra = Tasks.projectJar("vendor/library.jar");
+                int second = Tasks.extractJava(extra, "org/vendor");
+                Tasks.publishTree("tool", second, "src/main/java/org/vendor", "navigation");
             "#,
             &[
                 ("dep/vendor/lib.jar", &classes),
@@ -2493,11 +2963,12 @@ fn two_publications_sharing_a_package_tree_are_covered_together() {
             "net/example/deep/Deep.java",
             b"package net.example.deep; class Deep {}",
         )]);
+        // `deepTree` rather than `tree`: the appended statements land in the same `main` the
+        // fixture's own `tree` local is declared in, and Java has no shadowing in one scope.
         let extra = r#"
-            let nested = tasks.project_jar("vendor/deep.jar");
-            let tree = tasks.extract_java(nested, "net/example/deep");
-            tasks.publish_tree("deep", tree, "src/main/java/net/example/deep", "replace-root",
-                               "navigation");
+            int nested = Tasks.projectJar("vendor/deep.jar");
+            int deepTree = Tasks.extractJava(nested, "net/example/deep");
+            Tasks.publishTree("deep", deepTree, "src/main/java/net/example/deep", "navigation");
         "#;
 
         let (root, storage) =
@@ -2518,14 +2989,15 @@ fn two_publications_sharing_a_package_tree_are_covered_together() {
             "navigation",
             &format!(
                 r#"{extra}
-                   tasks.add_classpath(tasks.project_jar("vendor/lib.jar"));"#
+                   Tasks.addClasspath(Tasks.projectJar("vendor/lib.jar"));"#
             ),
             &[
                 ("dep/vendor/deep.jar", &deep),
                 ("dep/vendor/lib.jar", &classes),
             ],
         );
-        assert!(publication_diagnoses(&root, &storage).await.is_empty());
+        let diagnoses = publication_diagnoses(&root, &storage).await;
+        assert!(diagnoses.is_empty(), "{diagnoses:?}");
     });
 }
 
@@ -2541,7 +3013,7 @@ fn a_publishing_dependency_with_dependencies_still_reports_and_says_what_it_coul
             &[
                 (
                     "dep/jals.toml",
-                    b"[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n\
+                    b"[build]\nscript = { type = \"java\", file = \"build.java\" }\n\
                       [dependencies]\nlib = { jar = \"vendor/lib.jar\" }\n",
                 ),
                 ("dep/vendor/lib.jar", &classes),
@@ -2563,15 +3035,14 @@ fn the_dependencies_caveat_belongs_to_the_report_and_not_to_each_root() {
         let (root, storage) = publishing_dependency_with(
             "navigation",
             r#"
-                let extra = tasks.project_jar("vendor/library.jar");
-                let second = tasks.extract_java(extra, "org/vendor");
-                tasks.publish_tree("tool", second, "src/main/java/org/vendor", "replace-root",
-                                   "navigation");
+                int extra = Tasks.projectJar("vendor/library.jar");
+                int second = Tasks.extractJava(extra, "org/vendor");
+                Tasks.publishTree("tool", second, "src/main/java/org/vendor", "navigation");
             "#,
             &[
                 (
                     "dep/jals.toml",
-                    b"[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n\
+                    b"[build]\nscript = { type = \"java\", file = \"build.java\" }\n\
                       [dependencies]\nlib = { jar = \"vendor/library.jar\" }\n",
                 ),
                 ("dep/vendor/library.jar", &library),
@@ -2615,10 +3086,9 @@ fn every_unread_classpath_entry_is_named_in_one_report() {
         let (root, storage) = publishing_dependency_with(
             "navigation",
             r#"
-                let extra = tasks.project_jar("vendor/library.jar");
-                let second = tasks.extract_java(extra, "org/vendor");
-                tasks.publish_tree("tool", second, "src/main/java/org/vendor", "replace-root",
-                                   "navigation");
+                int extra = Tasks.projectJar("vendor/library.jar");
+                int second = Tasks.extractJava(extra, "org/vendor");
+                Tasks.publishTree("tool", second, "src/main/java/org/vendor", "navigation");
             "#,
             &[
                 (
@@ -2680,9 +3150,15 @@ fn a_publication_at_a_source_root_is_rejected_before_the_check() {
         let sources = jar(&[("net/example/Api.java", b"package net.example; class Api {}")]);
         let (root, storage) = task_dependency(
             r#"
-                let archive = tasks.project_jar("vendor/sources.jar");
-                let tree = tasks.extract_java(archive, "net/example");
-                tasks.publish_tree("api", tree, "src/main/java", "replace-root", "navigation");
+                import jals.build.Tasks;
+
+                class build {
+                    public static void main() {
+                        int archive = Tasks.projectJar("vendor/sources.jar");
+                        int tree = Tasks.extractJava(archive, "net/example");
+                        Tasks.publishTree("api", tree, "src/main/java", "navigation");
+                    }
+                }
             "#,
             &[("dep/vendor/sources.jar", &sources)],
         );
@@ -2713,12 +3189,18 @@ fn the_root_project_is_never_diagnosed() {
             CodeTree::new(
                 [
                     (
-                        "build.rhai",
+                        "build.java",
                         r#"
-                            let archive = tasks.project_jar("vendor/sources.jar");
-                            let tree = tasks.extract_java(archive, "net/example");
-                            tasks.publish_tree("api", tree, "src/main/java/net/example",
-                                               "replace-root", "navigation");
+                            import jals.build.Tasks;
+
+                            class build {
+                                public static void main() {
+                                    int archive = Tasks.projectJar("vendor/sources.jar");
+                                    int tree = Tasks.extractJava(archive, "net/example");
+                                    Tasks.publishTree("api", tree, "src/main/java/net/example",
+                                                      "navigation");
+                                }
+                            }
                         "#
                         .as_bytes()
                         .to_vec(),
@@ -2732,9 +3214,10 @@ fn the_root_project_is_never_diagnosed() {
             .unwrap(),
         );
         // The same publication a dependency would be diagnosed for, declared by the root itself.
-        let root = manifest("[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n");
+        let root = manifest("[build]\nscript = { type = \"java\", file = \"build.java\" }\n");
 
-        assert!(publication_diagnoses(&root, &storage).await.is_empty());
+        let diagnoses = publication_diagnoses(&root, &storage).await;
+        assert!(diagnoses.is_empty(), "{diagnoses:?}");
     });
 }
 
@@ -2767,11 +3250,8 @@ fn a_recorded_coverage_answer_is_reused_and_a_classpath_edit_invalidates_it() {
                 ("dep/vendor/lib.jar", &classes),
             ],
         );
-        assert!(
-            publication_diagnoses_in(&root, &backed, &mut cache)
-                .await
-                .is_empty()
-        );
+        let backed_diagnoses = publication_diagnoses_in(&root, &backed, &mut cache).await;
+        assert!(backed_diagnoses.is_empty(), "{backed_diagnoses:?}");
     });
 }
 
@@ -3095,6 +3575,7 @@ fn an_offline_graph_does_not_fetch_a_remote_jar_dependency() {
                 },
                 DependencyScope::Build,
                 ProjectInputOptions::Compile,
+                None,
             )
             .await
             .expect("an unreachable dependency is a warning, not a phase failure");

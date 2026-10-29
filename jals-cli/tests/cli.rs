@@ -70,6 +70,119 @@ fn deny_warnings_does_not_swallow_positional_path() {
     assert_eq!(status.code(), Some(0));
 }
 
+#[test]
+fn update_without_registry_dependencies_writes_no_lock() {
+    let project = project("[package]\nname = \"demo\"\n");
+    let output = jals()
+        .arg("update")
+        .arg("--manifest-path")
+        .arg(project.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join("jals.lock").exists(),
+        "an empty lock is not a lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no registry dependencies"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn update_from_a_member_uses_workspace_discovery() {
+    let dir = tempdir().unwrap();
+    // A `default-members` entry that matches nothing is only an error if discovery walked up and
+    // read the root manifest at all, which is exactly what this asserts.
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[workspace]\nmembers = [\"app\"]\ndefault-members = [\"missing\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("app/src/main/java")).unwrap();
+    std::fs::write(
+        dir.path().join("app/jals.toml"),
+        "[package]\nname = \"app\"\n",
+    )
+    .unwrap();
+    let output = jals()
+        .arg("update")
+        .arg("--manifest-path")
+        .arg(dir.path().join("app/jals.toml"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("matches no member"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn package_selects_a_workspace_member_for_build_and_run() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[workspace]\nmembers = [\"app\", \"lib\"]\n\
+         [workspace.package]\nversion = \"1.2.3\"\n\
+         [workspace.build]\njavac-flags = [\"-Xlint:none\"]\n",
+    )
+    .unwrap();
+    for (name, class) in [("app", "Main"), ("lib", "Lib")] {
+        std::fs::create_dir_all(dir.path().join(name).join("src/main/java")).unwrap();
+        std::fs::write(
+            dir.path().join(name).join("jals.toml"),
+            format!("[package]\nname = \"{name}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join(name)
+                .join("src/main/java")
+                .join(format!("{class}.java")),
+            format!("class {class} {{ }}\n"),
+        )
+        .unwrap();
+    }
+
+    let output = jals()
+        .args(["build", "-p", "app", "--dry-run"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Main.java"), "got: {stdout}");
+    assert!(!stdout.contains("Lib.java"), "got: {stdout}");
+    assert!(
+        stdout.contains("-Xlint:none"),
+        "the selected member must receive inherited workspace build defaults: {stdout}"
+    );
+
+    let missing = jals()
+        .args(["build", "-p", "missing", "--dry-run"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("`missing`"),
+        "stderr: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
 /// Build a minimal project tree (`jals.toml` + one source) under a fresh tempdir.
 fn project(manifest: &str) -> tempfile::TempDir {
     let dir = tempdir().unwrap();
@@ -217,7 +330,7 @@ fn names_javac(cmd_line: &str) -> bool {
 #[cfg(unix)]
 #[test]
 fn build_tasks_publish_replace_remove_and_clean_an_exclusive_source_root() {
-    let manifest = "[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n";
+    let manifest = "[build]\nscript = { type = \"java\", file = \"build.java\" }\n";
     let dir = project(manifest);
     let jar = dir.path().join("sources.jar");
     let generated = b"package net.example;\npublic class Generated {}\n";
@@ -228,19 +341,24 @@ fn build_tasks_publish_replace_remove_and_clean_an_exclusive_source_root() {
             ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
         ],
     );
-    let script = dir.path().join("build.rhai");
+    let script = dir.path().join("build.java");
     std::fs::write(
         &script,
         r#"
-            let jar = tasks.project_jar("sources.jar");
-            let sources = tasks.extract_java(jar, "net/example");
-            tasks.publish_tree(
-                "example-sources",
-                sources,
-                "src/main/java/net/example",
-                "replace-root",
-                "navigation"
-            );
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    int jar = Tasks.projectJar("sources.jar");
+                    int sources = Tasks.extractJava(jar, "net/example");
+                    Tasks.publishTree(
+                        "example-sources",
+                        sources,
+                        "src/main/java/net/example",
+                        "navigation"
+                    );
+                }
+            }
         "#,
     )
     .unwrap();
@@ -260,16 +378,26 @@ fn build_tasks_publish_replace_remove_and_clean_an_exclusive_source_root() {
     assert_eq!(std::fs::read(&destination).unwrap(), generated);
     assert!(!destination.parent().unwrap().join("Manual.txt").exists());
 
-    std::fs::write(&script, "let no_tasks = true;\n").unwrap();
+    std::fs::write(
+        &script,
+        "class build { public static void main() { boolean noTasks = true; } }\n",
+    )
+    .unwrap();
     assert!(build_with_fake_javac(dir.path()).status.success());
     assert!(!destination.parent().unwrap().exists());
 
     std::fs::write(
         &script,
         r#"
-            let jar = tasks.project_jar("sources.jar");
-            let sources = tasks.extract_java(jar, "net/example");
-            tasks.publish_tree("example-sources", sources, "src/main/java/net/example", "replace-root", "navigation");
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    int jar = Tasks.projectJar("sources.jar");
+                    int sources = Tasks.extractJava(jar, "net/example");
+                    Tasks.publishTree("example-sources", sources, "src/main/java/net/example", "navigation");
+                }
+            }
         "#,
     )
     .unwrap();
@@ -293,7 +421,7 @@ fn build_tasks_publish_replace_remove_and_clean_an_exclusive_source_root() {
 #[cfg(unix)]
 #[test]
 fn build_dry_run_leaves_an_exclusive_publication_root_untouched() {
-    let manifest = "[build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n";
+    let manifest = "[build]\nscript = { type = \"java\", file = \"build.java\" }\n";
     let dir = project(manifest);
     let jar = dir.path().join("sources.jar");
     write_source_jar(
@@ -304,11 +432,17 @@ fn build_dry_run_leaves_an_exclusive_publication_root_untouched() {
         )],
     );
     std::fs::write(
-        dir.path().join("build.rhai"),
+        dir.path().join("build.java"),
         r#"
-            let jar = tasks.project_jar("sources.jar");
-            let sources = tasks.extract_java(jar, "net/example");
-            tasks.publish_tree("example-sources", sources, "src/main/java/net/example", "replace-root", "navigation");
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    int jar = Tasks.projectJar("sources.jar");
+                    int sources = Tasks.extractJava(jar, "net/example");
+                    Tasks.publishTree("example-sources", sources, "src/main/java/net/example", "navigation");
+                }
+            }
         "#,
     )
     .unwrap();
@@ -353,20 +487,286 @@ fn build_dry_run_prints_javac_command() {
 }
 
 #[test]
+fn modular_auto_puts_classpath_on_the_module_path_when_module_info_is_present() {
+    let dir = project(
+        "[package]\nname = \"modular\"\n\
+         [build]\nmodular = \"auto\"\nclasspath = [\"libs/modules\"]\n",
+    );
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("--module-path"), "got: {stdout}");
+    assert!(stdout.contains("libs/modules"), "got: {stdout}");
+    assert!(
+        !stderr.contains("module-info.java` is compiled"),
+        "got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn modular_auto_warns_about_a_split_package_on_the_module_path() {
+    let dir = project(
+        "[package]\nname = \"split\"\n\
+         [build]\nmodular = \"auto\"\nclasspath = [\"libs/a.jar\", \"libs/b.jar\"]\n",
+    );
+    std::fs::create_dir_all(dir.path().join("libs")).unwrap();
+    write_source_jar(
+        &dir.path().join("libs/a.jar"),
+        &[("com/example/A.class", b"\xca\xfe\xba\xbe")],
+    );
+    write_source_jar(
+        &dir.path().join("libs/b.jar"),
+        &[("com/example/B.class", b"\xca\xfe\xba\xbe")],
+    );
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("split package `com.example`"),
+        "got: {stderr}"
+    );
+    assert!(stderr.contains("a.jar"), "got: {stderr}");
+    assert!(stderr.contains("b.jar"), "got: {stderr}");
+}
+
+#[test]
+fn module_info_with_classpath_mode_points_at_the_module_path_setting() {
+    let dir = project("[package]\nname = \"modular-hint\"\n");
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { exports com.example; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stdout.contains("--module-path"), "got: {stdout}");
+    assert!(stderr.contains("modular = \"auto\""), "got: {stderr}");
+}
+
+#[test]
+fn build_classpath_globs_expand_into_deterministic_javac_arguments() {
+    let dir = project("[package]\nname = \"globs\"\n[build]\nclasspath = [\"libs/*.jar\"]\n");
+    std::fs::create_dir_all(dir.path().join("libs")).unwrap();
+    std::fs::write(dir.path().join("libs/b.jar"), b"b").unwrap();
+    std::fs::write(dir.path().join("libs/a.jar"), b"a").unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let normalized = stdout.replace('\\', "/");
+    assert!(normalized.contains("libs/a.jar"), "got: {stdout}");
+    assert!(normalized.contains("libs/b.jar"), "got: {stdout}");
+    assert!(!normalized.contains("*.jar"), "got: {stdout}");
+    let a = normalized.find("libs/a.jar").unwrap();
+    let b = normalized.find("libs/b.jar").unwrap();
+    assert!(a < b, "glob expansion must be sorted; got: {stdout}");
+
+    // A plain directory keeps its directory entry and adds the jars it holds.
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"globs\"\n[build]\nclasspath = [\"libs\"]\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let normalized = stdout.replace('\\', "/");
+    assert!(normalized.contains("libs/a.jar"), "got: {stdout}");
+    assert!(normalized.contains("libs/b.jar"), "got: {stdout}");
+    assert!(
+        normalized.contains("libs:") || normalized.contains("libs;"),
+        "the directory entry itself must survive: {stdout}"
+    );
+}
+
+#[test]
+fn a_classpath_only_path_dependency_consumes_classes_and_skips_its_sources() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"consumer\"\n\
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
+    )
+    .unwrap();
+    let src = dir.path().join("src/main/java/com/example");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Main.java"),
+        "package com.example;\nclass Main { }\n",
+    )
+    .unwrap();
+    let stub = dir.path().join("stub");
+    std::fs::create_dir_all(stub.join("classes")).unwrap();
+    std::fs::create_dir_all(stub.join("src/main/java")).unwrap();
+    std::fs::write(
+        stub.join("src/main/java/Broken.java"),
+        "class Broken { void m( {\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_full(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        dir.path().join("jals.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let stub_classes = dir
+        .path()
+        .join("stub")
+        .join("classes")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(
+        stdout.replace('\\', "/").contains(&stub_classes),
+        "the stub's classes directory must be on the classpath: {stdout}"
+    );
+    assert!(!stdout.contains("Broken.java"), "got: {stdout}");
+
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        "[package]\nname = \"consumer\"\n\
+         [build]\nbackend = { type = \"jals\" }\n\
+         [dependencies]\nstub = { path = \"stub\", dir = \"classes\", mode = \"classpath\" }\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(dir.path().join("jals.toml"))
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "a classpath-only dependency's sources must not be compiled"
+    );
+}
+
+#[test]
+fn build_excludes_matching_sources_before_javac() {
+    let dir = project(
+        "[package]\nname = \"excluded\"\n\
+         [build]\nexclude = [\"module-info.java\", \"**/Broken.java\"]\n",
+    );
+    let manifest = dir.path().join("jals.toml");
+    let src = dir.path().join("src/main/java/com/example");
+    std::fs::write(
+        dir.path().join("src/main/java/module-info.java"),
+        "module demo { requires not.a.real.module; }\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("Broken.java"), "class Broken { void m( {\n").unwrap();
+    std::fs::write(
+        src.join("Kept.java"),
+        "package com.example; class Kept {}\n",
+    )
+    .unwrap();
+
+    let (stdout, code) = run(&[
+        "build",
+        "--dry-run",
+        "--manifest-path",
+        manifest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "got: {stdout}");
+    assert!(stdout.contains("Main.java"), "got: {stdout}");
+    assert!(stdout.contains("Kept.java"), "got: {stdout}");
+    assert!(!stdout.contains("module-info.java"), "got: {stdout}");
+    assert!(!stdout.contains("Broken.java"), "got: {stdout}");
+
+    // The in-process backend runs without a JDK, so the assertion below is about the compile
+    // failing on an excluded file rather than about the host having `javac`.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"excluded\"\n\
+         [build]\nbackend = { type = \"jals\" }\n\
+         exclude = [\"module-info.java\", \"**/Broken.java\"]\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(status.success(), "an excluded source must not be compiled");
+
+    // Negative control: without the exclusions the same tree must fail, so the success above is
+    // attributable to the filter rather than to a backend that tolerates the broken files.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"excluded\"\n[build]\nbackend = { type = \"jals\" }\n",
+    )
+    .unwrap();
+    let status = jals()
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "an unexcluded broken source must fail the build"
+    );
+}
+
+#[test]
 fn build_dry_run_executes_and_publishes_build_script_outputs() {
     let dir = project(
         "[package]\nname = \"dry-run-script\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     );
     std::fs::write(
-        dir.path().join("build.rhai"),
+        dir.path().join("build.java"),
         r#"
-            let source = output.write_text(
-                "com/example/DryRunGenerated.java",
-                "package com.example; public class DryRunGenerated {}\n",
-            );
-            build.add_source(source);
-            build.add_source("src/main/java/com/example/Main.java");
+            import jals.build.Build;
+            import jals.build.Output;
+
+            class build {
+                public static void main() {
+                    String source = Output.writeText(
+                        "com/example/DryRunGenerated.java",
+                        "package com.example; public class DryRunGenerated {}\n"
+                    );
+                    Build.addSource(source);
+                    Build.addSource("src/main/java/com/example/Main.java");
+                }
+            }
         "#,
     )
     .unwrap();
@@ -385,7 +785,7 @@ fn build_dry_run_executes_and_publishes_build_script_outputs() {
     );
     let generated = dir
         .path()
-        .join("target/jals/build/rhai/out/com/example/DryRunGenerated.java");
+        .join("target/jals/build/script/out/com/example/DryRunGenerated.java");
     assert!(generated.is_file());
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Both the authored and the script-generated source reach javac through the frontend's
@@ -395,7 +795,7 @@ fn build_dry_run_executes_and_publishes_build_script_outputs() {
         host_join(&staged, "src/main/java/com/example/Main.java"),
         host_join(
             &staged,
-            "target/jals/build/rhai/out/com/example/DryRunGenerated.java",
+            "target/jals/build/script/out/com/example/DryRunGenerated.java",
         ),
     ] {
         assert_eq!(
@@ -447,8 +847,14 @@ fn run_dry_run_prints_javac_and_java_commands() {
         manifest.to_str().unwrap(),
     ]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("javac "), "got: {stdout}");
-    assert!(stdout.contains("java -cp "), "got: {stdout}");
+    assert!(
+        stdout.contains(&format!("{} ", javac_binary_name())),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{} -cp ", java_binary_name())),
+        "got: {stdout}"
+    );
     assert!(stdout.contains("com.example.Main"), "got: {stdout}");
 }
 
@@ -607,11 +1013,17 @@ fn cfg_attribute_selects_code_and_preserves_lines_through_real_javac() {
 fn a_root_build_script_error_reports_every_diagnostic_it_emitted() {
     let dir = project(
         "[package]\nname = \"reported\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     );
     std::fs::write(
-        dir.path().join("build.rhai"),
-        "build.warning(\"check the version features\");\nbuild.error(\"select at most one\");\n",
+        dir.path().join("build.java"),
+        "import jals.build.Build;\n\
+         class build {\n\
+         \x20   public static void main() {\n\
+         \x20       Build.warning(\"check the version features\");\n\
+         \x20       Build.error(\"select at most one\");\n\
+         \x20   }\n\
+         }\n",
     )
     .unwrap();
 
@@ -641,17 +1053,26 @@ fn a_root_build_script_error_reports_every_diagnostic_it_emitted() {
     );
 }
 
-/// The CLI used to report a broken `build.rhai` with no location at all: it held the Rhai position
+/// The CLI used to report a broken `build.java` with no location at all: it held the script position
 /// and never resolved it against the script's text. It now points at the offending line.
 #[test]
 fn a_failing_build_script_is_reported_at_the_line_it_failed_on() {
     let dir = project(
         "[package]\nname = \"positioned\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     );
+    // The in-process compiler silently recovers a malformed declaration like `int broken = ;`
+    // rather than reporting it, so the failing statement is a syntax error it does report: a `+`
+    // with no right operand. The point of the test — the failure names the line it happened on —
+    // is unchanged.
     std::fs::write(
-        dir.path().join("build.rhai"),
-        "let valid = 1;\nlet broken = ;\n",
+        dir.path().join("build.java"),
+        "class build {\n\
+         \x20   public static void main() {\n\
+         \x20       int valid = 1;\n\
+         \x20       int broken = 1 +;\n\
+         \x20   }\n\
+         }\n",
     )
     .unwrap();
 
@@ -664,29 +1085,36 @@ fn a_failing_build_script_is_reported_at_the_line_it_failed_on() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     // An `ariadne` report: the script's path, the failing line number, and the source line itself.
-    assert!(stderr.contains("build.rhai:2:"), "stderr: {stderr}");
-    assert!(stderr.contains("let broken = ;"), "stderr: {stderr}");
+    assert!(stderr.contains("build.java:4:"), "stderr: {stderr}");
+    assert!(stderr.contains("int broken = 1 +;"), "stderr: {stderr}");
     assert!(stderr.contains("build-script"), "stderr: {stderr}");
 }
 
 #[cfg(unix)]
 #[test]
-fn build_runs_rhai_and_passes_generated_inputs_to_javac() {
+fn build_runs_java_and_passes_generated_inputs_to_javac() {
     let dir = project(
         "[package]\nname = \"generated\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     );
     std::fs::write(
-        dir.path().join("build.rhai"),
+        dir.path().join("build.java"),
         r#"
-            let source = output.write_text(
-                "com/example/Generated.java",
-                "package com.example; public class Generated {}\n",
-            );
-            build.add_source(source);
-            build.add_javac_arg("-Agenerated=true");
-            build.set_compile_env("JALS_SCRIPT_ENV", "from-rhai");
-            build.warning("generated BuildInfo.java");
+            import jals.build.Build;
+            import jals.build.Output;
+
+            class build {
+                public static void main() {
+                    String source = Output.writeText(
+                        "com/example/Generated.java",
+                        "package com.example; public class Generated {}\n"
+                    );
+                    Build.addSource(source);
+                    Build.addJavacArg("-Agenerated=true");
+                    Build.setCompileEnv("JALS_SCRIPT_ENV", "from-java");
+                    Build.warning("generated BuildInfo.java");
+                }
+            }
         "#,
     )
     .unwrap();
@@ -714,14 +1142,14 @@ fn build_runs_rhai_and_passes_generated_inputs_to_javac() {
     );
     let generated = dir
         .path()
-        .join("target/jals/build/rhai/out/com/example/Generated.java");
+        .join("target/jals/build/script/out/com/example/Generated.java");
     assert!(generated.is_file());
     let args = read_arg_lines(&captured_args);
     // The build script's output is root project source, so it goes through the frontend like
     // any authored file; javac sees the staged copy, not the script's own output path.
     let staged_generated = dir
         .path()
-        .join("target/jals/build/frontend/target/jals/build/rhai/out/com/example/Generated.java");
+        .join("target/jals/build/frontend/target/jals/build/script/out/com/example/Generated.java");
     assert!(
         args.iter().any(|arg| Path::new(arg) == staged_generated),
         "generated source should reach javac via the frontend staging tree; args: {args:?}"
@@ -731,7 +1159,7 @@ fn build_runs_rhai_and_passes_generated_inputs_to_javac() {
         "the pre-frontend generated file must not also be passed to javac"
     );
     assert!(args.iter().any(|arg| arg == "-Agenerated=true"));
-    assert_eq!(std::fs::read_to_string(captured_env).unwrap(), "from-rhai");
+    assert_eq!(std::fs::read_to_string(captured_env).unwrap(), "from-java");
     assert_eq!(
         std::fs::canonicalize(std::fs::read_to_string(captured_cwd).unwrap().trim()).unwrap(),
         std::fs::canonicalize(dir.path()).unwrap()
@@ -752,7 +1180,7 @@ fn a_dependency_publication_reaches_javac_only_when_it_declares_compile_intent()
     std::fs::write(
         library.join("jals.toml"),
         "[package]\nname = \"library\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     )
     .unwrap();
     write_source_jar(
@@ -765,18 +1193,23 @@ fn a_dependency_publication_reaches_javac_only_when_it_declares_compile_intent()
 
     let build = |intent: &str| {
         std::fs::write(
-            library.join("build.rhai"),
+            library.join("build.java"),
             format!(
                 r#"
-                    let jar = tasks.project_jar("sources.jar");
-                    let sources = tasks.extract_java(jar, "net/example");
-                    tasks.publish_tree(
-                        "example-sources",
-                        sources,
-                        "src/main/java/net/example",
-                        "replace-root",
-                        "{intent}",
-                    );
+                    import jals.build.Tasks;
+
+                    class build {{
+                        public static void main() {{
+                            int jar = Tasks.projectJar("sources.jar");
+                            int sources = Tasks.extractJava(jar, "net/example");
+                            Tasks.publishTree(
+                                "example-sources",
+                                sources,
+                                "src/main/java/net/example",
+                                "{intent}"
+                            );
+                        }}
+                    }}
                 "#
             ),
         )
@@ -867,24 +1300,32 @@ fn transitive_graph_sources_and_classpath_reach_compile_and_run() {
         dir.path().join("leaf/jals.toml"),
         "[package]\nname = \"leaf\"\n\
          [build]\nsource-dirs = [\"src\"]\nclasspath = [\"libs/manifest.jar\"]\n\
-         script = { type = \"rhai\", file = \"build.rhai\" }\n",
+         script = { type = \"java\", file = \"build.java\" }\n",
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("leaf/build.rhai"),
+        dir.path().join("leaf/build.java"),
         r#"
-            if build.env("JALS_PACKAGE_NAME") != "leaf" {
-                build.error("dependency did not receive its own package environment");
+            import jals.build.Build;
+            import jals.build.Output;
+
+            class build {
+                public static void main() {
+                    String name = Build.env("JALS_PACKAGE_NAME");
+                    if (name == null || !name.equals("leaf")) {
+                        Build.error("dependency did not receive its own package environment");
+                    }
+                    String source = Output.writeText(
+                        "com/example/TransitiveGenerated.java",
+                        "package com.example; public class TransitiveGenerated {}\n"
+                    );
+                    String classpath = Output.write("script.jar", new byte[] {9, 8, 7});
+                    Build.addSource(source);
+                    Build.addClasspath(classpath);
+                    Build.addJavacArg("-Adependency-only=true");
+                    Build.addJvmArg("-Ddependency-only=true");
+                }
             }
-            let source = output.write_text(
-                "com/example/TransitiveGenerated.java",
-                "package com.example; public class TransitiveGenerated {}\n",
-            );
-            let classpath = output.write("script.jar", [9, 8, 7]);
-            build.add_source(source);
-            build.add_classpath(classpath);
-            build.add_javac_arg("-Adependency-only=true");
-            build.add_jvm_arg("-Ddependency-only=true");
         "#,
     )
     .unwrap();
@@ -945,6 +1386,475 @@ fn transitive_graph_sources_and_classpath_reach_compile_and_run() {
                 .any(|path| std::fs::read(path).is_ok_and(|bytes| bytes == [9, 8, 7]))
         );
     }
+}
+
+/// A Maven repository served from one loopback socket.
+///
+/// `[registries]` validates an `http://`/`https://` URL, so the in-memory `Fetcher`
+/// `jals-classpath`'s tests mock with is out of reach at the host boundary: a registry fixture
+/// here has to speak HTTP. Every response closes its connection, which is all `reqwest` needs to
+/// read a status and a body. The serving thread parks in `accept` once the test is done and dies
+/// with the test binary; nothing on the far side is left waiting on it.
+struct FixtureRegistry {
+    base: String,
+}
+
+impl FixtureRegistry {
+    fn start(routes: &[(&str, &[u8])]) -> Self {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("a bound address");
+        let routes: std::collections::BTreeMap<String, Vec<u8>> = routes
+            .iter()
+            .map(|(path, body)| ((*path).to_owned(), body.to_vec()))
+            .collect();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    break;
+                };
+                Self::serve(stream, &routes);
+            }
+        });
+        Self {
+            base: format!("http://{address}"),
+        }
+    }
+
+    fn serve(
+        mut stream: std::net::TcpStream,
+        routes: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let Ok(reader) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(reader);
+        let mut request = String::new();
+        if reader.read_line(&mut request).is_err() {
+            return;
+        }
+        // A `GET` has no body, so the blank line ends the request. Answering before it is read can
+        // reach the client as a reset rather than as a status.
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if line == "\r\n" || line == "\n" => break,
+                Ok(_) => {}
+            }
+        }
+        let path = request.split_whitespace().nth(1).unwrap_or_default();
+        match routes.get(path) {
+            Some(body) => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+            None => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        }
+    }
+}
+
+/// A jar in memory: a zip of the given entries. Only a loading side opens one here, so the
+/// stored-only writer `jals-classpath` uses for real jars is not needed.
+fn jar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, bytes) in entries {
+        archive
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap().into_inner()
+}
+
+/// The registry fixture's two jars. With a host `javac`, the classes inside are compiled by it, so
+/// the consumer's import can be compiled against the very same toolchain; without one the archives
+/// carry placeholder bytes and only the argv assertions below run — resolution reads a jar's path
+/// and never opens its contents.
+fn fixture_jars(root: &Path) -> (Vec<u8>, Vec<u8>) {
+    if !javac_available() {
+        return (
+            jar_bytes(&[("com/example/lib/Lib.class", b"lib-placeholder")]),
+            jar_bytes(&[("com/example/direct/Direct.class", b"direct-placeholder")]),
+        );
+    }
+    let sources = root.join("fixture-src/com/example");
+    std::fs::create_dir_all(sources.join("lib")).unwrap();
+    std::fs::create_dir_all(sources.join("direct")).unwrap();
+    std::fs::write(
+        sources.join("lib/Lib.java"),
+        "package com.example.lib;\n\
+         public class Lib {\n\
+         \x20\x20\x20\x20public static String greet() { return \"hello\"; }\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sources.join("direct/Direct.java"),
+        "package com.example.direct;\npublic class Direct {}\n",
+    )
+    .unwrap();
+    let classes = root.join("fixture-classes");
+    std::fs::create_dir_all(&classes).unwrap();
+    let compiled = Command::new("javac")
+        .arg("-d")
+        .arg(&classes)
+        .arg(sources.join("lib/Lib.java"))
+        .arg(sources.join("direct/Direct.java"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "the fixture's classes compile: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let lib = std::fs::read(classes.join("com/example/lib/Lib.class")).unwrap();
+    let direct = std::fs::read(classes.join("com/example/direct/Direct.class")).unwrap();
+    (
+        jar_bytes(&[("com/example/lib/Lib.class", &lib)]),
+        jar_bytes(&[("com/example/direct/Direct.class", &direct)]),
+    )
+}
+
+/// The `-classpath` entries of a printed command line, with the display quoting removed.
+///
+/// Splitting the line into words is not enough: `display_command` wraps an argument containing
+/// whitespace in one pair of quotes, and a classpath joins every entry into one argument — so a
+/// single entry below a directory with a space quotes the whole value. Take the value from the
+/// text itself, where the inner whitespace survives verbatim.
+fn classpath_entries(command: &str) -> Vec<PathBuf> {
+    let Some((_, value)) = command.split_once(" -classpath ") else {
+        panic!("the compile command must carry a classpath: {command}");
+    };
+    // Display quoting is the whole of the encoding — there are no escapes — so a quoted value
+    // ends at the first closing quote and an unquoted one at the next whitespace. Both quotes
+    // are dropped.
+    let value = value.strip_prefix('"').map_or_else(
+        || value.split_whitespace().next().unwrap_or_default(),
+        |quoted| quoted.split_once('"').map_or(quoted, |(inner, _)| inner),
+    );
+    value
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// The M0.1 regression at the host boundary: a registry dependency resolves, downloads, locks, and
+/// reaches the analysis index — and it must also reach `javac`'s `-classpath`. The bug this pins
+/// was exactly that split: `jals-project`'s projection mapped the root plan's resolved jars into
+/// `inputs` but not into `compile_classpath`, so the project linted clean and failed to compile.
+/// The unit pin lives beside that projection
+/// (`resolve_native_lowers_registry_dependencies_under_the_roots_selection`); this one drives the
+/// real `jals` binary, because the wiring the bug lived in is between crates and only a host can
+/// print the argv a user's import is compiled with.
+///
+/// The repository is the loopback [`FixtureRegistry`] serving the files
+/// `a_registry_dependency_resolves_through_poms_and_locks` resolves: one direct entry whose POM
+/// declares one transitive entry. The consumer imports both, so the real compile below fails on
+/// either jar missing from the classpath — the same `cannot find symbol` the reports named.
+#[test]
+fn registry_dependency_reaches_javac_classpath() {
+    let dir = tempdir().unwrap();
+    let has_javac = javac_available();
+    let (lib_jar, direct_jar) = fixture_jars(dir.path());
+    let files: [(&str, &[u8]); 5] = [
+        (
+            "/com/example/lib/maven-metadata.xml",
+            br"<metadata><versioning><versions><version>1.0.0</version></versions></versioning></metadata>",
+        ),
+        (
+            "/com/example/lib/1.0.0/lib-1.0.0.pom",
+            br"<project>
+              <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0.0</version>
+              <dependencies>
+                <dependency><groupId>com.example</groupId><artifactId>direct</artifactId><version>2.0.0</version></dependency>
+              </dependencies>
+            </project>",
+        ),
+        (
+            "/com/example/direct/2.0.0/direct-2.0.0.pom",
+            br"<project><groupId>com.example</groupId><artifactId>direct</artifactId><version>2.0.0</version></project>",
+        ),
+        ("/com/example/lib/1.0.0/lib-1.0.0.jar", lib_jar.as_slice()),
+        (
+            "/com/example/direct/2.0.0/direct-2.0.0.jar",
+            direct_jar.as_slice(),
+        ),
+    ];
+    let registry = FixtureRegistry::start(&files);
+
+    let source = dir.path().join("src/main/java/com/example");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Main.java"),
+        "package com.example;\n\
+         import com.example.direct.Direct;\n\
+         import com.example.lib.Lib;\n\
+         public class Main {\n\
+         \x20\x20\x20\x20public static void main(String[] args) {\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20System.out.println(Lib.greet() + new Direct());\n\
+         \x20\x20\x20\x20}\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        format!(
+            "[package]\nname = \"registry-consumer\"\n\
+             [registries.local]\nurl = \"{}\"\n\
+             [dependencies]\n\"com.example:lib\" = {{ version = \"1\", registry = \"local\" }}\n",
+            registry.base
+        ),
+    )
+    .unwrap();
+    let manifest = dir.path().join("jals.toml");
+
+    // The fixture's classes were compiled by the `javac` on `PATH`, while `jals` resolves
+    // `$JAVAC` first, then `$JAVA_HOME`, then `PATH` (`jals_build`'s `ToolResolver`). Pin the
+    // child to the same bare name so the compile below is judged against the fixture's compiler
+    // and not against whichever JDK the host's environment happens to name — an older one would
+    // reject the fixture's class-file version before any regression could be seen.
+    let output = jals()
+        .env("JAVAC", "javac")
+        .args(["build", "--dry-run", "-v", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        names_javac(&stdout),
+        "the preview is the compile command: {stdout}"
+    );
+    assert!(
+        stdout.contains("Main.java"),
+        "the preview compiles this project's source: {stdout}"
+    );
+    let entries = classpath_entries(&stdout);
+    // The materialized bytes, not a path: a digest-derived address is not one a test can predict,
+    // and the bytes are the only evidence that the entry is this fixture rather than some other
+    // archive the host happened to put there.
+    for (name, expected) in [
+        ("lib", lib_jar.as_slice()),
+        ("direct", direct_jar.as_slice()),
+    ] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| std::fs::read(entry).is_ok_and(|bytes| bytes.as_slice() == expected)),
+            "the {name} registry jar must be a materialized `-classpath` entry; entries: {entries:?}"
+        );
+    }
+
+    if !has_javac {
+        // No JDK: the preview above still pins the argv, which is where the regression lived. The
+        // import half needs a real `javac`, and CI supplies one on every platform.
+        return;
+    }
+    let output = jals()
+        .env("JAVAC", "javac")
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the imports must compile against the registry jars; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path()
+            .join("target/classes/com/example/Main.class")
+            .is_file(),
+        "the compile actually ran"
+    );
+}
+
+/// A registry dependency that cannot resolve stops a build before any compiler runs — the
+/// failure must be the resolution error itself, not a mountain of javac `cannot find symbol`s —
+/// while `jals lint` stays usable and reports the same condition as a warning.
+#[test]
+fn unresolvable_registry_dependency_stops_build_before_javac() {
+    let dir = tempdir().unwrap();
+    // The registry serves nothing: every POM request is a 404.
+    let registry = FixtureRegistry::start(&[]);
+    let source = dir.path().join("src/main/java/com/example");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Main.java"),
+        "package com.example;\npublic class Main {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        format!(
+            "[package]\nname = \"registry-broken\"\n\
+             [registries.local]\nurl = \"{}\"\n\
+             [dependencies]\n\"com.example:missing\" = {{ version = \"=1.0.0\", registry = \"local\" }}\n",
+            registry.base
+        ),
+    )
+    .unwrap();
+    let manifest = dir.path().join("jals.toml");
+
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "the build must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("registry dependencies could not be resolved"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("error[classpath-input]"),
+        "the failure is an error diagnostic: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "no compiler command is printed: {stdout}"
+    );
+
+    let output = jals()
+        .args(["lint"])
+        .arg(source.join("Main.java"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "lint still succeeds: {stderr}");
+    assert!(
+        stderr.contains("warning[classpath-input]"),
+        "lint keeps the warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("registry dependencies could not be resolved"),
+        "lint names the failure: {stderr}"
+    );
+}
+
+/// Every declared dependency form is named with what it contributed: which entries reached the
+/// compile classpath and which did not. The line is stderr narration, so `--dry-run`'s stdout
+/// stays exactly the compiler command.
+#[test]
+fn build_reports_each_dependency_forms_classpath_state() {
+    let dir = tempdir().unwrap();
+    let (lib_jar, direct_jar) = fixture_jars(dir.path());
+    let files: [(&str, &[u8]); 7] = [
+        (
+            "/com/example/lib/maven-metadata.xml",
+            br"<metadata><versioning><versions><version>1.0.0</version></versions></versioning></metadata>",
+        ),
+        (
+            "/com/example/lib/1.0.0/lib-1.0.0.pom",
+            br"<project>
+              <groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0.0</version>
+              <dependencies>
+                <dependency><groupId>com.example</groupId><artifactId>direct</artifactId><version>2.0.0</version></dependency>
+                <dependency><groupId>com.example</groupId><artifactId>native-bin</artifactId><version>19.3.6</version><type>tar.gz</type></dependency>
+              </dependencies>
+            </project>",
+        ),
+        (
+            "/com/example/direct/2.0.0/direct-2.0.0.pom",
+            br"<project><groupId>com.example</groupId><artifactId>direct</artifactId><version>2.0.0</version></project>",
+        ),
+        (
+            "/com/example/native-bin/19.3.6/native-bin-19.3.6.pom",
+            br"<project><groupId>com.example</groupId><artifactId>native-bin</artifactId><version>19.3.6</version></project>",
+        ),
+        ("/com/example/lib/1.0.0/lib-1.0.0.jar", lib_jar.as_slice()),
+        (
+            "/com/example/direct/2.0.0/direct-2.0.0.jar",
+            direct_jar.as_slice(),
+        ),
+        (
+            "/com/example/native-bin/19.3.6/native-bin-19.3.6.tar.gz",
+            b"native-tarball",
+        ),
+    ];
+    let registry = FixtureRegistry::start(&files);
+
+    std::fs::create_dir_all(dir.path().join("libs")).unwrap();
+    std::fs::write(dir.path().join("libs/legacy.jar"), b"legacy").unwrap();
+    let child = dir.path().join("child/src/main/java/pkg");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        child.join("Child.java"),
+        "package pkg;\npublic class Child {}\n",
+    )
+    .unwrap();
+    let source = dir.path().join("src/main/java/app");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Main.java"),
+        "package app;\npublic class Main {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("jals.toml"),
+        format!(
+            "[package]\nname = \"status-consumer\"\n\
+             [registries.local]\nurl = \"{}\"\n\
+             [dependencies]\n\
+             \"com.example:lib\" = {{ version = \"=1.0.0\", registry = \"local\" }}\n\
+             legacy = {{ jar = \"libs/legacy.jar\" }}\n\
+             child = {{ path = \"child\" }}\n",
+            registry.base
+        ),
+    )
+    .unwrap();
+    let manifest = dir.path().join("jals.toml");
+
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "2 registry on the compile classpath",
+        "1 registry artifact not on the compile classpath",
+        "1 jar on the compile classpath",
+        "1 path source",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing `{expected}` in: {stderr}"
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        names_javac(&stdout),
+        "the preview is still the compile command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("compile classpath"),
+        "the summary is stderr narration: {stdout}"
+    );
 }
 
 #[cfg(unix)]
@@ -1038,12 +1948,17 @@ fn graph_failures_prevent_javac() {
     std::fs::write(
         script.path().join("child/jals.toml"),
         "[build]\nsource-dirs = [\"src\"]\n\
-         script = { type = \"rhai\", file = \"build.rhai\" }\n",
+         script = { type = \"java\", file = \"build.java\" }\n",
     )
     .unwrap();
     std::fs::write(
-        script.path().join("child/build.rhai"),
-        "build.error(\"dependency script failed\");\n",
+        script.path().join("child/build.java"),
+        "import jals.build.Build;\n\
+         class build {\n\
+         \x20   public static void main() {\n\
+         \x20       Build.error(\"dependency script failed\");\n\
+         \x20   }\n\
+         }\n",
     )
     .unwrap();
 
@@ -1225,14 +2140,21 @@ fn dry_run_preprocesses_dependencies_without_mutating_their_tree() {
     std::fs::write(
         dir.path().join("child/jals.toml"),
         "[build]\nsource-dirs = [\"src\"]\n\
-         script = { type = \"rhai\", file = \"build.rhai\" }\n",
+         script = { type = \"java\", file = \"build.java\" }\n",
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("child/build.rhai"),
+        dir.path().join("child/build.java"),
         r#"
-            let source = output.write_text("DryGenerated.java", "class DryGenerated {}\n");
-            build.add_source(source);
+            import jals.build.Build;
+            import jals.build.Output;
+
+            class build {
+                public static void main() {
+                    String source = Output.writeText("DryGenerated.java", "class DryGenerated {}\n");
+                    Build.addSource(source);
+                }
+            }
         "#,
     )
     .unwrap();
@@ -1322,13 +2244,20 @@ fn build_script_skips_non_unicode_environment_entries() {
 
     let dir = project(
         "[package]\nname = \"unicode-environment\"\n\
-         [build]\nscript = { type = \"rhai\", file = \"build.rhai\" }\n",
+         [build]\nscript = { type = \"java\", file = \"build.java\" }\n",
     );
     std::fs::write(
-        dir.path().join("build.rhai"),
+        dir.path().join("build.java"),
         r#"
-            if build.env("JALS_UNICODE_ENV") != "visible" {
-                build.error("Unicode environment entry was not supplied");
+            import jals.build.Build;
+
+            class build {
+                public static void main() {
+                    String value = Build.env("JALS_UNICODE_ENV");
+                    if (value == null || !value.equals("visible")) {
+                        Build.error("Unicode environment entry was not supplied");
+                    }
+                }
             }
         "#,
     )
@@ -1362,7 +2291,7 @@ fn run_applies_script_jvm_args_environment_and_ordered_classpath() {
     let dir = project(
         "[package]\nname = \"script-run\"\n\
          [build]\n\
-         script = { type = \"rhai\", file = \"build.rhai\" }\n\
+         script = { type = \"java\", file = \"build.java\" }\n\
          classpath = [\"libs/base.jar\"]\n\
          [run]\nmain-class = \"com.example.Main\"\n\
          [dependencies]\n\
@@ -1376,13 +2305,19 @@ fn run_applies_script_jvm_args_environment_and_ordered_classpath() {
     std::fs::write(libs.join("alpha.jar"), b"alpha dependency").unwrap();
     std::fs::write(libs.join("beta.jar"), b"beta dependency").unwrap();
     std::fs::write(
-        dir.path().join("build.rhai"),
+        dir.path().join("build.java"),
         r#"
-            build.add_classpath("libs/base.jar");
-            build.add_classpath("libs/runtime.jar");
-            build.add_jvm_arg("-Dfrom.script=true");
-            build.set_compile_env("JALS_SCRIPT_ENV", "compile");
-            build.set_run_env("JALS_RUN_ENV", "from-rhai");
+            import jals.build.Build;
+
+            class build {
+                public static void main() {
+                    Build.addClasspath("libs/base.jar");
+                    Build.addClasspath("libs/runtime.jar");
+                    Build.addJvmArg("-Dfrom.script=true");
+                    Build.setCompileEnv("JALS_SCRIPT_ENV", "compile");
+                    Build.setRunEnv("JALS_RUN_ENV", "from-java");
+                }
+            }
         "#,
     )
     .unwrap();
@@ -1425,7 +2360,7 @@ fn run_applies_script_jvm_args_environment_and_ordered_classpath() {
     assert_eq!(Path::new(classpath[2]), libs.join("runtime.jar"));
     assert_eq!(std::fs::read(classpath[3]).unwrap(), b"alpha dependency");
     assert_eq!(std::fs::read(classpath[4]).unwrap(), b"beta dependency");
-    assert_eq!(std::fs::read_to_string(java_env).unwrap(), "from-rhai");
+    assert_eq!(std::fs::read_to_string(java_env).unwrap(), "from-java");
     assert_eq!(
         std::fs::canonicalize(std::fs::read_to_string(java_cwd).unwrap().trim()).unwrap(),
         std::fs::canonicalize(dir.path()).unwrap()
@@ -1445,7 +2380,10 @@ fn run_bin_flag_selects_main_class() {
         manifest.to_str().unwrap(),
     ]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("java -cp "), "got: {stdout}");
+    assert!(
+        stdout.contains(&format!("{} -cp ", java_binary_name())),
+        "got: {stdout}"
+    );
     assert!(stdout.contains("com.example.Two"), "got: {stdout}");
     assert!(!stdout.contains("com.example.One"), "got: {stdout}");
 }
@@ -2603,7 +3541,7 @@ fn running_a_wasm_backed_project_without_an_export_instantiates_it() {
         "run failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
 }
 
 /// An export that is not there reports the ones that are.
@@ -2888,7 +3826,14 @@ fn jar_members(path: &Path) -> Vec<String> {
     let file = std::fs::File::open(path).unwrap();
     let mut archive = zip::ZipArchive::new(file).unwrap();
     (0..archive.len())
-        .map(|index| archive.by_index(index).unwrap().name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .unwrap()
+                .name()
+                .unwrap()
+                .into_owned()
+        })
         .collect()
 }
 
@@ -3134,14 +4079,14 @@ fn packaged_hierarchy_client(script: Option<&str>) -> Vec<u8> {
          remap = {{ with = \"mojmap\" }}\n\
          [mappings.mojmap]\nfile = \"maps/server.txt\"\n",
         if script.is_some() {
-            "script = { type = \"rhai\", file = \"build.rhai\" }\n"
+            "script = { type = \"java\", file = \"build.java\" }\n"
         } else {
             ""
         }
     );
     let dir = project(&manifest);
     if let Some(script) = script {
-        std::fs::write(dir.path().join("build.rhai"), script).unwrap();
+        std::fs::write(dir.path().join("build.java"), script).unwrap();
     }
     std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
     write_source_jar(
@@ -3199,7 +4144,15 @@ fn an_inherited_member_from_a_task_jar_is_reobfuscated() {
     );
 
     let with = packaged_hierarchy_client(Some(
-        r#"tasks.add_classpath(tasks.project_jar("vendor/lib.jar"));"#,
+        r#"
+            import jals.build.Tasks;
+
+            class build {
+                public static void main() {
+                    Tasks.addClasspath(Tasks.projectJar("vendor/lib.jar"));
+                }
+            }
+        "#,
     ));
     assert!(
         contains_bytes(&with, "hierarchyProvedIt"),
@@ -3875,6 +4828,490 @@ fn a_wasm_backend_with_a_jvm_runtime_is_refused_by_jals_test() {
     assert!(
         stderr.contains("runtime = \"wasm\""),
         "the refusal names the selector that works: {stderr}"
+    );
+}
+
+/// The platform's `java` executable name, for fixtures that have to look like a JDK home.
+const fn java_binary_name() -> &'static str {
+    if cfg!(windows) { "java.exe" } else { "java" }
+}
+
+/// The platform's `javac` executable name, for the same reason as [`java_binary_name`].
+const fn javac_binary_name() -> &'static str {
+    if cfg!(windows) { "javac.exe" } else { "javac" }
+}
+
+/// Whether a printed command's program is `expected`.
+///
+/// Component-wise (`Path::ends_with`) rather than a substring: a host path is spelled with the
+/// platform's separators, so a literal `target/jdk/…` comparison holds on Unix and fails on
+/// Windows for a reason that has nothing to do with what the command resolves.
+fn command_targets(cmd_line: &str, expected: &Path) -> bool {
+    cmd_line
+        .split_whitespace()
+        .next()
+        .map(|program| program.trim_matches('"'))
+        .is_some_and(|program| Path::new(program).ends_with(expected))
+}
+
+/// Write a fake JDK home (`bin/java`, `bin/javac`) under `directory`, ready to be archived or
+/// linked. The tools are no-op scripts: every toolchain test asserts *which* path was selected,
+/// never what the selected `java` would compute.
+fn write_fake_jdk(home: &Path) {
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in ["java", "javac"] {
+        let path = bin.join(if cfg!(windows) {
+            format!("{tool}.exe")
+        } else {
+            tool.to_owned()
+        });
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+    }
+}
+
+/// Package a fake JDK as a gzip-compressed tar with one top-level directory named for the release
+/// — the layout a real Temurin tarball has, so the installer's home-location rule is exercised
+/// rather than bypassed.
+fn write_jdk_tarball(archive: &Path, release: &str) {
+    let staging = tempdir().unwrap();
+    write_fake_jdk(&staging.path().join(release));
+    let file = std::fs::File::create(archive).unwrap();
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    builder
+        .append_dir_all(release, staging.path().join(release))
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap();
+}
+
+/// Package a fake JDK as a zip — what Windows builds (and some vendors' Unix builds) ship, and
+/// therefore the other decoder the installer must own.
+fn write_jdk_zip(archive: &Path, release: &str) {
+    let staging = tempdir().unwrap();
+    write_fake_jdk(&staging.path().join(release));
+    let file = std::fs::File::create(archive).unwrap();
+    let mut writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    let bin = staging.path().join(release).join("bin");
+    for tool in ["java", "javac"] {
+        let name = if cfg!(windows) {
+            format!("{tool}.exe")
+        } else {
+            tool.to_owned()
+        };
+        writer
+            .start_file(format!("{release}/bin/{name}"), options)
+            .unwrap();
+        writer
+            .write_all(&std::fs::read(bin.join(&name)).unwrap())
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// Install, list, resolve, and remove one toolchain, entirely offline: the `--url` lane is what a
+/// vendor page or an already-downloaded archive uses, and it exercises the same fetch gate,
+/// archive sniffing, home location, and store layout the provider lane does.
+#[test]
+fn a_toolchain_installs_lists_resolves_and_uninstalls_offline() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let archive = dir.path().join("fake-jdk.tar.gz");
+    write_jdk_tarball(&archive, "jdk-21.0.5+11");
+    let url = format!("file://{}", archive.display());
+
+    let output = jals()
+        .args([
+            "toolchain",
+            "install",
+            "temurin@21",
+            "--url",
+            &url,
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let home = dir.path().join("target/jdk/temurin-21");
+    assert!(
+        home.join("bin").join(java_binary_name()).is_file(),
+        "the extracted home lands under the requested install name: {stderr}"
+    );
+
+    let output = jals()
+        .args(["toolchain", "list", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{listed}");
+    assert!(listed.contains("temurin-21"), "{listed}");
+
+    let output = jals()
+        .args(["toolchain", "which", "temurin@21", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let which = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        Path::new(which.trim()).ends_with(Path::new("target").join("jdk").join("temurin-21")),
+        "`which` answers with the JDK home: {which}"
+    );
+
+    // A selector in the manifest resolves to the project-local install, not the host's tools.
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"demo\"\n\
+         [toolchain]\ncompiler = { distribution = { name = \"temurin\", version = 21 } }\n",
+    )
+    .unwrap();
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        command_targets(
+            &stdout,
+            &dir.path()
+                .join("target/jdk/temurin-21/bin")
+                .join(javac_binary_name())
+        ),
+        "the compile resolves the installed toolchain: {stdout}"
+    );
+
+    let output = jals()
+        .args(["toolchain", "uninstall", "temurin@21", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!home.exists(), "the install is removed recursively");
+}
+
+/// A manifest may spell the vendor with an alias (`adoptium`) that `install` accepts. The
+/// selection has to resolve the canonical install (`temurin-21`) that alias produced — otherwise
+/// the JDK is downloaded and then silently ignored in favor of the host's tools.
+#[test]
+fn a_manifest_vendor_alias_selects_the_install_it_downloaded() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let archive = dir.path().join("fake-jdk.tar.gz");
+    write_jdk_tarball(&archive, "jdk-21.0.5+11");
+    let url = format!("file://{}", archive.display());
+
+    let output = jals()
+        .args([
+            "toolchain",
+            "install",
+            "adoptium@21",
+            "--url",
+            &url,
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // The alias installs under the canonical name, which is what a selector matches.
+    let home = dir.path().join("target/jdk/temurin-21");
+    assert!(
+        home.join("bin").join(java_binary_name()).is_file(),
+        "{stderr}"
+    );
+
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"demo\"\n\
+         [toolchain]\ncompiler = { distribution = { name = \"adoptium\", version = 21 } }\n",
+    )
+    .unwrap();
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        command_targets(&stdout, &home.join("bin").join(javac_binary_name())),
+        "the alias selector resolves the canonical install: {stdout}"
+    );
+}
+
+/// The zip lane: a provider that answers with a zip must install exactly like a tarball, on every
+/// platform (some vendors ship one for Unix too).
+#[test]
+fn a_zip_archive_installs_like_a_tarball() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let archive = dir.path().join("fake-jdk.zip");
+    write_jdk_zip(&archive, "jdk-17.0.9");
+    let url = format!("file://{}", archive.display());
+
+    let output = jals()
+        .args([
+            "toolchain",
+            "install",
+            "temurin@17",
+            "--url",
+            &url,
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        dir.path()
+            .join("target/jdk/temurin-17/bin")
+            .join(java_binary_name())
+            .is_file(),
+        "{stderr}"
+    );
+}
+
+/// `link` registers a JDK that lives elsewhere, and `default` makes it what a plain `system`
+/// selection — every manifest with no `[toolchain]` table — resolves to for this project.
+#[test]
+fn a_linked_toolchain_can_become_the_projects_default() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let external = tempdir().unwrap();
+    let external_home = external.path().join("some-jdk");
+    write_fake_jdk(&external_home);
+    let canonical = std::fs::canonicalize(&external_home).unwrap();
+
+    let output = jals()
+        .args(["toolchain", "link", "custom-21", "--manifest-path"])
+        .arg(&manifest)
+        .arg(&external_home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::canonicalize(dir.path().join("target/jdk/custom-21")).unwrap(),
+        canonical,
+        "the registered name is a link to the JDK the user pointed at"
+    );
+
+    let output = jals()
+        .args(["toolchain", "default", "custom-21", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        command_targets(
+            &stdout,
+            &dir.path()
+                .join("target/jdk/custom-21/bin")
+                .join(javac_binary_name())
+        ),
+        "a `system` selection prefers the project's default: {stdout}"
+    );
+
+    let output = jals()
+        .args(["toolchain", "list", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        listed.contains("[linked]") && listed.contains("[default]"),
+        "{listed}"
+    );
+}
+
+/// A `link`ed toolchain may be called anything the store accepts. `list` shows the literal name, so
+/// `which`, `default`, and `uninstall` have to take it too — not only names that happen to parse as
+/// `distribution-version` specs.
+#[test]
+fn a_linked_toolchain_is_named_by_its_literal_name() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let external = tempdir().unwrap();
+    let external_home = external.path().join("some-jdk");
+    write_fake_jdk(&external_home);
+
+    let output = jals()
+        .args(["toolchain", "link", "my-jdk", "--manifest-path"])
+        .arg(&manifest)
+        .arg(&external_home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // `which` answers for the literal name, the one `list` prints.
+    let output = jals()
+        .args(["toolchain", "which", "my-jdk", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let which = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{which}");
+    assert!(
+        Path::new(which.trim()).ends_with(Path::new("target").join("jdk").join("my-jdk")),
+        "`which` answers with the linked home: {which}"
+    );
+
+    // `default` accepts it, so a plain `system` selection resolves it.
+    let output = jals()
+        .args(["toolchain", "default", "my-jdk", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = jals()
+        .args(["build", "--dry-run", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        command_targets(
+            &stdout,
+            &dir.path()
+                .join("target/jdk/my-jdk/bin")
+                .join(javac_binary_name())
+        ),
+        "the literal name is resolved: {stdout}"
+    );
+
+    // `uninstall` takes it back out.
+    let output = jals()
+        .args(["toolchain", "uninstall", "my-jdk", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join("target/jdk/my-jdk")).is_err(),
+        "the linked entry is removed"
+    );
+}
+
+/// A link whose target moved or was deleted is still an entry this store owns: `list` has to show
+/// it and `uninstall` has to remove it, or the dangling link can only be cleaned up by
+/// `link --force` (or by hand).
+#[test]
+fn a_dangling_linked_toolchain_is_listed_and_uninstallable() {
+    let dir = project("[package]\nname = \"demo\"\n");
+    let manifest = dir.path().join("jals.toml");
+    let external = tempdir().unwrap();
+    let external_home = external.path().join("some-jdk");
+    write_fake_jdk(&external_home);
+
+    let output = jals()
+        .args(["toolchain", "link", "gone-21", "--manifest-path"])
+        .arg(&manifest)
+        .arg(&external_home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(&external_home).unwrap();
+    let link = dir.path().join("target/jdk/gone-21");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the link itself survives its target"
+    );
+
+    let output = jals()
+        .args(["toolchain", "list", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{listed}");
+    assert!(listed.contains("gone-21"), "{listed}");
+
+    let output = jals()
+        .args(["toolchain", "uninstall", "gone-21", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the dangling link is removed as the link it is"
+    );
+}
+
+/// With no install and a refused network, the failure says how to proceed rather than falling
+/// back to the host's tools — the silent fallback an explicit `distribution` selector must not
+/// get.
+#[test]
+fn a_missing_distribution_offline_names_the_install_command() {
+    let dir = project(
+        "[package]\nname = \"demo\"\n\
+         [toolchain]\ncompiler = { distribution = { name = \"no-such-vendor\", version = 17 } }\n",
+    );
+    let output = jals()
+        .args(["build", "--offline", "--manifest-path"])
+        .arg(dir.path().join("jals.toml"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("jals toolchain install no-such-vendor@17"),
+        "the refusal names the way out: {stderr}"
+    );
+    assert!(
+        stderr.contains("not fetched while offline"),
+        "and the reason: {stderr}"
     );
 }
 

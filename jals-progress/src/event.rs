@@ -49,7 +49,7 @@ impl core::fmt::Display for UnitId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Activity {
-    /// A project's `build.rhai` phase, before its task plan runs.
+    /// A project's `build.java` phase, before its task plan runs.
     Script,
     /// Discovering or preprocessing one node of the dependency graph.
     Resolve,
@@ -59,6 +59,9 @@ pub enum Activity {
     Extract,
     /// Rewriting a jar's names through a mapping set.
     Remap,
+    /// Deriving one mapping text from others: joining two published sets, extending one with
+    /// copied entries, or resolving references through one.
+    Compose,
     /// Folding two jars into one.
     Merge,
     /// Reconstructing Java from class files.
@@ -92,6 +95,7 @@ impl Activity {
             Self::Fetch => "fetch",
             Self::Extract => "extract",
             Self::Remap => "remap",
+            Self::Compose => "compose",
             Self::Merge => "merge",
             Self::Decompile => "decompile",
             Self::Publish => "publish",
